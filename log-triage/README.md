@@ -30,22 +30,59 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Install the wheel from the extracted folder and run the bundled sample.
-If you downloaded a different version, use the wheel filename in your bundle.
+Install the wheel from the extracted folder. If you downloaded a different
+version, use the wheel filename in your bundle.
 
 ```sh
 python -m pip install --no-index --no-deps log_triage-0.1.0-py3-none-any.whl
 log-triage --version
-log-triage
 ```
 
-Expected counts:
+## Sample workflows for incident triage
 
-```text
-INFO: 12
-WARNING: 3
-ERROR: 5
+Run these examples from the extracted bundle or the `log-triage/` folder
+in the source checkout. Start with one log, then follow an incident across
+services.
+
+### 1. Find a timeout and see what happened around it
+
+```sh
+log-triage search log_triage/app.log --contains "Connection acquisition timed out" --context 1
 ```
+
+Line 8 shows a database timeout for request `r-100`. The next line shows
+the order lookup failure for the same request. The extra context gives you
+both events in one view.
+
+### 2. Rank recurring error codes
+
+```sh
+log-triage group app.jsonl --format jsonl --by code --top 3
+```
+
+`E1042` appears most often, with **4 records**, followed by `E2007` (3)
+and `E3001` (1). Use the ranking to choose which code to investigate first.
+
+### 3. Identify what changed during an incident
+
+```sh
+log-triage compare incident.jsonl --profile incident-profile.json --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z --top 1
+```
+
+The top result is **payments TIMEOUT**, rising from **2 to 40 log
+events per minute**. Comparing rates accounts for the different window
+lengths. The report points to `incident.jsonl:8` and request `incident-00`
+for a closer look.
+
+### 4. Reconstruct a request across services
+
+```sh
+log-triage timeline --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --value incident-00
+```
+
+The report combines **9 events** from the payments and worker logs in
+timestamp order. The worker accepts the job at **14:01:01 UTC** and logs
+a timeout at **14:01:04 UTC**. Each event includes its source file and line.
 
 ## Install directly from GitHub
 
