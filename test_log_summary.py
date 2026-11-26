@@ -64,5 +64,19 @@ class ShowLinesTests(unittest.TestCase):
         )
 
 
+class StdinTests(unittest.TestCase):
+    def test_counts_errors_from_stdin(self):
+        repo = Path(__file__).resolve().parent
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "-", "--level", "ERROR"],
+            cwd=repo,
+            input=(repo / "sample.log").read_text(encoding="utf-8"),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout, "ERROR: 2\n")
+
+
 if __name__ == "__main__":
     unittest.main()
