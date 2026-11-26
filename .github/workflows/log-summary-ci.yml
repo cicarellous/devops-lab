@@ -8,7 +8,7 @@ on:
 
 jobs:
   unit-tests:
-    name: Unit tests / ${{ matrix.platform }} / Python 3.12
+    name: Unit tests / ${{ matrix.platform }} / Python ${{ matrix.python }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -16,8 +16,13 @@ jobs:
         include:
           - platform: Ubuntu
             runner: ubuntu-latest
+            python: "3.12"
           - platform: Windows
             runner: windows-latest
+            python: "3.12"
+          - platform: Ubuntu
+            runner: ubuntu-latest
+            python: "3.14"
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -25,7 +30,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
       - name: Run Log Summary unit tests
         id: unittest
@@ -38,10 +43,11 @@ jobs:
         shell: bash
         env:
           PLATFORM: ${{ matrix.platform }}
+          PYTHON_VERSION: ${{ matrix.python }}
           TEST_OUTCOME: ${{ steps.unittest.outcome }}
         run: |
           {
-            printf '### Unit tests on %s (Python 3.12)\n\n' "$PLATFORM"
+            printf '### Unit tests on %s (Python %s)\n\n' "$PLATFORM" "$PYTHON_VERSION"
             printf 'Outcome: **%s**\n\n' "$TEST_OUTCOME"
             if [[ -f "$RUNNER_TEMP/log-summary-unittest.log" ]]; then
               grep -E '^Ran [0-9]+ tests? in ' "$RUNNER_TEMP/log-summary-unittest.log" || true
