@@ -248,14 +248,14 @@ def search_log(argv: list[str]) -> int:
         description="Search any text log and print matching lines with surrounding context.",
         epilog="Supply --contains, --regex, or both. With both, a line must match both filters.",
     )
-    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("log_files", nargs="+", metavar="LOG", help="files, quoted globs, or - for stdin")
     parser.add_argument("--contains", metavar="TEXT", help="match case-sensitive literal text")
     parser.add_argument("--regex", metavar="PATTERN", help="match a Python regular expression")
     parser.add_argument("--context", type=int, default=0, metavar="N",
                         help="show N lines (records with --multiline) before and after each match")
     add_multiline_option(parser)
     add_report_arguments(parser)
-    args = parser.parse_args(argv)
+    args = parser.parse_intermixed_args(argv)
     if args.contains is None and args.regex is None:
         parser.error("search requires --contains or --regex")
     if args.context < 0:
@@ -263,54 +263,62 @@ def search_log(argv: list[str]) -> int:
     pattern = compile_pattern(parser, args.regex)
     contains = args.contains or ""
 
-    previous: deque[tuple[int, int, str]] = deque(maxlen=args.context)
-    context_end = 0
+    if args.log_files.count("-") > 1:
+        parser.error("stdin can only be used as one source")
+    paths = [path for entry in args.log_files for path in expand_log_paths(parser, entry)]
+    multiple = len(paths) > 1
     number = physical_lines = matched = displayed = 0
     with (
         SpooledTemporaryFile(max_size=1_048_576, mode="w+t", encoding="utf-8")
         if args.json else nullcontext()
     ) as report:
-        def write_record(line_number: int, end_line: int, text: str) -> None:
+        def write_record(source: str, line_number: int, end_line: int, text: str) -> None:
             nonlocal displayed
             if report is None:
-                if line_number == end_line:
-                    print(f"{line_number}: {text}")
-                else:
-                    print(f"{line_number}-{end_line}: {text}")
+                prefix = f"{source}:" if multiple else ""
+                print(f"{prefix}{line_range(line_number, end_line)}: {text}")
             else:
                 if displayed:
                     report.write(",")
                 row = {"line": line_number, "text": text}
                 if args.multiline:
                     row["end_line"] = end_line
+                if multiple:
+                    row["source"] = source
                 report.write(json.dumps(row))
             displayed += 1
 
-        try:
-            with open_log(args.log_file) as log_file:
-                records = log_records(log_file, multiline=args.multiline)
-                for number, (line_number, end_line, _, line) in enumerate(records, start=1):
-                    physical_lines = end_line
-                    text = line.rstrip("\r\n")
-                    if contains in text and (pattern is None or pattern.search(text)):
-                        matched += 1
-                        for context_record in previous:
-                            write_record(*context_record)
-                        previous.clear()
-                        context_end = number + args.context
-                    if number <= context_end:
-                        write_record(line_number, end_line, text)
-                    elif args.context:
-                        previous.append((line_number, end_line, text))
-        except (OSError, UnicodeError) as error:
-            return report_input_error(args.log_file, error)
+        for path in paths:
+            source = source_name(path)
+            previous: deque[tuple[int, int, str]] = deque(maxlen=args.context)
+            context_end = 0
+            try:
+                with open_log(path) as log_file:
+                    records = log_records(log_file, multiline=args.multiline)
+                    for index, (line_number, end_line, _, line) in enumerate(records, start=1):
+                        number += 1
+                        physical_lines += end_line - line_number + 1
+                        text = line.rstrip("\r\n")
+                        if contains in text and (pattern is None or pattern.search(text)):
+                            matched += 1
+                            for context_record in previous:
+                                write_record(source, *context_record)
+                            previous.clear()
+                            context_end = index + args.context
+                        if index <= context_end:
+                            write_record(source, line_number, end_line, text)
+                        elif args.context:
+                            previous.append((line_number, end_line, text))
+            except (OSError, UnicodeError) as error:
+                return report_input_error(path, error)
         if report is not None:
             coverage = {
                 "scanned": number, "matched": matched, "displayed": displayed,
                 "physical_lines": physical_lines,
             }
             header = {
-                "schema_version": 1, "command": "search", "source": source_name(args.log_file),
+                "schema_version": 1, "command": "search", "source": None if multiple else source_name(paths[0]),
+                **({"sources": [source_name(path) for path in paths]} if multiple else {}),
                 "coverage": coverage,
             }
             print(json.dumps(header).removesuffix("}"), ', "lines": [', sep="", end="")
@@ -319,7 +327,7 @@ def search_log(argv: list[str]) -> int:
             print("]}")
     if not number:
         print("The input is empty.", file=sys.stderr)
-    elif not context_end:
+    elif not matched:
         unit = "records" if args.multiline else "lines"
         print(f"No matching {unit}. Check --contains or --regex.", file=sys.stderr)
     return report_status(args, empty=not matched)
@@ -514,6 +522,15 @@ def add_source_option(parser: argparse.ArgumentParser) -> None:
                         help="file or glob and its JSON profile; repeat for multiple sources")
 
 
+def expand_log_paths(parser: argparse.ArgumentParser, path: str) -> list[str]:
+    if path == "-" or Path(path).is_file() or not any(char in path for char in "*?["):
+        return [path]
+    expanded = sorted(match for match in glob(path, recursive=True) if Path(match).is_file())
+    if not expanded:
+        parser.error(f"no source files match {path!r}")
+    return expanded
+
+
 def source_mappings(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
@@ -531,14 +548,9 @@ def source_mappings(
             parser.error("stdin can only be used as one source")
         mappings: list[tuple[str, argparse.Namespace]] = []
         for path, profile in args.source:
-            expanded = [path]
-            if path != "-" and not Path(path).is_file() and any(char in path for char in "*?["):
-                expanded = sorted(match for match in glob(path, recursive=True) if Path(match).is_file())
-                if not expanded:
-                    parser.error(f"no source files match {path!r}")
             mappings.extend(
                 (filename, argparse.Namespace(profile=profile, **dict.fromkeys(fields[1:])))
-                for filename in expanded
+                for filename in expand_log_paths(parser, path)
             )
     elif args.log_file is not None:
         mappings = [(args.log_file, args)]

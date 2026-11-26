@@ -89,8 +89,16 @@ Search any text log with original line numbers and surrounding context:
 
 ```powershell
 python log_summary.py search app.log --regex "timed out|lookup failed" --context 2
+python log_summary.py search "app.log*" --contains "timed out" --context 2
 Get-Content app.log | python log_summary.py search - --contains "timed out"
 ```
+
+Pass multiple paths or quoted globs to search current and rotated logs,
+including `.gz` files. Context stays within each file. When several inputs
+are searched, text prefixes each result with its source and JSON adds
+`sources` to the report and `source` to each result. Use `-` once to include
+stdin.
+
 
 Use `--contains` for case-sensitive literal text or `--regex` for a Python regular
 expression. When both are supplied, lines must match both. Overlapping context

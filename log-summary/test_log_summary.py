@@ -144,6 +144,46 @@ class SearchTests(unittest.TestCase):
         ])
 
 
+class MultiFileSearchTests(unittest.TestCase):
+    def run_search(self, directory, *options, data=None):
+        script = Path(__file__).resolve().with_name("log_summary.py")
+        return subprocess.run(
+            [sys.executable, str(script), "search", *options],
+            cwd=directory, text=True, input=data, capture_output=True,
+        )
+
+    def test_glob_preserves_source_and_context_across_plain_and_gzip_files(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.log").write_text("before\nERROR first\n  frame\n", encoding="utf-8")
+            with gzip.open(root / "app.log.1.gz", "wt", encoding="utf-8") as archive:
+                archive.write("unrelated\nbefore\nERROR second\nafter\n")
+            options = ("app.log*", "--contains", "ERROR", "--context", "1", "--multiline")
+            result = self.run_search(directory, *options, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertIsNone(report["source"])
+            self.assertEqual(report["sources"], ["app.log", "app.log.1.gz"])
+            self.assertEqual(report["coverage"],
+                             {"scanned": 6, "physical_lines": 7, "matched": 2, "displayed": 5})
+            self.assertEqual([(row["source"], row["line"], row["end_line"]) for row in report["lines"]],
+                             [("app.log", 1, 1), ("app.log", 2, 3), ("app.log.1.gz", 2, 2),
+                              ("app.log.1.gz", 3, 3), ("app.log.1.gz", 4, 4)])
+            text = self.run_search(directory, *options)
+            self.assertIn("app.log:2-3: ERROR first", text.stdout)
+            self.assertIn("app.log.1.gz:3: ERROR second", text.stdout)
+
+    def test_accepts_stdin_once_and_rejects_unmatched_globs(self):
+        with TemporaryDirectory() as directory:
+            (Path(directory) / "app.log").write_text("ERROR file\n", encoding="utf-8")
+            result = self.run_search(directory, "-", "--contains", "ERROR", "app.log", data="ERROR stdin\n")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["<stdin>:1: ERROR stdin", "app.log:1: ERROR file"])
+            for inputs in (("-", "-"), ("*.missing",)):
+                with self.subTest(inputs=inputs):
+                    self.assertEqual(self.run_search(directory, *inputs, "--contains", "ERROR").returncode, 2)
+
+
 class GroupTests(unittest.TestCase):
     def test_groups_equivalent_text_and_jsonl_examples(self):
         repo = Path(__file__).resolve().parent
