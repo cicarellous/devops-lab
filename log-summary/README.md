@@ -238,5 +238,5 @@ From `log-summary/`, run the unit tests:
 python -m unittest -v
 ```
 
-GitHub Actions runs the tests on Ubuntu and Windows. The Ubuntu job also runs
-Ruff and mypy. You can see each run in the repository's **Actions** tab.
+In GitHub Actions, **Log Summary CI** shows separate Ubuntu and Windows test
+results and a code-quality job for Ruff and mypy. You can see each run in the repository's **Actions** tab.
