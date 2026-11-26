@@ -6,8 +6,9 @@ from collections import Counter, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
-from typing import Iterable, TextIO
+from typing import ContextManager, Iterable, TextIO
 
 
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
@@ -49,7 +50,7 @@ def count_errors(lines: Iterable[str]) -> int:
     return count_levels(lines)["ERROR"]
 
 
-def open_log(log_path: str):
+def open_log(log_path: str) -> ContextManager[TextIO]:
     if log_path == "-":
         return nullcontext(sys.stdin)
     return Path(log_path).open(encoding="utf-8")
@@ -82,7 +83,6 @@ def search_log(argv: list[str]) -> int:
     contains = args.contains or ""
 
     previous = deque(maxlen=args.context)
-    last_printed = 0
     context_end = 0
     try:
         with open_log(args.log_file) as log_file:
@@ -90,15 +90,18 @@ def search_log(argv: list[str]) -> int:
                 text = line.rstrip("\r\n")
                 if contains in text and (pattern is None or pattern.search(text)):
                     for previous_number, previous_text in previous:
-                        if previous_number > last_printed:
-                            print(f"{previous_number}: {previous_text}")
+                        print(f"{previous_number}: {previous_text}")
+                    previous.clear()
                     context_end = number + args.context
                 if number <= context_end:
                     print(f"{number}: {text}")
-                    last_printed = number
-                previous.append((number, text))
+                elif args.context:
+                    previous.append((number, text))
     except FileNotFoundError:
         print(f"Log file not found: {args.log_file}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"Cannot read log: {error}", file=sys.stderr)
         return 1
     return 0
 
@@ -128,7 +131,8 @@ def group_log(argv: list[str]) -> int:
     if pattern is not None and args.by not in pattern.groupindex:
         parser.error(f"--regex must define a named capture group {args.by!r}")
 
-    counts: Counter[str] = Counter()
+    strings: Counter[str] = Counter()
+    encoded_values: Counter[str] = Counter()
     scanned = 0
     grouped = 0
     try:
@@ -146,7 +150,10 @@ def group_log(argv: list[str]) -> int:
                     value = record.get(args.by) if isinstance(record, dict) else None
                 if value is None or value == "" or not isinstance(value, (str, int, float, bool)):
                     continue
-                counts[json.dumps(value, ensure_ascii=True)] += 1
+                if isinstance(value, str):
+                    strings[value] += 1
+                else:
+                    encoded_values[json.dumps(value)] += 1
                 grouped += 1
     except FileNotFoundError:
         print(f"Log file not found: {args.log_file}", file=sys.stderr)
@@ -155,8 +162,11 @@ def group_log(argv: list[str]) -> int:
         print(f"Cannot read log: {error}", file=sys.stderr)
         return 1
 
+    # Encode each distinct string once, preserving the report's ordering and escaping.
+    encoded_strings = ((json.dumps(value), count) for value, count in strings.items())
+    values = chain(encoded_values.items(), encoded_strings)
     print("COUNT  VALUE")
-    for value, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+    for value, count in sorted(values, key=lambda item: (-item[1], item[0])):
         print(f"{count:5}  {value}")
     print(f"Scanned: {scanned}  Grouped: {grouped}  Skipped: {scanned - grouped}")
     return 0
@@ -190,7 +200,7 @@ def event_pattern(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     return pattern
 
 
-def event_fields(text: str, pattern: re.Pattern[str] | None) -> dict:
+def event_fields(text: str, pattern: re.Pattern[str] | None) -> dict[str, object]:
     if pattern is not None:
         match = pattern.search(text)
         return match.groupdict() if match else {}
@@ -423,6 +433,9 @@ def main() -> int:
             )
     except FileNotFoundError:
         print(f"Log file not found: {log_path}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"Cannot read log: {error}", file=sys.stderr)
         return 1
 
     levels = (args.level,) if args.level else LOG_LEVELS

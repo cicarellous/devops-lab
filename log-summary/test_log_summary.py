@@ -2,6 +2,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from log_summary import count_errors, count_levels
 
@@ -285,6 +286,23 @@ class CorrelateTests(unittest.TestCase):
                 rows = result.stdout.splitlines()
                 self.assertTrue(rows[1].endswith(f'"{first_id}"'))
                 self.assertEqual(rows[-1], "Scanned: 7  IDs: 2  Skipped: 2")
+
+
+class InputErrorTests(unittest.TestCase):
+    def test_summary_and_search_report_invalid_utf8_without_traceback(self):
+        with TemporaryDirectory() as directory:
+            log = Path(directory) / "invalid.log"
+            log.write_bytes(b"INFO invalid byte: \xff\n")
+            script = Path(__file__).with_name("log_summary.py").resolve()
+            for args in ([str(log)], ["search", str(log), "--contains", "INFO"]):
+                with self.subTest(args=args):
+                    result = subprocess.run(
+                        [sys.executable, str(script), *args],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertTrue(result.stderr.startswith("Cannot read log:"))
+                    self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":
