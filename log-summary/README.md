@@ -221,7 +221,9 @@ three times the median of the previous five full buckets. Empty full
 buckets count as zero in the baseline. A zero median, insufficient
 history, or a partial bucket produces no spike flag. JSON adds
 `spike_factor` to the report and `baseline_count` and `spike` to each
-bucket. A missing baseline is represented by `null`.
+bucket. A missing baseline is represented by `null`. Add `--fail-on spike`
+to return 4 when any bucket is flagged. Without a flag, the spike gate
+returns 0, including when there are too few full buckets to evaluate.
 
 
 Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps before signature
@@ -310,6 +312,16 @@ for timeline and correlation. Explicit flags override the profile. Bucket uses i
 `--value`. Time
 windows, requested values, and output options stay on the command line.
 
+## Gate a comparison
+
+Add `--fail-on increase --min-increase-rate 5 --min-increase-percent 50`
+to `compare` to return 4 if any signature increases by at least 5 events
+per minute and at least 50% over its baseline rate. A signature unseen
+in a usable baseline only needs to meet the absolute threshold.
+If the baseline has no usable events, the gate returns 3. The gate
+checks every signature, including rows hidden by `--top`. JSON reports
+include the thresholds, breach count, and a `breached` flag on displayed rows.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -317,7 +329,8 @@ windows, requested values, and output options stay on the command line.
 | `0` | Completed, including empty results by default |
 | `1` | Input or output error |
 | `2` | Invalid arguments or profile |
-| `3` | Empty result with `--fail-on empty` |
+| `3` | Empty result with `--fail-on empty`, or no usable baseline for the increase gate |
+| `4` | Spike or increase gate breached |
 
 ## Tests
 

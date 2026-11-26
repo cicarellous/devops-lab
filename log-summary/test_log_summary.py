@@ -452,6 +452,55 @@ class BucketTests(unittest.TestCase):
         self.assertEqual([row["events_per_minute"] for row in rows], [None, 0, 0, None])
 
 
+class CompareGateTests(unittest.TestCase):
+    def run_compare(self, records, *options):
+        data = "".join(
+            json.dumps({"ts": f"2026-11-26T14:{minute}:10Z", "code": code}) + "\n"
+            for minute, code, count in records
+            for _ in range(count)
+        )
+        return subprocess.run(
+            [sys.executable, "log_summary.py", "compare", "-", "--format", "jsonl",
+             "--time", "ts", "--signature", "code", "--json",
+             "--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
+             "--incident", "2026-11-26T14:01Z", "2026-11-26T14:03Z", *options],
+            cwd=Path(__file__).resolve().parent, input=data, text=True, capture_output=True,
+        )
+
+    def test_gate_uses_both_normalized_thresholds_and_all_rows(self):
+        records = [("00", "high", 10), ("01", "high", 30),
+                   ("00", "low", 1), ("01", "low", 6),
+                   ("00", "small", 1), ("01", "small", 4)]
+        result = self.run_compare(records, "--fail-on", "increase", "--min-increase-rate", "2",
+                                  "--min-increase-percent", "200", "--top", "1")
+        self.assertEqual(result.returncode, 4, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["gate"]["breach_count"], 1)
+        self.assertEqual(report["results"][0]["signature"], "high")
+        self.assertFalse(report["results"][0]["breached"])
+
+    def test_new_signature_uses_absolute_threshold_with_a_usable_baseline(self):
+        options = ("--fail-on", "increase", "--min-increase-rate", "2", "--min-increase-percent", "500")
+        for count, status in ((3, 0), (4, 4)):
+            with self.subTest(count=count):
+                result = self.run_compare([("00", "existing", 1), ("01", "new", count)], *options)
+                self.assertEqual(result.returncode, status, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["results"][0]["breached"], status == 4)
+        missing = self.run_compare([("01", "new", 4)], *options)
+        self.assertEqual(missing.returncode, 3, missing.stderr)
+        self.assertFalse(json.loads(missing.stdout)["gate"]["baseline_available"])
+
+    def test_gate_requires_both_positive_thresholds(self):
+        for options in (
+            ("--fail-on", "increase", "--min-increase-rate", "2"),
+            ("--min-increase-rate", "2"),
+            ("--fail-on", "increase", "--min-increase-rate", "2", "--min-increase-percent", "inf"),
+        ):
+            with self.subTest(options=options):
+                self.assertEqual(self.run_compare([], *options).returncode, 2)
+
+
 class SpikeDetectionTests(unittest.TestCase):
     def run_bucket(self, counts, *options):
         data = "".join(
@@ -486,6 +535,17 @@ class SpikeDetectionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         bucket = json.loads(result.stdout)["buckets"][6]
         self.assertEqual((bucket["baseline_count"], bucket["count"], bucket["spike"]), (0, 1, False))
+
+    def test_spike_gate_keeps_report_and_returns_four_only_for_a_spike(self):
+        options = ("--fail-on", "spike", "--spike-factor", "3", "--json")
+        for count, status in ((6, 0), (7, 4)):
+            with self.subTest(count=count):
+                result = self.run_bucket([0, 2, 2, 2, 2, 2, count], *options)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["buckets"][6]["spike"], status == 4)
+        result = self.run_bucket([], "--fail-on", "spike")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--fail-on spike requires --spike-factor", result.stderr)
 
     def test_factor_rejects_invalid_values(self):
         for value in ("1", "nan", "inf", "invalid"):

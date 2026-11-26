@@ -225,9 +225,11 @@ def compile_pattern(parser: argparse.ArgumentParser, value: str | None) -> re.Pa
         parser.error(f"invalid --regex pattern: {error}")
 
 
-def add_report_arguments(parser: argparse.ArgumentParser) -> None:
+def add_report_arguments(parser: argparse.ArgumentParser, *, gate: str = "") -> None:
     parser.add_argument("--json", action="store_true", help="emit versioned JSON")
-    parser.add_argument("--fail-on", choices=("empty",), help="exit 3 when the result is empty")
+    choices = ("empty", gate) if gate else ("empty",)
+    help_text = f"exit 3 on empty results or 4 on {gate}" if gate else "exit 3 when the result is empty"
+    parser.add_argument("--fail-on", choices=choices, help=help_text)
 
 
 def report_status(args: argparse.Namespace, *, empty: bool) -> int:
@@ -1061,6 +1063,17 @@ def comparison_window(
     return ComparisonWindow(start, end)
 
 
+def positive_threshold(value: str) -> float:
+    message = "must be a finite number greater than 0"
+    try:
+        threshold = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(message) from None
+    if not isfinite(threshold) or threshold <= 0:
+        raise argparse.ArgumentTypeError(message)
+    return threshold
+
+
 def compare_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py compare",
@@ -1077,8 +1090,22 @@ def compare_log(argv: list[str]) -> int:
     parser.add_argument("--incident", nargs=2, metavar=("START", "END"), required=True)
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     add_multiline_option(parser)
-    add_report_arguments(parser)
+    parser.add_argument(
+        "--min-increase-rate", type=positive_threshold, metavar="N",
+        help="minimum increase in events/min for --fail-on increase",
+    )
+    parser.add_argument(
+        "--min-increase-percent", type=positive_threshold, metavar="N",
+        help="minimum percentage increase for --fail-on increase (new signatures use only the rate threshold)",
+    )
+    add_report_arguments(parser, gate="increase")
     args = parser.parse_args(argv)
+    gate_enabled = args.fail_on == "increase"
+    rate_threshold, percent_threshold = args.min_increase_rate, args.min_increase_percent
+    if gate_enabled and (rate_threshold is None or percent_threshold is None):
+        parser.error("--fail-on increase requires --min-increase-rate and --min-increase-percent")
+    if not gate_enabled and (rate_threshold is not None or percent_threshold is not None):
+        parser.error("increase thresholds require --fail-on increase")
     mappings = source_mappings(
         parser, args, required=("time", "signature"), optional=("service", "id")
     )
@@ -1167,6 +1194,24 @@ def compare_log(argv: list[str]) -> int:
         rows.append((after_rate - before_rate, service, signature, before, after, before_rate, after_rate))
 
     ranked = sorted(rows, key=lambda row: (-row[0], row[1] is not None, row[1] or "", row[2]))
+    gate_report: dict[str, object] = {}
+    breached: set[tuple[str | None, str]] = set()
+    if rate_threshold is not None and percent_threshold is not None:
+        min_delta = Fraction(str(rate_threshold))
+        min_relative = Fraction(str(percent_threshold)) / 100
+        # An unseen signature can be evaluated when the baseline has usable events.
+        if baseline.used:
+            breached = {
+                (service, signature)
+                for delta, service, signature, _, _, before_rate, _ in ranked
+                if delta >= min_delta and delta >= before_rate * min_relative
+            }
+        gate_report = {
+            "min_increase_rate": rate_threshold,
+            "min_increase_percent": percent_threshold,
+            "baseline_available": bool(baseline.used),
+            "breach_count": len(breached),
+        }
     results = []
     for delta, service, signature, before, after, before_rate, after_rate in ranked[:args.top]:
         if not before.count:
@@ -1181,6 +1226,7 @@ def compare_log(argv: list[str]) -> int:
         if args.json:
             results.append({
                 "change": label,
+                **({"breached": (service, signature) in breached} if gate_enabled else {}),
                 "signature": signature,
                 "service": service,
                 "baseline": {"events": before.count, "events_per_minute": float(before_rate),
@@ -1191,7 +1237,8 @@ def compare_log(argv: list[str]) -> int:
                 "example": {"source": example.example_source, "line": example.example_line, "id": example.example_id},
             })
         else:
-            details = f"{label} {json.dumps(signature)}"
+            prefix = "BREACH " if (service, signature) in breached else ""
+            details = f"{prefix}{label} {json.dumps(signature)}"
             if has_service:
                 details += f" service={json.dumps(service)}"
             details += (
@@ -1222,6 +1269,7 @@ def compare_log(argv: list[str]) -> int:
                 "physical_lines": physical_lines,
             },
             "results": results,
+            **({"gate": gate_report} if gate_enabled else {}),
         }))
     else:
         if args.top is not None:
@@ -1251,6 +1299,13 @@ def compare_log(argv: list[str]) -> int:
             elif not window.used:
                 signatures = ", ".join(sorted({repr(mapping.signature) for _, mapping in mappings}))
                 print(f"{name}: no usable signatures in {signatures}. Check --signature or the per-source profiles.", file=sys.stderr)
+    if gate_enabled:
+        if not baseline.used:
+            print("Increase gate could not evaluate a baseline with no usable events.", file=sys.stderr)
+            return 3
+        if breached:
+            print(f"Increase gate breached by {len(breached)} signature(s).", file=sys.stderr)
+            return 4
     return report_status(args, empty=not ranked)
 
 
@@ -1308,8 +1363,10 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("--value", help="exact value to count in the signature field")
     parser.add_argument("--ignore-case", action="store_true", help="match signature values case-insensitively")
     add_multiline_option(parser)
-    add_report_arguments(parser)
+    add_report_arguments(parser, gate="spike")
     args = parser.parse_args(argv)
+    if args.fail_on == "spike" and args.spike_factor is None:
+        parser.error("--fail-on spike requires --spike-factor")
     if args.level is not None and (args.signature is not None or args.value is not None):
         parser.error("--level cannot be combined with --signature or --value")
     if args.level_field is not None and args.level is None:
@@ -1501,6 +1558,9 @@ def bucket_log(argv: list[str]) -> int:
             f"Scanned: {scanned}  Counted: {coverage['counted']}  "
             f"Invalid timestamp: {invalid}  Outside window: {outside}  Filtered: {filtered}{suffix}"
         )
+    if args.fail_on == "spike" and any(bucket.get("spike") for bucket in buckets):
+        print("Spike gate breached.", file=sys.stderr)
+        return 4
     return report_status(args, empty=not counts)
 
 
@@ -1766,7 +1826,7 @@ def main() -> int:
             "  compare     Compare incident and baseline event rates\n"
             "  bucket      Show observed event rates over time\n"
             "  inspect     Sample input and suggest field mappings\n\n"
-            "Exit codes: 0 success, 1 I/O error, 2 usage error, 3 empty with --fail-on empty.\n\n"
+            "Exit codes: 0 success, 1 I/O error, 2 usage error, 3 empty or missing gate data, 4 gate breached.\n\n"
             "Examples:\n"
             "  python log_summary.py                 Count levels in app.log\n"
             "  python log_summary.py app.jsonl --format jsonl\n"
