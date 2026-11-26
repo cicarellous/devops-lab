@@ -201,15 +201,54 @@ def group_log(argv: list[str]) -> int:
     return 0
 
 
+def add_mapping_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--profile", metavar="FILE", help="JSON log mapping; explicit flags override it")
+    parser.add_argument("--format", choices=("text", "jsonl"), help="input format (default: text)")
+    parser.add_argument("--time", help="timestamp field or named regex capture")
+    parser.add_argument("--regex", help="named field captures for text input")
+
+
+def apply_log_mapping(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    required: tuple[str, ...],
+    optional: tuple[str, ...] = (),
+) -> None:
+    profile = {}
+    if args.profile is not None:
+        try:
+            profile = json.loads(Path(args.profile).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError) as error:
+            parser.error(f"cannot load profile {args.profile!r}: {error}")
+        allowed = {"format", "time", "regex", "signature", "service", "id"}
+        if not isinstance(profile, dict):
+            parser.error("profile must be a JSON object")
+        for name, value in profile.items():
+            if name not in allowed:
+                parser.error(f"unknown profile field {name!r}")
+            if not isinstance(value, str) or not value.strip():
+                parser.error(f"profile field {name!r} must be a nonempty string")
+        if "format" in profile and profile["format"] not in ("text", "jsonl"):
+            parser.error("profile format must be text or jsonl")
+
+    if args.format is None:
+        args.format = profile.get("format", "text")
+    if args.regex is None and args.format == "text":
+        args.regex = profile.get("regex")
+
+    for name in required + optional:
+        if getattr(args, name) is None:
+            setattr(args, name, profile.get("id" if name == "key" else name))
+    missing = [f"--{name}" for name in required if getattr(args, name) is None]
+    if missing:
+        parser.error(f"missing {', '.join(missing)}; supply flags or a --profile")
+
+
 def add_event_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("log_file", help="log file path or - for stdin")
-    parser.add_argument(
-        "--format", choices=("text", "jsonl"), default="text",
-        help="input format (default: text)",
-    )
-    parser.add_argument("--key", required=True, help="ID field or named regex capture")
-    parser.add_argument("--time", required=True, help="timestamp field or named regex capture")
-    parser.add_argument("--regex", help="text pattern capturing the ID and timestamp")
+    add_mapping_arguments(parser)
+    parser.add_argument("--key", help="ID field or named regex capture (profile: id)")
     parser.add_argument("--since", metavar="TIME", help="include events at or after this ISO timestamp")
     parser.add_argument("--until", metavar="TIME", help="include events at or before this ISO timestamp")
     parser.epilog = (
@@ -285,6 +324,7 @@ def timeline_log(argv: list[str]) -> int:
     add_event_arguments(parser)
     parser.add_argument("--value", required=True, help="ID to match exactly")
     args = parser.parse_args(argv)
+    apply_log_mapping(parser, args, required=("key", "time"))
     pattern = event_pattern(parser, args)
     since, until = event_window(parser, args)
 
@@ -348,6 +388,7 @@ def correlate_log(argv: list[str]) -> int:
     parser.add_argument("--sort", choices=("span", "count"), default="span",
                         help="rank IDs by observed span or event count (default: span)")
     args = parser.parse_args(argv)
+    apply_log_mapping(parser, args, required=("key", "time"))
     pattern = event_pattern(parser, args)
     since, until = event_window(parser, args)
 
@@ -453,15 +494,14 @@ def compare_log(argv: list[str]) -> int:
         epilog="Windows include START and exclude END. The baseline must end by the incident start. Times without offsets use UTC.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
-    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
-    parser.add_argument("--regex", help="named field captures for text input")
-    parser.add_argument("--time", required=True, help="timestamp field")
-    parser.add_argument("--signature", required=True, help="error code or other stable event field")
+    add_mapping_arguments(parser)
+    parser.add_argument("--signature", help="error code or other stable event field")
     parser.add_argument("--service", help="optional service field")
     parser.add_argument("--id", help="optional request or transaction ID field")
     parser.add_argument("--baseline", nargs=2, metavar=("START", "END"), required=True)
     parser.add_argument("--incident", nargs=2, metavar=("START", "END"), required=True)
     args = parser.parse_args(argv)
+    apply_log_mapping(parser, args, required=("time", "signature"), optional=("service", "id"))
 
     pattern = input_pattern(parser, args)
     if pattern is not None:
@@ -586,12 +626,10 @@ def bucket_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py bucket",
         description="Count observed events in aligned UTC time buckets.",
-        epilog="Text requires --regex. Use --signature and --value together. Omitted bounds use observed timestamps. Partial buckets have no rate.",
+        epilog="Text requires --regex. Choose --value with a signature field from --signature or --profile. Omitted bounds use observed timestamps. Partial buckets have no rate.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
-    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
-    parser.add_argument("--regex", help="named captures for text input")
-    parser.add_argument("--time", required=True, help="timestamp field")
+    add_mapping_arguments(parser)
     parser.add_argument("--interval", required=True, type=interval_seconds, help="bucket width, e.g. 30s or 5m")
     parser.add_argument("--since", help="inclusive start of the report (ISO 8601)")
     parser.add_argument("--until", help="exclusive end of the report (ISO 8601)")
@@ -599,9 +637,15 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("--value", help="exact value to count in the signature field")
     parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     args = parser.parse_args(argv)
+    apply_log_mapping(
+        parser, args, required=("time",),
+        optional=("signature",) if args.value is not None else (),
+    )
 
-    if (args.signature is None) != (args.value is None):
-        parser.error("--signature and --value must be used together")
+    if args.value is not None and args.signature is None:
+        parser.error("--value requires a signature field from --signature or --profile")
+    if args.signature is not None and args.value is None:
+        parser.error("--signature requires --value")
     pattern = input_pattern(parser, args)
     if pattern is not None:
         required_fields = {args.time, args.signature} - {None}

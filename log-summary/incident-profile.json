@@ -1,0 +1,7 @@
+{
+  "format": "jsonl",
+  "time": "ts",
+  "signature": "code",
+  "service": "service",
+  "id": "request"
+}

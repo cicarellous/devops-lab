@@ -481,5 +481,60 @@ class InspectTests(unittest.TestCase):
                 self.assertIn(message, result.stderr)
 
 
+class ProfileTests(unittest.TestCase):
+    def run_cli(self, *args, input_text=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=input_text,
+            capture_output=True, text=True,
+        )
+
+    def test_one_profile_reproduces_explicit_mappings(self):
+        cases = [
+            ("bucket", ["--interval", "30s", "--value", "TIMEOUT", "--json"], ["--signature", "code"]),
+            ("bucket", ["--interval", "30s", "--json"], []),
+            ("timeline", ["--value", "incident-00"], ["--key", "request"]),
+            ("correlate", [], ["--key", "request"]),
+            ("compare", [
+                "--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
+                "--incident", "2026-11-26T14:01Z", "2026-11-26T14:03Z",
+            ], ["--signature", "code", "--service", "service", "--id", "request"]),
+        ]
+        for command, options, mapping in cases:
+            with self.subTest(command=command, options=options):
+                common = (command, "incident.jsonl", *options)
+                explicit = self.run_cli(*common, "--format", "jsonl", "--time", "ts", *mapping)
+                profiled = self.run_cli(*common, "--profile", "incident-profile.json")
+                self.assertEqual(explicit.returncode, 0, explicit.stderr)
+                self.assertEqual(profiled.returncode, 0, profiled.stderr)
+                self.assertEqual((profiled.stdout, profiled.stderr), (explicit.stdout, explicit.stderr))
+
+    def test_explicit_timestamp_overrides_text_profile(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile.json"
+            profile.write_text(json.dumps({
+                "format": "text",
+                "time": "wrong",
+                "id": "request",
+                "regex": r"^(?P<ts>\S+) request=(?P<request>\S+)",
+            }), encoding="utf-8")
+            result = self.run_cli(
+                "timeline", "-", "--profile", str(profile), "--time", "ts", "--value", "r1",
+                input_text="2026-11-26T14:00Z request=r1\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Matched: 1", result.stdout)
+
+    def test_invalid_profile_has_a_clear_usage_error(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile.json"
+            profile.write_text('{"timestamp":"ts"}', encoding="utf-8")
+            result = self.run_cli(
+                "bucket", "incident.jsonl", "--profile", str(profile), "--interval", "30s",
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unknown profile field 'timestamp'", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -165,6 +165,22 @@ Windows include their start and exclude their end. Use `--regex` with named
 captures for text logs. `--service` and `--id` are optional. Observed ID counts
 reflect only records with usable IDs. Rates use the full requested windows.
 
+## Reuse field mappings
+
+Save your log mapping in a JSON file and pass it to `bucket`, `compare`,
+`timeline`, or `correlate` through `--profile`. See
+[`incident-profile.json`](incident-profile.json) for an example.
+
+```powershell
+python log_summary.py bucket incident.jsonl --profile incident-profile.json --interval 30s --value TIMEOUT
+python log_summary.py timeline incident.jsonl --profile incident-profile.json --value incident-00
+```
+
+Profile keys are `format`, `time`, `regex`, `signature`, `service`, and `id`.
+Use `regex` for named captures in text logs. The `id` field supplies `--key`
+for timeline and correlation. Explicit flags override the profile. Time
+windows, requested values, and output options stay on the command line.
+
 ## Tests
 
 From `log-summary/`, run the unit tests:
