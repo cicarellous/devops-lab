@@ -4,6 +4,7 @@ import re
 import sys
 from collections import Counter, deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, TextIO
@@ -65,6 +66,7 @@ def search_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py search",
         description="Search any text log and print matching lines with surrounding context.",
+        epilog="Supply --contains, --regex, or both. With both, a line must match both filters.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument("--contains", metavar="TEXT", help="match case-sensitive literal text")
@@ -105,9 +107,13 @@ def group_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py group",
         description="Rank values extracted from text or JSON Lines logs by frequency.",
+        epilog="Text input requires --regex. For JSON Lines, use --format jsonl and a field name.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
-    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
+    parser.add_argument(
+        "--format", choices=("text", "jsonl"), default="text",
+        help="input format (default: text)",
+    )
     parser.add_argument("--by", required=True, metavar="FIELD",
                         help="named regex group or top-level JSON field")
     parser.add_argument("--regex", metavar="PATTERN",
@@ -156,22 +162,22 @@ def group_log(argv: list[str]) -> int:
     return 0
 
 
-def timeline_log(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        prog="log_summary.py timeline",
-        description="Show events for one ID in chronological order.",
-    )
+def add_event_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("log_file", help="log file path or - for stdin")
-    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
+    parser.add_argument(
+        "--format", choices=("text", "jsonl"), default="text",
+        help="input format (default: text)",
+    )
     parser.add_argument("--key", required=True, help="ID field or named regex capture")
-    parser.add_argument("--value", required=True, help="ID to match exactly")
     parser.add_argument("--time", required=True, help="timestamp field or named regex capture")
     parser.add_argument("--regex", help="text pattern capturing the ID and timestamp")
     parser.epilog = (
         "Timestamps use ISO 8601. Timestamps without an offset are treated as UTC. "
         "Use --format jsonl for top-level JSON fields, or --regex for text."
     )
-    args = parser.parse_args(argv)
+
+
+def event_pattern(parser: argparse.ArgumentParser, args: argparse.Namespace) -> re.Pattern[str] | None:
     if args.format == "text" and args.regex is None:
         parser.error("text input requires --regex")
     if args.format == "jsonl" and args.regex is not None:
@@ -179,6 +185,47 @@ def timeline_log(argv: list[str]) -> int:
     pattern = compile_pattern(parser, args.regex)
     if pattern is not None and not {args.key, args.time} <= pattern.groupindex.keys():
         parser.error("--regex must define named captures for --key and --time")
+    return pattern
+
+
+def event_fields(text: str, pattern: re.Pattern[str] | None) -> dict:
+    if pattern is not None:
+        match = pattern.search(text)
+        return match.groupdict() if match else {}
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def event_id(value: object) -> str | None:
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool) and value != "":
+        return str(value)
+    return None
+
+
+def event_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value)
+        if timestamp.tzinfo is None:
+            return timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def timeline_log(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="log_summary.py timeline",
+        description="Show events for one ID in chronological order.",
+    )
+    add_event_arguments(parser)
+    parser.add_argument("--value", required=True, help="ID to match exactly")
+    args = parser.parse_args(argv)
+    pattern = event_pattern(parser, args)
 
     events: list[tuple[datetime, str]] = []
     scanned = 0
@@ -188,32 +235,16 @@ def timeline_log(argv: list[str]) -> int:
             for line in log_file:
                 scanned += 1
                 text = line.rstrip("\r\n")
-                if pattern is not None:
-                    match = pattern.search(text)
-                    fields = match.groupdict() if match else {}
-                else:
-                    try:
-                        record = json.loads(text)
-                    except json.JSONDecodeError:
-                        record = None
-                    fields = record if isinstance(record, dict) else {}
-                key = fields.get(args.key)
-                if not isinstance(key, (str, int, float)) or isinstance(key, bool) or key == "":
+                fields = event_fields(text, pattern)
+                key = event_id(fields.get(args.key))
+                if key is None:
                     skipped += 1
                     continue
-                if str(key) != args.value:
+                if key != args.value:
                     continue
 
-                raw_time = fields.get(args.time)
-                if not isinstance(raw_time, str):
-                    skipped += 1
-                    continue
-                try:
-                    timestamp = datetime.fromisoformat(raw_time)
-                    utc_time = timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else (
-                        timestamp.astimezone(timezone.utc)
-                    )
-                except (ValueError, OverflowError):
+                utc_time = event_time(fields.get(args.time))
+                if utc_time is None:
                     skipped += 1
                     continue
                 events.append((utc_time, text))
@@ -230,6 +261,72 @@ def timeline_log(argv: list[str]) -> int:
     return 0
 
 
+@dataclass
+class EventStats:
+    first: datetime
+    last: datetime
+    count: int = 1
+
+
+def correlate_log(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="log_summary.py correlate",
+        description="Summarize event counts and observed time spans by ID.",
+    )
+    add_event_arguments(parser)
+    parser.add_argument("--sort", choices=("span", "count"), default="span",
+                        help="rank IDs by observed span or event count (default: span)")
+    args = parser.parse_args(argv)
+    pattern = event_pattern(parser, args)
+
+    groups: dict[str, EventStats] = {}
+    scanned = 0
+    skipped = 0
+    try:
+        with open_log(args.log_file) as log_file:
+            for line in log_file:
+                scanned += 1
+                fields = event_fields(line.rstrip("\r\n"), pattern)
+                key = event_id(fields.get(args.key))
+                timestamp = event_time(fields.get(args.time))
+                if key is None or timestamp is None:
+                    skipped += 1
+                    continue
+
+                stats = groups.get(key)
+                if stats is None:
+                    groups[key] = EventStats(timestamp, timestamp)
+                else:
+                    stats.first = min(stats.first, timestamp)
+                    stats.last = max(stats.last, timestamp)
+                    stats.count += 1
+    except FileNotFoundError:
+        print(f"Log file not found: {args.log_file}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"Cannot read log: {error}", file=sys.stderr)
+        return 1
+
+    # Sort the IDs first to break ties consistently even when input is reordered.
+    ranked = sorted(groups)
+    if args.sort == "span":
+        ranked.sort(key=lambda key: groups[key].last - groups[key].first, reverse=True)
+    else:
+        ranked.sort(key=lambda key: groups[key].count, reverse=True)
+
+    print("EVENTS  OBSERVED SPAN   FIRST (UTC)                       LAST (UTC)                        ID")
+    for key in ranked:
+        stats = groups[key]
+        span = stats.last - stats.first
+        print(
+            f"{stats.count:6}  {str(span):14}  "
+            f"{stats.first.isoformat(timespec='microseconds')}  "
+            f"{stats.last.isoformat(timespec='microseconds')}  {json.dumps(key)}"
+        )
+    print(f"Scanned: {scanned}  IDs: {len(groups)}  Skipped: {skipped}")
+    return 0
+
+
 def main() -> int:
     if sys.argv[1:2] == ["search"]:
         return search_log(sys.argv[2:])
@@ -237,12 +334,18 @@ def main() -> int:
         return group_log(sys.argv[2:])
     if sys.argv[1:2] == ["timeline"]:
         return timeline_log(sys.argv[2:])
+    if sys.argv[1:2] == ["correlate"]:
+        return correlate_log(sys.argv[2:])
 
     parser = argparse.ArgumentParser(
         description="Count INFO, WARNING, and ERROR entries, with optional ISO timestamps.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Commands: search, group, timeline. Run any command with -h for details.\n\n"
+            "Commands (add -h after a command for its options):\n"
+            "  search      Find matching lines and surrounding context\n"
+            "  group       Rank extracted values by frequency\n"
+            "  timeline    Reconstruct events for one ID\n"
+            "  correlate   Rank IDs by event count or observed span\n\n"
             "Examples:\n"
             "  python log_summary.py                 Count levels in app.log\n"
             "  python log_summary.py app.log --level ERROR\n"

@@ -239,5 +239,53 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(rows[2], "Scanned: 5  Matched: 2  Skipped: 2")
 
 
+class CorrelateTests(unittest.TestCase):
+    def test_reports_are_identical_for_text_and_reversed_jsonl(self):
+        repo = Path(__file__).resolve().parent
+        command = [sys.executable, "log_summary.py", "correlate"]
+        text = subprocess.run(
+            [*command, "app.log", "--key", "id", "--time", "ts",
+             "--regex", r"^(?P<ts>\S+).*request_id=(?P<id>\S+)"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        )
+        json_lines = (repo / "app.jsonl").read_text(encoding="utf-8").splitlines()
+        structured = subprocess.run(
+            [*command, "-", "--format", "jsonl", "--key", "request_id",
+             "--time", "timestamp", "--sort", "span"],
+            cwd=repo, input="\n".join(reversed(json_lines)),
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(text.stdout, structured.stdout)
+        rows = text.stdout.splitlines()
+        self.assertEqual(rows[1].split(), [
+            "6", "0:00:01.781000", "2026-11-26T14:00:00.000000+00:00",
+            "2026-11-26T14:00:01.781000+00:00", '"r-100"',
+        ])
+        self.assertEqual(rows[-1], "Scanned: 20  IDs: 5  Skipped: 0")
+
+    def test_count_sort_and_skipped_records(self):
+        repo = Path(__file__).resolve().parent
+        log = (
+            '{"id":"wide","ts":"2026-11-26T14:10:00Z"}\n'
+            '{"id":"busy","ts":"2026-11-26T14:00:00Z"}\n'
+            '{"id":"wide","ts":"2026-11-26T14:00:00Z"}\n'
+            '{"id":"busy","ts":"2026-11-26T14:00:01Z"}\n'
+            '{"id":"busy","ts":"2026-11-26T14:00:02Z"}\n'
+            '{"id":"busy","ts":"invalid"}\n'
+            '{"ts":"2026-11-26T14:00:00Z"}\n'
+        )
+        for ranking, first_id in [("count", "busy"), ("span", "wide")]:
+            with self.subTest(ranking=ranking):
+                result = subprocess.run(
+                    [sys.executable, "log_summary.py", "correlate", "-",
+                     "--format", "jsonl", "--key", "id", "--time", "ts",
+                     "--sort", ranking],
+                    cwd=repo, input=log, capture_output=True, text=True, check=True,
+                )
+                rows = result.stdout.splitlines()
+                self.assertTrue(rows[1].endswith(f'"{first_id}"'))
+                self.assertEqual(rows[-1], "Scanned: 7  IDs: 2  Skipped: 2")
+
+
 if __name__ == "__main__":
     unittest.main()
