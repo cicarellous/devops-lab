@@ -1,3 +1,4 @@
+import gzip
 import json
 import subprocess
 import sys
@@ -464,7 +465,7 @@ class InspectTests(unittest.TestCase):
         self.assertIn('Signature candidates (by name): "code"', result.stdout)
         self.assertIn('ID candidates (by name): "request"', result.stdout)
         self.assertIn('"request": 83/93 | str', result.stdout)
-        self.assertIn("bucket 'incident.jsonl' --format jsonl --time='ts' --interval 30s", result.stdout)
+        self.assertIn("bucket 'incident.jsonl' --format jsonl --time='ts' --interval 30s", result.stderr)
 
     def test_inspect_limits_stdin_sample_and_recognizes_text(self):
         result = self.run_cli(
@@ -845,6 +846,94 @@ class MultiSourceAnalysisTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("stdin can only be used as one source", result.stderr)
+
+
+class AutomationContractTests(unittest.TestCase):
+    def run_cli(self, *args, data=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=data,
+            text=True, capture_output=True,
+        )
+
+    def test_correlate_json_hands_ranked_id_to_timeline(self):
+        sources = MultiSourceAnalysisTests.sources
+        result = self.run_cli("correlate", *sources, "--top", "1", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual((report["command"], report["schema_version"], report["total_rows"]),
+                         ("correlate", 1, 15))
+        row, = report["results"]
+        self.assertEqual((row["id"], row["events"], row["span_ms"]), ("incident-00", 9, 72_000))
+        self.assertEqual(row["sources"], ["incident.jsonl", "worker-example.txt"])
+        timeline = self.run_cli("timeline", *sources, "--value", row["id"], "--json")
+        self.assertEqual(timeline.returncode, 0, timeline.stderr)
+        self.assertEqual(len(json.loads(timeline.stdout)["events"]), row["events"])
+
+    def test_inspect_and_group_use_nested_fields_with_clean_json(self):
+        data = '{"event":{"ts":"2026-11-26T14:00Z","code":"E1"}}\n'
+        inspect = self.run_cli("inspect", "-", "--json", data=data)
+        self.assertEqual(inspect.returncode, 0, inspect.stderr)
+        report = json.loads(inspect.stdout)
+        self.assertEqual(report["command"], "inspect")
+        self.assertEqual(report["profile"]["time"], "event.ts")
+        self.assertEqual(report["profile"]["signature"], "event.code")
+        self.assertIn("Try in PowerShell", inspect.stderr)
+        group = self.run_cli("group", "-", "--format", "jsonl", "--by", "event.code",
+                             "--json", data=data)
+        self.assertEqual(group.returncode, 0, group.stderr)
+        self.assertEqual(json.loads(group.stdout)["results"], [{"value": "E1", "count": 1}])
+
+    def test_all_json_commands_support_opt_in_empty_status(self):
+        window = ("--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
+                  "--incident", "2026-11-26T14:01Z", "2026-11-26T14:02Z")
+        cases = [
+            ("summary", ["-"]),
+            ("search", ["search", "-", "--contains", "missing"]),
+            ("group", ["group", "-", "--format", "jsonl", "--by", "id"]),
+            ("timeline", ["timeline", "-", "--format", "jsonl", "--key", "id",
+                          "--time", "ts", "--value", "missing"]),
+            ("correlate", ["correlate", "-", "--format", "jsonl", "--key", "id", "--time", "ts"]),
+            ("compare", ["compare", "-", "--format", "jsonl", "--time", "ts",
+                         "--signature", "code", *window]),
+            ("bucket", ["bucket", "-", "--format", "jsonl", "--time", "ts", "--interval", "1m"]),
+            ("inspect", ["inspect", "-"]),
+        ]
+        for name, args in cases:
+            with self.subTest(command=name):
+                result = self.run_cli(*args, "--json", "--fail-on", "empty", data="")
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["command"], name)
+                self.assertTrue(result.stderr)
+
+    def test_search_json_keeps_original_line_numbers_and_context(self):
+        result = self.run_cli("search", "-", "--contains", "hit", "--context", "1", "--json",
+                              data="before\nhit\nafter\nignored\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["coverage"], {"scanned": 4, "matched": 1, "displayed": 3})
+        self.assertEqual([item["line"] for item in report["lines"]], [1, 2, 3])
+
+    def test_gzip_globs_and_configurable_severity(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profile.json"
+            profile.write_text('{"format":"jsonl","time":"ts","key":"id","level_field":"priority"}',
+                               encoding="utf-8")
+            for minute in ("00", "01"):
+                with gzip.open(root / f"events-{minute}.jsonl.gz", "wt", encoding="utf-8-sig") as stream:
+                    stream.write(f'{{"ts":"2026-11-26T14:{minute}Z","id":"r1","priority":"critical"}}\n')
+            source = self.run_cli("correlate", "--source", str(root / "*.gz"), str(profile), "--json")
+            self.assertEqual(source.returncode, 0, source.stderr)
+            self.assertEqual(json.loads(source.stdout)["results"][0]["events"], 2)
+            log = str(root / "events-00.jsonl.gz")
+            summary = self.run_cli(log, "--profile", str(profile), "--levels", "CRITICAL", "--json")
+            self.assertEqual(summary.returncode, 0, summary.stderr)
+            self.assertEqual(json.loads(summary.stdout)["counts"], {"CRITICAL": 1})
+            bucket = self.run_cli("bucket", log, "--profile", str(profile), "--interval", "1m",
+                                  "--level", "CRITICAL", "--json")
+            self.assertEqual(bucket.returncode, 0, bucket.stderr)
+            self.assertEqual(json.loads(bucket.stdout)["coverage"]["counted"], 1)
 
 
 if __name__ == "__main__":

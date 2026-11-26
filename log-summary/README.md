@@ -27,7 +27,7 @@ python log_summary.py
 
 Run the remaining examples from `log-summary/`. The included `app.log` and
 `app.jsonl` represent the same 20 synthetic events, with interleaved requests,
-retries, and recurring error codes. Pass a UTF-8 file path (with or without a BOM) or use `-` to read
+retries, and recurring error codes. Pass a UTF-8 file path (plain or `.gz`, with or without a BOM) or use `-` to read
 from standard input.
 
 ## Inspect an unfamiliar log
@@ -44,8 +44,9 @@ For key-value logs, inspect suggests `logfmt`. Save a suggested mapping with
 `python log_summary.py inspect app.log --profile-out app-profile.json`, then
 review the new profile before using it. Existing files are kept intact.
 
-Empty results still exit with status 0. Guidance goes to stderr and
-distinguishes no matches, an empty window, and unusable input fields.
+Empty results exit with status 0 by default. Add `--fail-on empty` to return
+3 instead. Guidance goes to stderr and distinguishes no matches, an empty
+window, and unusable input fields.
 
 ## Summarize severity
 
@@ -57,10 +58,11 @@ python log_summary.py app.log --level ERROR --contains "timed out" --show-lines
 python log_summary.py app.jsonl --format jsonl --level-field severity
 ```
 
-JSON Lines uses the top-level `severity` field by default. Its values are
+JSON Lines uses the `severity` field by default. Its values are
 matched case-insensitively against INFO, WARNING, and ERROR. Coverage goes
 to stderr for JSON Lines and for text with unclassified lines. It counts
-lines after text filters, across all levels.
+lines after text filters, across all levels. Use `--levels INFO WARNING ERROR CRITICAL`
+to choose the severity vocabulary.
 
 Key-value logs can use `--format logfmt`. The parser reads consecutive
 `key=value` fields, including double-quoted values, after an optional ISO
@@ -82,7 +84,8 @@ is printed once.
 
 ## Group log entries
 
-Use a named regex capture for plain text or a field from JSON Lines or logfmt.
+Use a named regex capture for text or a field from JSON Lines or logfmt. Use
+dotted paths such as `event.code` for nested JSON fields.
 
 ```powershell
 python log_summary.py group app.log --regex 'code=(?P<code>E\d{4})' --by code
@@ -93,7 +96,7 @@ Get-Content app.jsonl | python log_summary.py group - --format jsonl --by servic
 Both error-code reports rank `E1042` (4), `E2007` (3), and `E3001` (1).
 Results are ordered by count, with ties sorted by displayed value.
 Each line contributes at most one value. Text uses the first regex match.
-JSON Lines uses a top-level scalar field. Missing, empty, unmatched, and
+JSON Lines uses a scalar field. Missing, empty, unmatched, and
 malformed records count as skipped. The footer shows how much of the input
 contributed to the report.
 
@@ -167,7 +170,7 @@ Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps bef
 filtering. Empty buckets inside the reported range show zero observed
 events. Partial edge buckets show counts with no rate (`null` in JSON).
 Reports are limited to 10,000 buckets. Signature matching is exact unless
-you pass `--ignore-case`.
+you pass `--ignore-case`. Use `--level ERROR` to bucket by severity directly.
 
 ## Compare an incident with a baseline
 
@@ -187,7 +190,8 @@ reflect only records with usable IDs. Rates use the full requested windows.
 ## Analyze multiple sources
 
 Use the same `--source FILE PROFILE` pairs with `compare`, `correlate`, and
-`timeline`. Each profile maps the fields in its own file.
+`timeline`. Each profile maps the fields in its own file. Quote a glob such
+as `'logs/*.jsonl.gz'` to apply one profile to all matching files.
 
 ```powershell
 python log_summary.py compare --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z
@@ -202,9 +206,10 @@ overlapping copies can inflate event counts.
 ## Limit or export reports
 
 Use `--top N` with `group`, `correlate`, or `compare` to show the first N
-ranked rows. Coverage still describes the entire input. Add `--json` to
-`compare`, `timeline`, or `bucket` for versioned output on stdout. The severity summary also accepts `--json`.
-Each JSON report identifies its command.
+ranked rows. Coverage still describes the entire input. Every command accepts
+`--json` for one versioned report on stdout. Each report identifies its command.
+Use `search --json` for matching lines and context, or severity summary
+`--json` for counts.
 
 ## Reuse field mappings
 
@@ -220,7 +225,9 @@ python log_summary.py timeline incident.jsonl --profile incident-profile.json --
 Profile keys are `format`, `time`, `regex`, `signature`, `service`, `id`,
 `by` (group), and `level_field` (summary).
 Use `regex` for named captures in text logs. The `id` field supplies `--key`
-for timeline and correlation. Explicit flags override the profile. Time
+for timeline and correlation (`key` is an alias in the profile). Explicit
+flags override the profile. Bucket uses its signature mapping when you pass
+`--value`. Time
 windows, requested values, and output options stay on the command line.
 
 ## Tests
@@ -231,4 +238,5 @@ From `log-summary/`, run the unit tests:
 python -m unittest -v
 ```
 
-GitHub Actions runs the tests on Ubuntu and Windows for pushes to `main` and pull requests targeting it. You can see each run in the repository's **Actions** tab.
+GitHub Actions runs the tests on Ubuntu and Windows. The Ubuntu job also runs
+Ruff and mypy. You can see each run in the repository's **Actions** tab.
