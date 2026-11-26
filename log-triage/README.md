@@ -5,33 +5,18 @@ and rotated files, identify spikes, compare incident and baseline windows,
 and follow a request across services. Use text reports during an investigation
 and versioned JSON and exit codes in automation.
 
-## Quick start
+## Download and install
 
-Linux is the primary platform. On **RHEL 8.10**, install Python 3.12 from
-AppStream. Log Triage uses the Python standard library.
+Download the **Log Triage bundle** from [GitHub Releases](https://github.com/cicarellous/devops-lab/releases).
+Under **Assets**, choose `log-triage-<version>-bundle.zip`. Extract it
+and open a terminal in the extracted folder. The bundle includes the
+installable wheel, the analyst guides, sample logs, and the MIT license.
 
-```bash
-sudo dnf install python3.12
-cd log-triage
-python3.12 log_triage.py app.jsonl --format jsonl
-```
+All you need is **Python 3.12 or later** with pip. The wheel installs
+offline and works on Linux and Windows. On RHEL 8.10, install
+`python3.12` from AppStream if needed.
 
-Expected counts:
-
-```text
-INFO: 12
-WARNING: 3
-ERROR: 5
-```
-
-Run commands from `log-triage/` in the repository. On Windows, use
-`python log_triage.py` in an activated environment with Python 3.12 or later.
-[Red Hat Python setup guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_basic_system_settings/installing-and-using-dynamic-programming-languages_configuring-basic-system-settings)
-
-## Install the command from this checkout
-
-From `log-triage/`, create and activate a virtual environment if you
-do not already have one.
+On Linux:
 
 ```bash
 python3.12 -m venv .venv
@@ -45,18 +30,41 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Then install the project and try the bundled sample from any directory:
+Install the wheel from the extracted folder and run the bundled sample.
+If you downloaded a different version, use the wheel filename in your bundle.
 
-```text
-python -m pip install .
+```sh
+python -m pip install --no-index --no-deps log_triage-0.1.0-py3-none-any.whl
 log-triage --version
 log-triage
 ```
 
-The install command runs from `log-triage/`. Once installed,
-`log-triage` is available whenever the environment is active.
-The guides use the source checkout and its exercise files. You can
-replace `python3.12 log_triage.py` with `log-triage` after installing.
+Expected counts:
+
+```text
+INFO: 12
+WARNING: 3
+ERROR: 5
+```
+
+## Install directly from GitHub
+
+If you have Git and an active Python 3.12+ virtual environment, you can
+install from the repository in one command. This needs internet access
+and installs the current code from the default branch.
+
+```sh
+python -m pip install "git+https://github.com/cicarellous/devops-lab.git#subdirectory=log-triage"
+log-triage --version
+```
+
+## Use a source checkout
+
+If you already cloned the repository, run `python -m pip install .` from
+`log-triage/` with your environment active. You can also run the script
+directly from that directory with `python3.12 log_triage.py` on Linux or
+`python log_triage.py` on Windows. The download bundle and checkout both include the
+sample files used in the runbook.
 
 ## Documentation
 
@@ -64,7 +72,7 @@ Use a centralized log export or a UTF-8 stream from your approved logging CLI. S
 
 - [Start with the runbook](docs/runbook.md). It walks through sample commands, expected results, and what to investigate next.
 - [Reference](docs/reference.md) for formats, field mappings, time windows, JSON, exit codes, and troubleshooting.
-- `python3.12 log_triage.py -h` lists commands. Add `-h` after any command for its flags.
+- `log-triage -h` lists commands. Add `-h` after any command for its flags.
 
 ## License
 

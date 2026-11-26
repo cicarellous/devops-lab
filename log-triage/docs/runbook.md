@@ -1,14 +1,16 @@
 # Log Triage runbook
 
-Run these exercises from `log-triage/` using the included synthetic logs.
-The commands use Bash and Python 3.12. On Windows, substitute `python`
-in an activated environment. File-based commands also work in PowerShell.
-See the [reference](reference.md) for input and output rules.
+Run the exercises from the extracted download bundle or the `log-triage/`
+directory in a source checkout. The commands use Bash and Python 3.12.
+If you installed the wheel, replace `python3.12 log_triage.py` (or
+`python log_triage.py` on Windows) with `log-triage`. The remaining
+arguments and sample file paths stay the same. See the
+[reference](reference.md) for input and output rules.
 
 ## Before you start
 
-From the repository root, run `cd log-triage`. Then verify you are in the
-right directory and that Python is available.
+Open a terminal in the extracted bundle folder or in `log-triage/`
+inside the source checkout. Then verify that Python and Log Triage run.
 
 ```bash
 python3.12 --version
@@ -17,9 +19,9 @@ python3.12 log_triage.py --version
 
 You should see Python 3.12.x and a line beginning with `Log Triage`. On
 Windows, substitute `python` throughout after activating your Python
-environment. If Python cannot find `log_triage.py`, check that your terminal
-is in the directory containing that file. The README has
-[setup instructions](../README.md#quick-start).
+environment. If Python cannot find `log_triage.py`, use the installed `log-triage` command
+or move to the source directory containing the script. The README has
+[setup instructions](../README.md#download-and-install).
 
 Keep the bundled files intact. Commands that create files below use scratch
 directories or explicitly named outputs. Copy commands from Bash or

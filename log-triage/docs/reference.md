@@ -1,7 +1,9 @@
 # Log Triage reference
 
-See the [quick start](../README.md) for setup and the [runbook](runbook.md)
-for complete investigations. Run the examples from `log-triage/`.
+See the [installation guide](../README.md#download-and-install) for setup and the [runbook](runbook.md)
+for complete investigations. Run examples from the extracted bundle or
+`log-triage/` in the checkout. With the wheel installed, use `log-triage`
+where examples say `python3.12 log_triage.py`.
 The examples use `python3.12` on Linux. On Windows, substitute `python` in
 an activated environment with Python 3.12 or later.
 
