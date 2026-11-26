@@ -44,7 +44,10 @@ types, presence, and timestamp candidates. On `incident.jsonl`, look for
 `--signature code --value TIMEOUT` to isolate the jump at 14:01 UTC.
 For key-value logs, inspect suggests `logfmt`. Save a suggested mapping with
 `python log_summary.py inspect app.log --profile-out app-profile.json`, then
-review the new profile before using it. Existing files are kept intact.
+review the new profile before using it. Inspect uses the inferred signature as
+the default grouping field (`by`). Its bucket suggestion preserves
+`--multiline` and chooses an interval for the sampled time span. Longer logs
+may need a wider interval. Existing files are kept intact.
 
 Empty results exit with status 0 by default. Add `--fail-on empty` to return
 3 instead. Guidance goes to stderr and distinguishes no matches, an empty
@@ -92,6 +95,7 @@ is printed once.
 Use `--multiline` with any command when reading text logs. For `inspect`,
 `--lines` counts sampled records in this mode.
 Lines that start with a space or tab attach to the preceding record.
+Unindented stack frames start new records.
 Summary and search can match text anywhere in a record. Severity and field
 mappings read its header. JSON Lines stays line-based in structured commands and when `inspect` recognizes
 a JSON object. A multiline record exceeding 10,000 lines or 1 MiB of UTF-8
@@ -264,8 +268,9 @@ python log_summary.py group --source app.jsonl app-jsonl-profile.json --source s
 python log_summary.py bucket --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --interval 1m --value E1042 --multiline --since 2026-11-26T14:00Z --before 2026-11-26T14:02Z
 ```
 
-Reports show each source's contribution. Summary `--show-lines` includes the
-source and line range when you use `--source`.
+Summary shows the severity counts for each source. `--level` limits the
+displayed counts, and coverage still includes all classified severities.
+With `--source`, summary `--show-lines` includes the source and line range.
 
 ## Limit or export reports
 
@@ -273,7 +278,8 @@ Use `--top N` with `group`, `correlate`, or `compare` to show the first N
 ranked rows. Coverage still describes the entire input. Every command accepts
 `--json` for one versioned report on stdout. Each report identifies its command.
 Use `search --json` for matching lines and context, or severity summary
-`--json` for counts.
+`--json` for counts. Summary, group, and bucket JSON always include physical
+line counts and `coverage.sources`, including for a single file or stdin.
 
 ## Reuse field mappings
 

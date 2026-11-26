@@ -1,5 +1,6 @@
 import gzip
 import json
+import shlex
 import subprocess
 import sys
 import unittest
@@ -432,7 +433,7 @@ class BucketTests(unittest.TestCase):
                 self.assertEqual(coverage["counted"], sum(expected))
                 self.assertEqual(
                     coverage["scanned"],
-                    sum(value for name, value in coverage.items() if name != "scanned"),
+                    sum(coverage[name] for name in ("counted", "invalid_timestamp", "outside_window", "filtered")),
                 )
 
     def test_text_and_jsonl_match_with_reordered_input_and_partial_edges(self):
@@ -488,6 +489,74 @@ class InspectTests(unittest.TestCase):
                 )
                 self.assertEqual(json.loads(result.stdout)["coverage"]["counted"], 0)
                 self.assertIn(message, result.stderr)
+
+
+class InspectFollowThroughTests(unittest.TestCase):
+    def run_cli(self, *args, data=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=data,
+            text=True, encoding="utf-8", capture_output=True, check=True,
+        )
+
+    def test_generated_profile_works_for_all_consumers(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "generated.json"
+            self.run_cli("inspect", "app.jsonl", "--profile-out", str(profile))
+            mapping = json.loads(profile.read_text(encoding="utf-8"))
+            self.assertEqual((mapping["signature"], mapping["by"]), ("code", "code"))
+            for command, options, field in (
+                ((), (), "counts"),
+                (("group",), (), "results"),
+                (("bucket",), ("--interval", "30s"), "buckets"),
+                (("compare",), ("--baseline", "2026-11-26T14:00:00Z", "2026-11-26T14:00:01Z",
+                                "--incident", "2026-11-26T14:00:01Z", "2026-11-26T14:01:00Z"), "results"),
+                (("correlate",), (), "results"),
+                (("timeline",), ("--value", "r-100"), "events"),
+            ):
+                with self.subTest(command=command):
+                    report = json.loads(self.run_cli(
+                        *command, "app.jsonl", "--profile", str(profile), *options, "--json",
+                    ).stdout)
+                    self.assertTrue(report[field])
+
+    def test_suggested_bucket_command_preserves_multiline(self):
+        result = self.run_cli("inspect", "stacktrace-example.txt", "--multiline")
+        suggestion = next(line.strip() for line in result.stderr.splitlines()
+                          if line.strip().startswith("python log_summary.py bucket"))
+        report = json.loads(self.run_cli(*shlex.split(suggestion)[2:], "--json").stdout)
+        coverage = report["coverage"]
+        self.assertEqual((coverage["scanned"], coverage["physical_lines"], coverage["invalid_timestamp"]),
+                         (3, 6, 0))
+
+    def test_suggested_bucket_interval_handles_sparse_input(self):
+        data = '{"ts":"2020-01-01T00:00:00Z"}\n{"ts":"2021-01-01T00:00:00Z"}\n'
+        result = self.run_cli("inspect", "-", data=data)
+        suggestion = next(line.strip() for line in result.stderr.splitlines()
+                          if line.strip().startswith("python log_summary.py bucket"))
+        report = json.loads(self.run_cli(*shlex.split(suggestion)[2:], "--json", data=data).stdout)
+        self.assertEqual(report["coverage"]["counted"], 2)
+        self.assertLessEqual(len(report["buckets"]), 10_000)
+
+    def test_positional_source_and_stdin_emit_full_coverage(self):
+        fixture = Path(__file__).resolve().with_name("app.jsonl").read_text(encoding="utf-8")
+        for command, options in (((), ()), (("group",), ()), (("bucket",), ("--interval", "30s"))):
+            with self.subTest(command=command):
+                reports = [
+                    json.loads(self.run_cli(*command, *source, *options, "--json", data=data).stdout)
+                    for source, data in (
+                        (("app.jsonl", "--profile", "app-jsonl-profile.json"), None),
+                        (("--source", "app.jsonl", "app-jsonl-profile.json"), None),
+                        (("-", "--profile", "app-jsonl-profile.json"), fixture),
+                    )
+                ]
+                coverages = [report["coverage"] for report in reports]
+                self.assertEqual(coverages[0], coverages[1])
+                self.assertEqual(set(coverages[0]), set(coverages[2]))
+                for coverage in coverages:
+                    self.assertEqual(coverage["physical_lines"], 20)
+                    self.assertEqual(len(coverage["sources"]), 1)
+                    self.assertEqual(coverage["sources"][0]["physical_lines"], 20)
 
 
 class ProfileTests(unittest.TestCase):
@@ -643,7 +712,7 @@ class InputCompatibilityTests(unittest.TestCase):
             self.assertIn("Suggested format: logfmt", result.stdout)
             self.assertEqual(json.loads(profile.read_text()), {
                 "format": "logfmt", "id": "job", "time": "timestamp",
-                "service": "service", "signature": "code",
+                "service": "service", "signature": "code", "by": "code",
             })
             existing = self.run_cli("inspect", "worker-example.txt", "--profile-out", str(profile), check=False)
             self.assertEqual(existing.returncode, 1)
@@ -957,7 +1026,8 @@ class ReportCorrectnessTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 report = json.loads(result.stdout)
                 self.assertEqual(report["counts"][level], 1)
-                self.assertEqual(report["coverage"], {"classified": 1, "unclassified": 0})
+                self.assertEqual(report["coverage"]["classified"], 1)
+                self.assertEqual(report["coverage"]["unclassified"], 0)
 
     def test_text_profile_capture_is_independent_of_cli_regex_filter(self):
         with TemporaryDirectory() as directory:
@@ -1254,6 +1324,8 @@ class MultilineTests(unittest.TestCase):
         report = json.loads(group.stdout)
         self.assertEqual(report["coverage"], {
             "scanned": 3, "grouped": 3, "skipped": 0, "physical_lines": 6,
+            "sources": [{"source": "stacktrace-example.txt", "field": "code",
+                         "scanned": 3, "grouped": 3, "skipped": 0, "physical_lines": 6}],
         })
         self.assertEqual(report["results"], [{"value": "E1042", "count": 2},
                                              {"value": "START", "count": 1}])
@@ -1296,6 +1368,8 @@ class MultilineParityTests(unittest.TestCase):
         self.assertEqual(bucket["coverage"], {
             "scanned": 3, "counted": 3, "invalid_timestamp": 0,
             "outside_window": 0, "filtered": 0, "physical_lines": 6,
+            "sources": [{"source": fixture, "signature": None, "scanned": 3, "counted": 3,
+                         "invalid_timestamp": 0, "outside_window": 0, "filtered": 0, "physical_lines": 6}],
         })
         self.assertIn("Physical lines: 6", self.run_cli("bucket", *common, "--interval", "1m").stdout)
         correlate = json.loads(self.run_cli("correlate", *common, "--key", "request_id", "--json").stdout)
@@ -1375,6 +1449,17 @@ class MultiSourceTotalsTests(unittest.TestCase):
         self.assertIn("stacktrace-example.txt:1-3", text.stdout)
         self.assertIn("ERROR: 1", text.stdout)
         self.assertIn("app.jsonl: scanned 20, classified 0, unclassified 0, filtered 20", text.stdout)
+
+    def test_summary_reports_selected_level_per_source(self):
+        args = (*self.sources, "--multiline", "--level", "ERROR")
+        report = json.loads(self.run_cli(*args, "--json").stdout)
+        self.assertEqual(report["counts"], {"ERROR": 7})
+        self.assertEqual(report["coverage"]["classified"], 23)
+        self.assertEqual([source["counts"] for source in report["coverage"]["sources"]],
+                         [{"ERROR": 5}, {"ERROR": 2}])
+        output = self.run_cli(*args).stdout
+        self.assertRegex(output, r"app\.jsonl: [^\n]+\n +ERROR: 5")
+        self.assertRegex(output, r"stacktrace-example\.txt: [^\n]+\n +ERROR: 2")
 
     def test_group_merges_values_and_keeps_full_coverage_with_top(self):
         result = self.run_cli("group", *self.sources, "--multiline", "--top", "1", "--json")

@@ -103,6 +103,16 @@ class SeverityCoverage:
     physical_lines: int = 0
 
 
+class SummarySourceCoverage(TypedDict):
+    source: str
+    scanned: int
+    classified: int
+    unclassified: int
+    filtered: int
+    physical_lines: int
+    counts: dict[str, int]
+
+
 def normalize_level(value: str, levels: Iterable[str]) -> str:
     level = value.strip().upper()
     return level if level in levels else LEVEL_ALIASES.get(level, level)
@@ -382,7 +392,7 @@ def group_log(argv: list[str]) -> int:
             "source": source_name(path), "field": mapping.by,
             "scanned": source_scanned, "grouped": source_grouped,
             "skipped": source_scanned - source_grouped,
-            **({"physical_lines": source_lines} if args.multiline else {}),
+            "physical_lines": source_lines,
         })
 
     # Encode each distinct string once, preserving the report's ordering and escaping.
@@ -390,12 +400,11 @@ def group_log(argv: list[str]) -> int:
     values = chain(encoded_values.items(), encoded_strings)
     ranked = sorted(values, key=lambda item: (-item[1], item[0]))
     displayed = ranked[:args.top]
-    coverage: dict[str, object] = {"scanned": scanned, "grouped": grouped, "skipped": scanned - grouped}
-    if args.source:
-        coverage["sources"] = sources
+    coverage = {
+        "scanned": scanned, "grouped": grouped, "skipped": scanned - grouped,
+        "physical_lines": physical_lines, "sources": sources,
+    }
     fields = sorted({mapping.by for _, mapping in mappings})
-    if args.multiline:
-        coverage["physical_lines"] = physical_lines
     if args.json:
         print(json.dumps({
             "schema_version": 1,
@@ -1372,7 +1381,7 @@ def bucket_log(argv: list[str]) -> int:
             "source": source_name(path), "signature": signature, "scanned": source_scanned,
             "counted": source_counted, "invalid_timestamp": source_invalid,
             "outside_window": source_outside, "filtered": source_filtered,
-            **({"physical_lines": source_lines} if args.multiline else {}),
+            "physical_lines": source_lines,
         })
 
     start = start_bound if start_bound is not None else first
@@ -1406,10 +1415,9 @@ def bucket_log(argv: list[str]) -> int:
         "invalid_timestamp": invalid,
         "outside_window": outside,
         "filtered": filtered,
-        **({"physical_lines": physical_lines} if args.multiline else {}),
+        "physical_lines": physical_lines,
+        "sources": sources,
     }
-    if args.source:
-        coverage["sources"] = sources
     if not scanned:
         print("The input is empty.", file=sys.stderr)
     elif invalid == scanned:
@@ -1468,6 +1476,15 @@ class FieldSample:
     timestamps: int = 0
     epochs: Counter[str] = field(default_factory=Counter)
     types: set[str] = field(default_factory=set)
+    time_bounds: dict[str, tuple[datetime, datetime]] = field(default_factory=dict)
+
+    def observe_time(self, mode: str, timestamp: datetime) -> None:
+        if mode == "iso":
+            self.timestamps += 1
+        else:
+            self.epochs[mode] += 1
+        first, last = self.time_bounds.get(mode, (timestamp, timestamp))
+        self.time_bounds[mode] = (min(first, timestamp), max(last, timestamp))
 
 
 def inspect_json_fields(record: dict[str, object]) -> dict[str, object]:
@@ -1528,13 +1545,14 @@ def inspect_log(argv: list[str]) -> int:
                     sample = sample_fields[name]
                     sample.present += 1
                     sample.types.add(type(value).__name__)
-                    if isinstance(value, str) and event_time(value) is not None:
-                        sample.timestamps += 1
+                    iso_timestamp = event_time(value) if isinstance(value, str) else None
+                    if iso_timestamp is not None:
+                        sample.observe_time("iso", iso_timestamp)
                     elif EPOCH_FIELD_NAME.search(name.rsplit(".", 1)[-1]):
                         for mode in ("epoch_s", "epoch_ms"):
                             candidate_time = epoch_time(value, mode)
                             if candidate_time is not None and INSPECT_EPOCH_START <= candidate_time < INSPECT_EPOCH_END:
-                                sample.epochs[mode] += 1
+                                sample.observe_time(mode, candidate_time)
     except (OSError, UnicodeError) as error:
         return report_input_error(args.log_file, error)
 
@@ -1560,6 +1578,9 @@ def inspect_log(argv: list[str]) -> int:
             if choices:
                 candidates[role] = choices
                 profile[role] = max(choices, key=lambda name: fields[name].present)
+
+    if "signature" in profile:
+        profile["by"] = profile["signature"]
 
     time_modes: dict[str, tuple[str, int]] = {}
     for name, sample in fields.items():
@@ -1663,7 +1684,14 @@ def inspect_log(argv: list[str]) -> int:
     timestamp = timestamp_fields[0].replace("'", "''")
     source = args.log_file.replace("'", "''")
     print("Try in PowerShell:", file=sys.stderr)
-    options = f"--format {input_format} --time='{timestamp}' --interval 30s"
+    first, last = fields[timestamp_fields[0]].time_bounds[time_modes[timestamp_fields[0]][0]]
+    # Reserve an extra aligned bucket since the first sample may be off the boundary.
+    span_us = (last - first) // MICROSECOND
+    min_seconds = span_us // ((MAX_BUCKETS - 1) * 1_000_000) + 1
+    interval = max(30, ((min_seconds + 29) // 30) * 30)
+    options = f"--format {input_format} --time='{timestamp}' --interval {interval}s"
+    if args.multiline:
+        options += " --multiline"
     if "time_format" in profile:
         print("Confirm the suggested epoch unit before using the mapping.", file=sys.stderr)
         options += f" --time-format {profile['time_format']}"
@@ -1782,7 +1810,8 @@ def main() -> int:
     pattern = compile_pattern(parser, regex_flag)
     counts = dict.fromkeys(vocabulary, 0)
     coverage = SeverityCoverage()
-    sources = []
+    levels = (args.level,) if args.level else vocabulary
+    sources: list[SummarySourceCoverage] = []
     for path, mapping, level_field, level_pattern in severity_mappings:
         source_coverage = SeverityCoverage()
         try:
@@ -1813,21 +1842,18 @@ def main() -> int:
             "source": source_name(path), "scanned": source_coverage.scanned,
             "classified": source_coverage.classified, "unclassified": source_coverage.unclassified,
             "filtered": source_coverage.scanned - source_coverage.classified - source_coverage.unclassified,
-            **({"physical_lines": source_coverage.physical_lines} if args.multiline else {}),
+            "physical_lines": source_coverage.physical_lines,
+            "counts": {level: source_counts[level] for level in levels},
         })
 
-    levels = (args.level,) if args.level else vocabulary
-    report_coverage: dict[str, object] = {
-        "classified": coverage.classified, "unclassified": coverage.unclassified,
+    report_coverage = {
+        "classified": coverage.classified,
+        "unclassified": coverage.unclassified,
+        "scanned": coverage.scanned,
+        "filtered": coverage.scanned - coverage.classified - coverage.unclassified,
+        "physical_lines": coverage.physical_lines,
+        "sources": sources,
     }
-    if args.source:
-        report_coverage.update({
-            "scanned": coverage.scanned,
-            "filtered": coverage.scanned - coverage.classified - coverage.unclassified,
-            "sources": sources,
-        })
-        if args.multiline:
-            report_coverage["physical_lines"] = coverage.physical_lines
     if args.json:
         print(json.dumps({
             "schema_version": 1,
@@ -1844,6 +1870,8 @@ def main() -> int:
                 source_suffix = f", physical lines {source['physical_lines']}" if args.multiline else ""
                 print(f"{source['source']}: scanned {source['scanned']}, classified {source['classified']}, "
                       f"unclassified {source['unclassified']}, filtered {source['filtered']}{source_suffix}")
+                level_counts = "  ".join(f"{level}: {count}" for level, count in source["counts"].items())
+                print(f"  {level_counts}")
     if not coverage.classified and coverage.unclassified:
         print("No severity levels recognized. Run inspect to check the input format and fields.", file=sys.stderr)
         path, mapping = mappings[0]
