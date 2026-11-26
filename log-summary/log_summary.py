@@ -38,6 +38,38 @@ TIMESTAMP_PREFIX = re.compile(
 )
 
 
+def log_records(
+    lines: Iterable[str], *, multiline: bool = False
+) -> Iterator[tuple[int, int, str, str]]:
+    """Yield physical start/end lines, the header, and the complete record."""
+    if not multiline:
+        for number, line in enumerate(lines, start=1):
+            yield number, number, line, line
+        return
+
+    pending: list[str] = []
+    start = last = 0
+    for number, line in enumerate(lines, start=1):
+        if pending and not line.startswith((" ", "\t")):
+            yield start, last, pending[0], "".join(pending)
+            pending = []
+        if not pending:
+            start = number
+        pending.append(line)
+        last = number
+    if pending:
+        yield start, last, pending[0], "".join(pending)
+
+
+def line_range(start: int, end: int) -> str:
+    return str(start) if start == end else f"{start}-{end}"
+
+
+def add_multiline_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--multiline", action="store_true",
+                        help="attach indented continuation lines to the preceding record")
+
+
 @dataclass
 class SeverityCoverage:
     classified: int = 0
@@ -61,33 +93,35 @@ def count_levels(
     input_format: str = "jsonl",
     levels: tuple[str, ...] = LOG_LEVELS,
     coverage: SeverityCoverage | None = None,
+    multiline: bool = False,
 ) -> dict[str, int]:
     """Count matching lines and optionally write them as they are read."""
     counts = dict.fromkeys(levels, 0)
     prefixes = LOG_LEVELS if levels == LOG_LEVELS else sorted(levels, key=len, reverse=True)
     aliases = {alias: level for alias, level in LEVEL_ALIASES.items()
                if alias not in counts and level in counts}
-    for line_number, line in enumerate(lines, start=1):
+    records = log_records(lines, multiline=multiline)
+    for line_number, end_line, header, line in records:
         if contains not in line:
             continue
         if pattern is not None and pattern.search(line.rstrip("\r\n")) is None:
             continue
         if level_field is None:
-            timestamp = TIMESTAMP_PREFIX.match(line)
+            timestamp = TIMESTAMP_PREFIX.match(header)
             level_start = timestamp.end() if timestamp else 0
             level = None
             for name in prefixes:
-                if line.startswith(name, level_start):
+                if header.startswith(name, level_start):
                     level = name
                     break
             if level is None and aliases:
                 for alias, canonical in aliases.items():
                     end = level_start + len(alias)
-                    if line.startswith(alias, level_start) and (len(line) == end or line[end].isspace()):
+                    if header.startswith(alias, level_start) and (len(header) == end or header[end].isspace()):
                         level = canonical
                         break
         else:
-            fields = event_fields(line.rstrip("\r\n"), level_pattern, input_format)
+            fields = event_fields(header.rstrip("\r\n"), level_pattern, input_format)
             value = log_field(fields, level_field)
             level = normalize_level(value, counts) if isinstance(value, str) else None
 
@@ -101,7 +135,7 @@ def count_levels(
             coverage.classified += 1
         if output is not None and selected_level in (None, level):
             text = line.rstrip("\r\n")
-            print(f"{line_number}: {text}", file=output)
+            print(f"{line_range(line_number, end_line)}: {text}", file=output)
     return counts
 
 
@@ -167,7 +201,8 @@ def search_log(argv: list[str]) -> int:
     parser.add_argument("--contains", metavar="TEXT", help="match case-sensitive literal text")
     parser.add_argument("--regex", metavar="PATTERN", help="match a Python regular expression")
     parser.add_argument("--context", type=int, default=0, metavar="N",
-                        help="show N lines before and after each match (default: 0)")
+                        help="show N lines (records with --multiline) before and after each match")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     if args.contains is None and args.regex is None:
@@ -177,43 +212,54 @@ def search_log(argv: list[str]) -> int:
     pattern = compile_pattern(parser, args.regex)
     contains = args.contains or ""
 
-    previous: deque[tuple[int, str]] = deque(maxlen=args.context)
+    previous: deque[tuple[int, int, str]] = deque(maxlen=args.context)
     context_end = 0
-    number = matched = displayed = 0
+    number = physical_lines = matched = displayed = 0
     with (
         SpooledTemporaryFile(max_size=1_048_576, mode="w+t", encoding="utf-8")
         if args.json else nullcontext()
     ) as report:
-        def write_line(line_number: int, text: str) -> None:
+        def write_record(line_number: int, end_line: int, text: str) -> None:
             nonlocal displayed
             if report is None:
-                print(f"{line_number}: {text}")
+                if line_number == end_line:
+                    print(f"{line_number}: {text}")
+                else:
+                    print(f"{line_number}-{end_line}: {text}")
             else:
                 if displayed:
                     report.write(",")
-                report.write(json.dumps({"line": line_number, "text": text}))
+                row = {"line": line_number, "text": text}
+                if args.multiline:
+                    row["end_line"] = end_line
+                report.write(json.dumps(row))
             displayed += 1
 
         try:
             with open_log(args.log_file) as log_file:
-                for number, line in enumerate(log_file, start=1):
+                records = log_records(log_file, multiline=args.multiline)
+                for number, (line_number, end_line, _, line) in enumerate(records, start=1):
+                    physical_lines = end_line
                     text = line.rstrip("\r\n")
                     if contains in text and (pattern is None or pattern.search(text)):
                         matched += 1
-                        for previous_number, previous_text in previous:
-                            write_line(previous_number, previous_text)
+                        for context_record in previous:
+                            write_record(*context_record)
                         previous.clear()
                         context_end = number + args.context
                     if number <= context_end:
-                        write_line(number, text)
+                        write_record(line_number, end_line, text)
                     elif args.context:
-                        previous.append((number, text))
+                        previous.append((line_number, end_line, text))
         except (OSError, UnicodeError) as error:
             return report_input_error(args.log_file, error)
         if report is not None:
+            coverage = {"scanned": number, "matched": matched, "displayed": displayed}
+            if args.multiline:
+                coverage["physical_lines"] = physical_lines
             header = {
                 "schema_version": 1, "command": "search", "source": source_name(args.log_file),
-                "coverage": {"scanned": number, "matched": matched, "displayed": displayed},
+                "coverage": coverage,
             }
             print("{", end="")
             for key, value in header.items():
@@ -225,7 +271,8 @@ def search_log(argv: list[str]) -> int:
     if not number:
         print("The input is empty.", file=sys.stderr)
     elif not context_end:
-        print("No matching lines. Check --contains or --regex.", file=sys.stderr)
+        unit = "records" if args.multiline else "lines"
+        print(f"No matching {unit}. Check --contains or --regex.", file=sys.stderr)
     return report_status(args, empty=not matched)
 
 
@@ -256,6 +303,7 @@ def group_log(argv: list[str]) -> int:
     parser.add_argument("--regex", metavar="PATTERN",
                         help="Python regex with a named capture for text input")
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
 
@@ -266,11 +314,12 @@ def group_log(argv: list[str]) -> int:
 
     strings: Counter[str] = Counter()
     encoded_values: Counter[str] = Counter()
-    scanned = 0
+    scanned = physical_lines = 0
+    multiline = args.multiline and args.format != "jsonl"
     grouped = 0
     try:
         with open_log(args.log_file) as log_file:
-            for line in log_file:
+            for _, physical_lines, line, _ in log_records(log_file, multiline=multiline):
                 scanned += 1
                 if pattern is not None:
                     match = pattern.search(line.rstrip("\r\n"))
@@ -294,6 +343,9 @@ def group_log(argv: list[str]) -> int:
     values = chain(encoded_values.items(), encoded_strings)
     ranked = sorted(values, key=lambda item: (-item[1], item[0]))
     displayed = ranked[:args.top]
+    coverage = {"scanned": scanned, "grouped": grouped, "skipped": scanned - grouped}
+    if args.multiline:
+        coverage["physical_lines"] = physical_lines
     if args.json:
         print(json.dumps({
             "schema_version": 1,
@@ -301,7 +353,7 @@ def group_log(argv: list[str]) -> int:
             "source": source_name(args.log_file),
             "field": args.by,
             "total_rows": len(ranked),
-            "coverage": {"scanned": scanned, "grouped": grouped, "skipped": scanned - grouped},
+            "coverage": coverage,
             "results": [{"value": json.loads(value), "count": count} for value, count in displayed],
         }, allow_nan=False))
     else:
@@ -310,7 +362,8 @@ def group_log(argv: list[str]) -> int:
             print(f"{count:5}  {value}")
         if args.top is not None:
             print(f"Showing {len(displayed)} of {len(ranked)} values")
-        print(f"Scanned: {scanned}  Grouped: {grouped}  Skipped: {scanned - grouped}")
+        suffix = f"  Physical lines: {physical_lines}" if args.multiline else ""
+        print(f"Scanned: {scanned}  Grouped: {grouped}  Skipped: {scanned - grouped}{suffix}")
     if scanned and not grouped:
         print(f"No usable values for {args.by!r}. Run inspect to check the field or capture.", file=sys.stderr)
     elif not scanned:
@@ -631,6 +684,7 @@ class TimelineSource:
     matched: int = 0
     outside_window: int = 0
     other_ids: int = 0
+    physical_lines: int = 0
 
     @property
     def name(self) -> str:
@@ -642,6 +696,7 @@ class TimelineEvent:
     timestamp: datetime
     source: str
     line: int
+    end_line: int
     text: str
 
 
@@ -653,6 +708,7 @@ def timeline_log(argv: list[str]) -> int:
     add_event_arguments(parser, optional_file=True)
     add_source_option(parser)
     parser.add_argument("--value", required=True, help="ID to match exactly")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     since, until, exclusive_end = event_window(parser, args)
@@ -670,10 +726,11 @@ def timeline_log(argv: list[str]) -> int:
         parse_time = event_time if times.time_format == "iso" else times.parse
         try:
             with open_log(source.path) as log_file:
-                for line_number, line in enumerate(log_file, start=1):
+                records = log_records(log_file, multiline=args.multiline and source.input_format != "jsonl")
+                for line_number, end_line, header, line in records:
                     source.scanned += 1
-                    text = line.rstrip("\r\n")
-                    fields = event_fields(text, source.pattern, source.input_format)
+                    source.physical_lines = end_line
+                    fields = event_fields(header.rstrip("\r\n"), source.pattern, source.input_format)
                     key = event_id(log_field(fields, source.key))
                     if key is None:
                         source.skipped += 1
@@ -689,7 +746,9 @@ def timeline_log(argv: list[str]) -> int:
                         continue
                     source.valid_times += 1
                     if since <= utc_time <= until and (not exclusive_end or utc_time != until):
-                        events.append(TimelineEvent(utc_time, source.name, line_number, text))
+                        events.append(TimelineEvent(
+                            utc_time, source.name, line_number, end_line, line.rstrip("\r\n")
+                        ))
                         source.matched += 1
                     else:
                         source.outside_window += 1
@@ -710,9 +769,11 @@ def timeline_log(argv: list[str]) -> int:
     source_coverage = [
         {"source": source.name, "scanned": source.scanned,
          "matched": source.matched, "skipped": source.skipped,
-         "outside_window": source.outside_window, "other_ids": source.other_ids}
+         "outside_window": source.outside_window, "other_ids": source.other_ids,
+         **({"physical_lines": source.physical_lines} if args.multiline else {})}
         for source in sources
     ]
+    physical_lines = sum(source.physical_lines for source in sources)
     if args.json:
         print(json.dumps({
             "schema_version": 1,
@@ -720,23 +781,27 @@ def timeline_log(argv: list[str]) -> int:
             "value": args.value,
             "coverage": {"scanned": scanned, "matched": len(events), "skipped": skipped,
                          "outside_window": outside, "other_ids": other_ids,
-                         "sources": source_coverage},
+                         "sources": source_coverage,
+                         **({"physical_lines": physical_lines} if args.multiline else {})},
             "events": [
                 {"timestamp": event.timestamp.isoformat(timespec="microseconds"),
-                 "source": event.source, "line": event.line, "text": event.text}
+                 "source": event.source, "line": event.line, "text": event.text,
+                 **({"end_line": event.end_line} if args.multiline else {})}
                 for event in events
             ],
         }))
     else:
         for event in events:
             print(f"{event.timestamp.isoformat(sep=' ', timespec='microseconds')}  "
-                  f"{event.source}:{event.line}  {event.text}")
+                  f"{event.source}:{line_range(event.line, event.end_line)}  {event.text}")
         if len(sources) > 1:
             for source in sources:
+                suffix = f", physical lines {source.physical_lines}" if args.multiline else ""
                 print(f"{source.name}: scanned {source.scanned}, matched {source.matched}, "
-                      f"skipped {source.skipped}, outside {source.outside_window}, other IDs {source.other_ids}")
+                      f"skipped {source.skipped}, outside {source.outside_window}, other IDs {source.other_ids}{suffix}")
+        suffix = f"  Physical lines: {physical_lines}" if args.multiline else ""
         print(f"Scanned: {scanned}  Matched: {len(events)}  Skipped: {skipped}  "
-              f"Outside window: {outside}  Other IDs: {other_ids}")
+              f"Outside window: {outside}  Other IDs: {other_ids}{suffix}")
 
     if not any(source.matching_ids for source in sources):
         print(f"No events match ID {args.value!r}. Check the ID field and --value.", file=sys.stderr)
@@ -1575,6 +1640,7 @@ def main() -> int:
     parser.add_argument("--format", choices=LOG_FORMATS)
     parser.add_argument("--level-field", help="severity field (JSONL: severity; logfmt or text profile: level)")
     parser.add_argument("--levels", nargs="+", metavar="LEVEL", help="severity vocabulary (default: INFO WARNING ERROR; WARN aliases WARNING)")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args()
     if args.json and args.show_lines:
@@ -1616,6 +1682,7 @@ def main() -> int:
                 input_format=args.format,
                 levels=vocabulary,
                 coverage=coverage,
+                multiline=args.multiline and args.format != "jsonl",
             )
     except (OSError, UnicodeError) as error:
         return report_input_error(log_path, error)
@@ -1640,7 +1707,7 @@ def main() -> int:
         print("No lines to classify. Check the input and text filters.", file=sys.stderr)
     elif args.level and not counts[args.level]:
         print(f"No {args.level} entries matched.", file=sys.stderr)
-    if args.format != "text" or level_pattern is not None or coverage.unclassified:
+    if args.format != "text" or level_pattern is not None or args.multiline or coverage.unclassified:
         print(
             f"Classified: {coverage.classified}  Unclassified: {coverage.unclassified}",
             file=sys.stderr,

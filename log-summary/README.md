@@ -87,6 +87,24 @@ Use `--contains` for case-sensitive literal text or `--regex` for a Python regul
 expression. When both are supplied, lines must match both. Overlapping context
 is printed once.
 
+## Read multiline text records
+
+Use `--multiline` with search, severity summary, group, or timeline.
+Lines that start with a space or tab attach to the preceding record.
+Summary and search can match text anywhere in a record. Severity and field
+mappings read its header. JSON Lines stays line-based in structured commands.
+
+```powershell
+python log_summary.py search stacktrace-example.txt --multiline --contains TimeoutError --context 1
+python log_summary.py stacktrace-example.txt --multiline --contains TimeoutError --show-lines
+python log_summary.py timeline stacktrace-example.txt --format logfmt --time timestamp --key request_id --value r1 --multiline
+```
+
+Search context counts records in multiline mode. Search and timeline JSON
+include the inclusive `line` and `end_line` of each displayed record. Coverage
+in search, group, and timeline counts logical records and reports physical
+lines separately.
+
 ## Group log entries
 
 Use a named regex capture for text or a field from JSON Lines or logfmt. Use

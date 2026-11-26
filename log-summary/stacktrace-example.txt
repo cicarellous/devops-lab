@@ -1,0 +1,6 @@
+2026-11-26T14:01:02Z ERROR request_id=r1 code=E1042 Database request failed
+    at Client.read
+	TimeoutError: connection timed out
+2026-11-26T14:01:01Z INFO request_id=r1 code=START Request accepted
+2026-11-26T14:01:04Z ERROR request_id=r2 code=E1042 Worker request failed
+    at Worker.handle

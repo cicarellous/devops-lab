@@ -1217,5 +1217,69 @@ class ReportTrustTests(unittest.TestCase):
         self.assertIn("Outside window: 4  Other IDs: 14", text.stdout)
 
 
+class MultilineTests(unittest.TestCase):
+    def run_cli(self, *args, data=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=data,
+            text=True, capture_output=True, check=True,
+        )
+
+    def test_search_matches_continuation_and_counts_context_in_records(self):
+        args = ("search", "stacktrace-example.txt", "--multiline",
+                "--contains", "TimeoutError", "--context", "1")
+        result = self.run_cli(*args, "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["coverage"], {
+            "scanned": 3, "matched": 1, "displayed": 2, "physical_lines": 6,
+        })
+        self.assertEqual(
+            [(row["line"], row["end_line"]) for row in report["lines"]], [(1, 3), (4, 4)],
+        )
+        self.assertIn("\tTimeoutError: connection timed out", report["lines"][0]["text"])
+        self.assertTrue(self.run_cli(*args).stdout.startswith("1-3: "))
+        legacy = json.loads(self.run_cli("search", "stacktrace-example.txt",
+                                       "--contains", "TimeoutError", "--json").stdout)
+        self.assertEqual(legacy["lines"], [{"line": 3, "text": "\tTimeoutError: connection timed out"}])
+
+    def test_summary_counts_exception_once_and_group_reads_headers(self):
+        summary = self.run_cli(
+            "stacktrace-example.txt", "--multiline", "--contains", "TimeoutError", "--show-lines",
+        )
+        self.assertTrue(summary.stdout.startswith("1-3: "))
+        self.assertTrue(summary.stdout.endswith("ERROR: 1\n"))
+        self.assertIn("Classified: 1  Unclassified: 0", summary.stderr)
+        group = self.run_cli("group", "stacktrace-example.txt", "--format", "logfmt",
+                            "--by", "code", "--multiline", "--json")
+        report = json.loads(group.stdout)
+        self.assertEqual(report["coverage"], {
+            "scanned": 3, "grouped": 3, "skipped": 0, "physical_lines": 6,
+        })
+        self.assertEqual(report["results"], [{"value": "E1042", "count": 2},
+                                             {"value": "START", "count": 1}])
+
+    def test_timeline_sorts_headers_and_keeps_stack_trace_attached(self):
+        args = ("timeline", "stacktrace-example.txt", "--format", "logfmt",
+                "--time", "timestamp", "--key", "request_id", "--value", "r1", "--multiline")
+        result = self.run_cli(*args, "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual([(event["line"], event["end_line"]) for event in report["events"]], [(4, 4), (1, 3)])
+        self.assertIn("Client.read", report["events"][1]["text"])
+        self.assertEqual(report["coverage"]["scanned"], 3)
+        self.assertEqual(report["coverage"]["physical_lines"], 6)
+        self.assertEqual(report["coverage"]["other_ids"], 1)
+        self.assertIn("stacktrace-example.txt:1-3", self.run_cli(*args).stdout)
+
+    def test_structured_jsonl_stays_line_based_with_multiline_flag(self):
+        result = self.run_cli(
+            "group", "-", "--format", "jsonl", "--by", "code", "--multiline", "--json",
+            data='{"code":"E1"}\n  {"code":"E2"}\n',
+        )
+        report = json.loads(result.stdout)
+        self.assertEqual(report["coverage"]["grouped"], 2)
+        self.assertEqual(report["results"], [{"value": "E1", "count": 1},
+                                             {"value": "E2", "count": 1}])
+
+
 if __name__ == "__main__":
     unittest.main()
