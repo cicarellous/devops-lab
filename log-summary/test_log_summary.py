@@ -452,6 +452,49 @@ class BucketTests(unittest.TestCase):
         self.assertEqual([row["events_per_minute"] for row in rows], [None, 0, 0, None])
 
 
+class SpikeDetectionTests(unittest.TestCase):
+    def run_bucket(self, counts, *options):
+        data = "".join(
+            json.dumps({"ts": f"2026-11-26T14:{minute:02d}:20Z"}) + "\n"
+            for minute, count in enumerate(counts)
+            for _ in range(count)
+        )
+        return subprocess.run(
+            [sys.executable, "log_summary.py", "bucket", "-", "--format", "jsonl",
+             "--time", "ts", "--interval", "1m", "--since", "2026-11-26T14:00:10Z",
+             "--before", "2026-11-26T14:08:30Z", *options],
+            cwd=Path(__file__).resolve().parent, input=data, text=True, capture_output=True,
+        )
+
+    def test_flags_only_full_buckets_above_threshold_after_warmup(self):
+        counts = [100, 2, 2, 2, 2, 2, 6, 7, 100]
+        result = self.run_bucket(counts, "--spike-factor", "3", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["spike_factor"], 3)
+        self.assertEqual([bucket["spike"] for bucket in report["buckets"]],
+                         [False] * 7 + [True, False])
+        self.assertEqual([bucket["baseline_count"] for bucket in report["buckets"]],
+                         [None] * 6 + [2, 2, None])
+        self.assertIn("SPIKE (baseline 2)", self.run_bucket(counts, "--spike-factor", "3").stdout)
+        plain = json.loads(self.run_bucket(counts, "--json").stdout)
+        self.assertNotIn("spike_factor", plain)
+        self.assertNotIn("spike", plain["buckets"][7])
+
+    def test_zero_median_does_not_flag_a_single_event(self):
+        result = self.run_bucket([0, 0, 0, 0, 0, 0, 1], "--spike-factor", "3", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bucket = json.loads(result.stdout)["buckets"][6]
+        self.assertEqual((bucket["baseline_count"], bucket["count"], bucket["spike"]), (0, 1, False))
+
+    def test_factor_rejects_invalid_values(self):
+        for value in ("1", "nan", "inf", "invalid"):
+            with self.subTest(value=value):
+                result = self.run_bucket([], "--spike-factor", value)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("must be a finite number greater than 1", result.stderr)
+
+
 class InspectTests(unittest.TestCase):
     def run_cli(self, *args, input_text=None):
         return subprocess.run(
@@ -474,6 +517,10 @@ class InspectTests(unittest.TestCase):
             input_text='2026-11-26T14:00:00Z INFO Hello\n{"ts":"2026-11-26T14:00Z"}\n',
         )
         self.assertIn("Sampled: 1  JSON objects: 0  Text timestamp prefixes: 1", result.stdout)
+        report = json.loads(self.run_cli(
+            "inspect", "-", "--lines", "1", "--json", input_text="first\nsecond\n",
+        ).stdout)
+        self.assertEqual(report["coverage"]["physical_lines"], 1)
 
     def test_bucket_distinguishes_empty_results_and_keeps_json_parseable(self):
         cases = [
@@ -641,7 +688,7 @@ class InvestigationOutputTests(unittest.TestCase):
         self.assertIn("worker-example.txt:2", text)
         self.assertEqual(report["coverage"]["sources"][1], {
             "source": "worker-example.txt", "scanned": 3, "matched": 2, "skipped": 0,
-            "outside_window": 0, "other_ids": 1,
+            "outside_window": 0, "other_ids": 1, "physical_lines": 3,
         })
 
     def test_compare_json_preserves_rank_and_coverage_when_limited(self):
@@ -981,7 +1028,7 @@ class AutomationContractTests(unittest.TestCase):
                               data="before\nhit\nafter\nignored\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         report = json.loads(result.stdout)
-        self.assertEqual(report["coverage"], {"scanned": 4, "matched": 1, "displayed": 3})
+        self.assertEqual(report["coverage"], {"scanned": 4, "matched": 1, "displayed": 3, "physical_lines": 4})
         self.assertEqual([item["line"] for item in report["lines"]], [1, 2, 3])
 
     def test_gzip_globs_and_configurable_severity(self):
@@ -1071,7 +1118,7 @@ class ReportCorrectnessTests(unittest.TestCase):
             [20, 12, 0, 8],
         )
         self.assertEqual(coverage["sources"], [
-            {"source": "app.jsonl", "scanned": 20, "used": 12, "skipped": 0, "outside_window": 8},
+            {"source": "app.jsonl", "scanned": 20, "used": 12, "skipped": 0, "outside_window": 8, "physical_lines": 20},
         ])
         text = self.run_cli(*args)
         self.assertIn(b"Used: 12  Outside window: 8", text.stdout)
@@ -1281,7 +1328,7 @@ class ReportTrustTests(unittest.TestCase):
         result = self.run_cli(*args, "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         coverage = json.loads(result.stdout)["coverage"]
-        expected = {"scanned": 20, "matched": 2, "outside_window": 4, "other_ids": 14, "skipped": 0}
+        expected = {"scanned": 20, "matched": 2, "outside_window": 4, "other_ids": 14, "skipped": 0, "physical_lines": 20}
         self.assertEqual(coverage, {**expected, "sources": [{"source": "app.jsonl", **expected}]})
         text = self.run_cli(*args)
         self.assertIn("Outside window: 4  Other IDs: 14", text.stdout)

@@ -15,8 +15,9 @@ from io import TextIOWrapper
 from itertools import chain, islice
 from math import isfinite
 from pathlib import Path
+from statistics import median
 from tempfile import SpooledTemporaryFile
-from typing import Iterable, Iterator, TextIO, TypedDict
+from typing import Iterable, Iterator, NotRequired, TextIO, TypedDict
 
 
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
@@ -296,9 +297,10 @@ def search_log(argv: list[str]) -> int:
         except (OSError, UnicodeError) as error:
             return report_input_error(args.log_file, error)
         if report is not None:
-            coverage = {"scanned": number, "matched": matched, "displayed": displayed}
-            if args.multiline:
-                coverage["physical_lines"] = physical_lines
+            coverage = {
+                "scanned": number, "matched": matched, "displayed": displayed,
+                "physical_lines": physical_lines,
+            }
             header = {
                 "schema_version": 1, "command": "search", "source": source_name(args.log_file),
                 "coverage": coverage,
@@ -833,7 +835,7 @@ def timeline_log(argv: list[str]) -> int:
         {"source": source.name, "scanned": source.scanned,
          "matched": source.matched, "skipped": source.skipped,
          "outside_window": source.outside_window, "other_ids": source.other_ids,
-         **({"physical_lines": source.physical_lines} if args.multiline else {})}
+         "physical_lines": source.physical_lines}
         for source in sources
     ]
     physical_lines = sum(source.physical_lines for source in sources)
@@ -845,7 +847,7 @@ def timeline_log(argv: list[str]) -> int:
             "coverage": {"scanned": scanned, "matched": len(events), "skipped": skipped,
                          "outside_window": outside, "other_ids": other_ids,
                          "sources": source_coverage,
-                         **({"physical_lines": physical_lines} if args.multiline else {})},
+                         "physical_lines": physical_lines},
             "events": [
                 {"timestamp": event.timestamp.isoformat(timespec="microseconds"),
                  "source": event.source, "line": event.line, "text": event.text,
@@ -942,7 +944,7 @@ def correlate_log(argv: list[str]) -> int:
         coverage.append({
             "source": name, "scanned": source_scanned, "used": source_used,
             "skipped": source_skipped, "outside_window": source_outside,
-            **({"physical_lines": source_lines} if args.multiline else {}),
+            "physical_lines": source_lines,
         })
         scanned += source_scanned
         used += source_used
@@ -969,7 +971,7 @@ def correlate_log(argv: list[str]) -> int:
                 "skipped": skipped,
                 "outside_window": outside,
                 "sources": coverage,
-                **({"physical_lines": physical_lines} if args.multiline else {}),
+                "physical_lines": physical_lines,
             },
             "results": [
                 {
@@ -1150,7 +1152,7 @@ def compare_log(argv: list[str]) -> int:
         coverage.append({
             "source": name,
             **source_counts,
-            **({"physical_lines": source_lines} if args.multiline else {}),
+            "physical_lines": source_lines,
             "skipped": source_counts["scanned"] - source_counts["used"] - source_counts["outside_windows"],
         })
 
@@ -1217,7 +1219,7 @@ def compare_log(argv: list[str]) -> int:
                 "invalid_timestamp": unknown_time,
                 "outside_windows": outside,
                 "sources": coverage,
-                **({"physical_lines": physical_lines} if args.multiline else {}),
+                "physical_lines": physical_lines,
             },
             "results": results,
         }))
@@ -1255,12 +1257,27 @@ def compare_log(argv: list[str]) -> int:
 MAX_BUCKETS = 10_000
 
 
+SPIKE_BASELINE_BUCKETS = 5
+
+
 class TimeBucket(TypedDict):
     start: str
     end: str
     count: int
     events_per_minute: float | None
     partial: bool
+    baseline_count: NotRequired[float | None]
+    spike: NotRequired[bool]
+
+
+def spike_factor(value: str) -> float:
+    try:
+        factor = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a finite number greater than 1") from None
+    if not isfinite(factor) or factor <= 1:
+        raise argparse.ArgumentTypeError("must be a finite number greater than 1")
+    return factor
 
 
 def interval_seconds(value: str) -> int:
@@ -1280,6 +1297,10 @@ def bucket_log(argv: list[str]) -> int:
     add_source_option(parser)
     add_mapping_arguments(parser)
     parser.add_argument("--interval", required=True, type=interval_seconds, help="bucket width, e.g. 30s or 5m")
+    parser.add_argument(
+        "--spike-factor", type=spike_factor, metavar="N",
+        help="flag counts above N times the median of the previous 5 full buckets (N > 1, median > 0)",
+    )
     add_window_arguments(parser, exclusive_until=True)
     parser.add_argument("--signature", help="field used to select events")
     parser.add_argument("--level", help="filter severity, case-insensitively (WARN aliases WARNING)")
@@ -1387,6 +1408,7 @@ def bucket_log(argv: list[str]) -> int:
     start = start_bound if start_bound is not None else first
     end = end_bound if end_bound is not None else (last + 1 if last is not None else None)
     buckets: list[TimeBucket] = []
+    history: deque[int] = deque(maxlen=SPIKE_BASELINE_BUCKETS)
     if start is not None and end is not None:
         first_bucket, last_bucket = start // width, (end - 1) // width
         if last_bucket - first_bucket + 1 > MAX_BUCKETS:
@@ -1397,13 +1419,22 @@ def bucket_log(argv: list[str]) -> int:
                 bucket_end = bucket_start + width
                 partial = bucket_start < start or bucket_end > end
                 count = counts[index]
-                buckets.append({
+                bucket: TimeBucket = {
                     "start": (EPOCH + timedelta(microseconds=bucket_start)).isoformat(),
                     "end": (EPOCH + timedelta(microseconds=bucket_end)).isoformat(),
                     "count": count,
                     "events_per_minute": None if partial else count * 60 / args.interval,
                     "partial": partial,
-                })
+                }
+                if args.spike_factor is not None:
+                    baseline = None
+                    if not partial:
+                        if len(history) == SPIKE_BASELINE_BUCKETS:
+                            baseline = median(history)
+                        history.append(count)
+                    bucket["baseline_count"] = baseline
+                    bucket["spike"] = baseline is not None and baseline > 0 and count > baseline * args.spike_factor
+                buckets.append(bucket)
         except OverflowError:
             parser.error("aligned bucket boundaries fall outside the supported timestamp range")
 
@@ -1442,6 +1473,7 @@ def bucket_log(argv: list[str]) -> int:
             "matched": bool(counts),
             "coverage": coverage,
             "buckets": buckets,
+            **({"spike_factor": args.spike_factor} if args.spike_factor is not None else {}),
         }))
     else:
         title = f"Interval: {args.interval}s"
@@ -1455,7 +1487,9 @@ def bucket_log(argv: list[str]) -> int:
         for bucket in buckets:
             rate = bucket["events_per_minute"]
             rate_text = "partial" if rate is None else f"{rate:.3f}"
-            print(f'{bucket["start"]:32}  {bucket["count"]:5}  {rate_text}')
+            baseline = bucket.get("baseline_count")
+            spike_label = f"  SPIKE (baseline {baseline:g})" if bucket.get("spike") and baseline is not None else ""
+            print(f'{bucket["start"]:32}  {bucket["count"]:5}  {rate_text}{spike_label}')
         if args.source:
             for source in sources:
                 source_suffix = f", physical lines {source['physical_lines']}" if args.multiline else ""
@@ -1625,7 +1659,7 @@ def inspect_log(argv: list[str]) -> int:
             "coverage": {
                 "sampled": sampled, "json_objects": objects, "logfmt_lines": logfmt_lines,
                 "text_timestamp_prefixes": timestamp_prefixes,
-                **({"physical_lines": physical_lines} if args.multiline else {}),
+                "physical_lines": physical_lines,
             },
             "format": input_format,
             "fields": {

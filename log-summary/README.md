@@ -216,6 +216,14 @@ Replace `TIMEOUT` with `QUEUE_WARNING` to see a steady rate. Text input requires
 `--regex` with named captures. Add `--json` for a versioned report with bucket
 boundaries, counts, rates, and coverage.
 
+Add `--spike-factor 3` to flag a full bucket whose event count exceeds
+three times the median of the previous five full buckets. Empty full
+buckets count as zero in the baseline. A zero median, insufficient
+history, or a partial bucket produces no spike flag. JSON adds
+`spike_factor` to the report and `baseline_count` and `spike` to each
+bucket. A missing baseline is represented by `null`.
+
+
 Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps before signature
 filtering. Empty buckets inside the reported range show zero observed
 events. Partial edge buckets show counts with no rate (`null` in JSON).
@@ -278,8 +286,9 @@ Use `--top N` with `group`, `correlate`, or `compare` to show the first N
 ranked rows. Coverage still describes the entire input. Every command accepts
 `--json` for one versioned report on stdout. Each report identifies its command.
 Use `search --json` for matching lines and context, or severity summary
-`--json` for counts. Summary, group, and bucket JSON always include physical
-line counts and `coverage.sources`, including for a single file or stdin.
+`--json` for counts. JSON reports always include `coverage.physical_lines`. For `inspect`, this
+counts only sampled lines. Summary, group, and bucket also include
+`coverage.sources` for a single file or stdin.
 
 ## Reuse field mappings
 
