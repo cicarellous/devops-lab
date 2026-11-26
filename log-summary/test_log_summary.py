@@ -7,7 +7,7 @@ from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from log_summary import count_errors, count_levels
+from log_summary import count_errors, count_levels, event_time
 
 
 class CountErrorsTests(unittest.TestCase):
@@ -1032,6 +1032,115 @@ class ReportCorrectnessTests(unittest.TestCase):
         self.assertEqual(invalid.returncode, 1)
         self.assertEqual(invalid.stdout, b"")
         self.assertIn(b"Cannot read log", invalid.stderr)
+
+
+class EpochTimestampTests(unittest.TestCase):
+    def run_cli(self, *args, data=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=data,
+            text=True, capture_output=True,
+        )
+
+    def test_timestamp_modes_agree_to_the_microsecond(self):
+        expected = event_time("2026-11-26T14:01:00.123456Z")
+        self.assertIsNotNone(expected)
+        self.assertEqual(event_time("1795701660.123456", "epoch_s"), expected)
+        self.assertEqual(event_time("1795701660123.456", "epoch_ms"), expected)
+        self.assertEqual(event_time(-1, "epoch_ms"), event_time("1969-12-31T23:59:59.999Z"))
+        for bad in (True, "1e99999999", "NaN", "1e-99999999", "0.0000001", "bad"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(event_time(bad, "epoch_s"))
+
+    def test_all_timed_commands_assign_epoch_boundary_to_later_window(self):
+        start, boundary, end = ("2026-11-26T14:00Z", "2026-11-26T14:01Z", "2026-11-26T14:02Z")
+        encodings = {
+            "iso": ("2026-11-26T14:00:30Z", boundary),
+            "epoch_s": (1795701630, 1795701660),
+            "epoch_ms": (1795701630000, 1795701660000),
+        }
+        expected_reports = None
+        for mode, timestamps in encodings.items():
+            with self.subTest(mode=mode):
+                data = "".join(json.dumps({"ts": ts, "id": "r1", "code": code}) + "\n"
+                               for ts, code in zip(timestamps, ("BEFORE", "BOUNDARY")))
+                common = ("-", "--format", "jsonl", "--time", "ts", "--time-format", mode, "--json")
+                window = ("--since", boundary, "--before", end)
+                commands = [
+                    ("timeline", *common, "--key", "id", "--value", "r1", *window),
+                    ("correlate", *common, "--key", "id", *window),
+                    ("bucket", *common, "--interval", "1m", *window),
+                    ("compare", *common, "--signature", "code",
+                     "--baseline", start, boundary, "--incident", boundary, end),
+                ]
+                reports = []
+                for args in commands:
+                    result = self.run_cli(*args, data=data)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    reports.append(json.loads(result.stdout))
+                timeline, correlate, bucket, compare = reports
+                self.assertEqual([event["line"] for event in timeline["events"]], [2])
+                self.assertEqual(correlate["results"][0]["events"], 1)
+                self.assertEqual(bucket["buckets"][0]["count"], 1)
+                changes = {row["signature"]: row for row in compare["results"]}
+                self.assertEqual(changes["BOUNDARY"]["baseline"]["events"], 0)
+                self.assertEqual(changes["BOUNDARY"]["incident"]["events"], 1)
+                del timeline["events"][0]["text"]
+                if expected_reports is None:
+                    expected_reports = reports
+                else:
+                    self.assertEqual(reports, expected_reports)
+
+    def test_inspect_saves_unambiguous_epoch_mapping(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "generated.json"
+            result = self.run_cli(
+                "inspect", "-", "--json", "--profile-out", str(profile),
+                data='{"timestamp_ms":1795701660000,"request_id":"r1"}\n',
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            saved = json.loads(profile.read_text(encoding="utf-8"))
+            self.assertEqual(saved["time_format"], "epoch_ms")
+            self.assertEqual(saved, json.loads(result.stdout)["profile"])
+            result = self.run_cli("bucket", "-", "--profile", str(profile), "--interval", "1m",
+                                  "--json", data='{"timestamp_ms":1795701660000}\n')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["coverage"]["counted"], 1)
+            mixed = self.run_cli(
+                "inspect", "-", "--json",
+                data='{"ts":1795701660000}\n{"ts":1795701660}\n',
+            )
+            self.assertEqual(mixed.returncode, 0, mixed.stderr)
+            self.assertIsNone(json.loads(mixed.stdout)["profile"])
+
+    def test_mixed_source_profiles_and_explicit_override(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.jsonl"
+            second = root / "second.log"
+            first.write_text('{"timestamp":"2026-11-26T14:01:00Z","id":"r1"}\n', encoding="utf-8")
+            second.write_text("ts=1795701660123 job=r1 done\n", encoding="utf-8")
+            iso = root / "iso.json"
+            epoch = root / "epoch.json"
+            iso.write_text('{"format":"jsonl","time":"timestamp","id":"id"}', encoding="utf-8")
+            epoch.write_text(
+                '{"format":"logfmt","time":"ts","id":"job","time_format":"epoch_ms"}',
+                encoding="utf-8",
+            )
+            result = self.run_cli("timeline", "--source", str(second), str(epoch),
+                                  "--source", str(first), str(iso), "--value", "r1", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                [event["timestamp"] for event in json.loads(result.stdout)["events"]],
+                ["2026-11-26T14:01:00.000000+00:00", "2026-11-26T14:01:00.123000+00:00"],
+            )
+            result = self.run_cli(
+                "timeline", "-", "--profile", str(epoch), "--time-format", "epoch_s", "--value", "r1",
+                "--json", data="ts=1795701660 job=r1 done\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["events"][0]["timestamp"],
+                             "2026-11-26T14:01:00.000000+00:00")
 
 
 if __name__ == "__main__":

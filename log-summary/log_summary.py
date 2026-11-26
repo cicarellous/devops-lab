@@ -8,6 +8,7 @@ from collections import Counter, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from glob import glob
 from io import TextIOWrapper
@@ -21,6 +22,16 @@ from typing import Iterable, Iterator, TextIO, TypedDict
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
 LEVEL_ALIASES = {"WARN": "WARNING"}
 LOG_FORMATS = ("text", "jsonl", "logfmt")
+TIME_FORMATS = ("iso", "epoch_s", "epoch_ms")
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+MICROSECOND = timedelta(microseconds=1)
+INSPECT_EPOCH_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
+INSPECT_EPOCH_END = datetime(2100, 1, 1, tzinfo=timezone.utc)
+EPOCH_FIELD_NAME = re.compile(
+    r"(?:^|_)(?:ts|time|timestamp)(?:_(?:ms|s|millis|seconds))?$"
+    r"|^(?:created|updated|logged|observed|received)_at$",
+    re.IGNORECASE,
+)
 TIMESTAMP_PREFIX = re.compile(
     r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?"
     r"(?:Z|[+-]\d{2}:?\d{2})?[ \t]+"
@@ -311,6 +322,7 @@ def add_mapping_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--profile", metavar="FILE", help="JSON log mapping; explicit flags override it")
     parser.add_argument("--format", choices=LOG_FORMATS, help="input format (default: text)")
     parser.add_argument("--time", help="timestamp field or named regex capture")
+    parser.add_argument("--time-format", choices=TIME_FORMATS, help="record timestamp format (default: iso)")
     parser.add_argument("--regex", help="named field captures for text input")
 
 
@@ -327,7 +339,7 @@ def apply_log_mapping(
             profile = json.loads(Path(args.profile).read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, ValueError) as error:
             parser.error(f"cannot load profile {args.profile!r}: {error}")
-        allowed = {"format", "time", "regex", "signature", "service", "id", "key", "by", "level_field"}
+        allowed = {"format", "time", "regex", "signature", "service", "id", "key", "by", "level_field", "time_format"}
         if not isinstance(profile, dict):
             parser.error("profile must be a JSON object")
         for name, value in profile.items():
@@ -337,6 +349,8 @@ def apply_log_mapping(
                 parser.error(f"profile field {name!r} must be a nonempty string")
         if "format" in profile and profile["format"] not in LOG_FORMATS:
             parser.error("profile format must be text, jsonl, or logfmt")
+        if "time_format" in profile and profile["time_format"] not in TIME_FORMATS:
+            parser.error("profile time_format must be iso, epoch_s, or epoch_ms")
         if profile.get("format", "text") != "text" and "regex" in profile:
             parser.error("profile regex applies only to text input")
         if "key" in profile:
@@ -348,6 +362,9 @@ def apply_log_mapping(
         args.format = profile.get("format", "text")
     if args.regex is None and args.format == "text":
         args.regex = profile.get("regex")
+
+    if hasattr(args, "time_format") and args.time_format is None:
+        args.time_format = profile.get("time_format", "iso")
 
     for name in required + optional:
         if getattr(args, name, None) is None:
@@ -379,7 +396,7 @@ def source_mappings(
     required: tuple[str, ...],
     optional: tuple[str, ...] = (),
 ) -> list[tuple[str, argparse.Namespace]]:
-    fields = ("profile", "format", "regex", *required, *optional)
+    fields = ("profile", "format", "regex", "time_format", *required, *optional)
     if args.source:
         if args.log_file is not None or any(getattr(args, name) is not None for name in fields):
             parser.error("--source replaces the positional file and global mapping options")
@@ -417,7 +434,7 @@ def add_event_arguments(parser: argparse.ArgumentParser, *, optional_file: bool 
     parser.add_argument("--key", help="ID field or named regex capture (profile: id)")
     add_window_arguments(parser)
     parser.epilog = (
-        "Timestamps use ISO 8601. Timestamps without an offset are treated as UTC. "
+        "Time bounds use ISO 8601. Timestamps without an offset are treated as UTC. "
         "Use --format jsonl or logfmt for fields, or --regex for text."
     )
 
@@ -498,7 +515,39 @@ def event_id(value: object) -> str | None:
     return None
 
 
-def event_time(value: object) -> datetime | None:
+def epoch_time(value: object, time_format: str) -> datetime | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    # Bound the conversion even for malformed or extreme numeric input.
+    if isinstance(value, int) and value.bit_length() > 64:
+        return None
+    text = str(value).strip()
+    if not text or len(text) > 64 or "_" in text:
+        return None
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return None
+    if not number.is_finite():
+        return None
+    if number.is_zero():
+        return EPOCH
+    digits = 6 if time_format == "epoch_s" else 3
+    if not -digits <= number.adjusted() <= 17 - digits:
+        return None
+    numerator, denominator = number.as_integer_ratio()
+    micros, remainder = divmod(numerator * 10**digits, denominator)
+    if remainder:
+        return None
+    try:
+        return EPOCH + timedelta(microseconds=micros)
+    except OverflowError:
+        return None
+
+
+def event_time(value: object, time_format: str = "iso") -> datetime | None:
+    if time_format != "iso":
+        return epoch_time(value, time_format)
     if not isinstance(value, str):
         return None
     try:
@@ -536,6 +585,7 @@ class TimelineSource:
     time: str
     pattern: re.Pattern[str] | None
     input_format: str
+    time_format: str
     scanned: int = 0
     skipped: int = 0
     matching_ids: int = 0
@@ -572,7 +622,7 @@ def timeline_log(argv: list[str]) -> int:
     sources: list[TimelineSource] = []
     for path, mapping in mappings:
         pattern = event_pattern(parser, mapping)
-        sources.append(TimelineSource(path, mapping.key, mapping.time, pattern, mapping.format))
+        sources.append(TimelineSource(path, mapping.key, mapping.time, pattern, mapping.format, mapping.time_format))
 
     events: list[TimelineEvent] = []
     for source in sources:
@@ -590,7 +640,7 @@ def timeline_log(argv: list[str]) -> int:
                         continue
 
                     source.matching_ids += 1
-                    utc_time = event_time(log_field(fields, source.time))
+                    utc_time = event_time(log_field(fields, source.time), source.time_format)
                     if utc_time is None:
                         source.skipped += 1
                         continue
@@ -682,7 +732,7 @@ def correlate_log(argv: list[str]) -> int:
                     source_scanned += 1
                     fields = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
                     key = event_id(log_field(fields, mapping.key))
-                    timestamp = event_time(log_field(fields, mapping.time))
+                    timestamp = event_time(log_field(fields, mapping.time), mapping.time_format)
                     if key is None or timestamp is None:
                         source_skipped += 1
                         continue
@@ -867,7 +917,7 @@ def compare_log(argv: list[str]) -> int:
                 for line_number, line in enumerate(log_file, start=1):
                     source_counts["scanned"] += 1
                     record = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
-                    timestamp = event_time(log_field(record, mapping.time))
+                    timestamp = event_time(log_field(record, mapping.time), mapping.time_format)
                     if timestamp is None:
                         source_counts['invalid_timestamp'] += 1
                         continue
@@ -998,8 +1048,6 @@ def compare_log(argv: list[str]) -> int:
     return report_status(args, empty=not ranked)
 
 
-EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-MICROSECOND = timedelta(microseconds=1)
 MAX_BUCKETS = 10_000
 
 
@@ -1079,7 +1127,7 @@ def bucket_log(argv: list[str]) -> int:
             for line in log_file:
                 scanned += 1
                 fields = event_fields(line.rstrip("\r\n"), pattern, args.format)
-                timestamp = event_time(log_field(fields, args.time))
+                timestamp = event_time(log_field(fields, args.time), args.time_format)
                 if timestamp is None:
                     invalid += 1
                     continue
@@ -1185,6 +1233,7 @@ def bucket_log(argv: list[str]) -> int:
 class FieldSample:
     present: int = 0
     timestamps: int = 0
+    epochs: Counter[str] = field(default_factory=Counter)
     types: set[str] = field(default_factory=set)
 
 
@@ -1246,6 +1295,11 @@ def inspect_log(argv: list[str]) -> int:
                     sample.types.add(type(value).__name__)
                     if isinstance(value, str) and event_time(value) is not None:
                         sample.timestamps += 1
+                    elif EPOCH_FIELD_NAME.search(name.rsplit(".", 1)[-1]):
+                        for mode in ("epoch_s", "epoch_ms"):
+                            candidate_time = epoch_time(value, mode)
+                            if candidate_time is not None and INSPECT_EPOCH_START <= candidate_time < INSPECT_EPOCH_END:
+                                sample.epochs[mode] += 1
     except (OSError, UnicodeError) as error:
         return report_input_error(args.log_file, error)
 
@@ -1272,13 +1326,23 @@ def inspect_log(argv: list[str]) -> int:
                 candidates[role] = choices
                 profile[role] = max(choices, key=lambda name: fields[name].present)
 
+    time_modes: dict[str, tuple[str, int]] = {}
+    for name, sample in fields.items():
+        modes = dict(sample.epochs)
+        if sample.timestamps:
+            modes["iso"] = sample.timestamps
+        if len(modes) == 1:
+            time_modes[name] = next(iter(modes.items()))
     timestamp_fields = sorted(
-        (name for name in fields if fields[name].timestamps),
-        key=lambda name: (-fields[name].timestamps, name),
+        time_modes, key=lambda name: (-time_modes[name][1], name)
     )
     if timestamp_fields:
         candidates["time"] = timestamp_fields
-        profile["time"] = timestamp_fields[0]
+        selected = timestamp_fields[0]
+        profile["time"] = selected
+        mode = time_modes[selected][0]
+        if mode != "iso":
+            profile["time_format"] = mode
 
     if not candidates:
         profile.clear()
@@ -1306,7 +1370,7 @@ def inspect_log(argv: list[str]) -> int:
             "format": input_format,
             "fields": {
                 name: {"present": sample.present, "types": sorted(sample.types),
-                       "timestamps": sample.timestamps}
+                       "timestamps": sample.timestamps, "epoch_candidates": dict(sample.epochs)}
                 for name, sample in sorted(fields.items())
             },
             "candidates": candidates,
@@ -1322,7 +1386,8 @@ def inspect_log(argv: list[str]) -> int:
             for name, sample in sorted(fields.items()):
                 types = ", ".join(sorted(sample.types))
                 timestamp_hint = f" | ISO timestamps: {sample.timestamps}" if sample.timestamps else ""
-                print(f"  {json.dumps(name)}: {sample.present}/{sampled} | {types}{timestamp_hint}")
+                epoch_hint = "".join(f" | {mode} candidates: {count}" for mode, count in sorted(sample.epochs.items()))
+                print(f"  {json.dumps(name)}: {sample.present}/{sampled} | {types}{timestamp_hint}{epoch_hint}")
             labels = {"signature": "Signature", "id": "ID", "service": "Service",
                       "level_field": "Severity", "time": "Timestamp"}
             for role, choices in candidates.items():
@@ -1343,7 +1408,7 @@ def inspect_log(argv: list[str]) -> int:
     print("Save and review the suggested mapping with --profile-out FILE, then reuse it with --profile FILE.",
           file=sys.stderr)
     if not timestamp_fields:
-        print("No ISO timestamp fields found in the sample. Try --lines with a larger sample.", file=sys.stderr)
+        print("No unambiguous timestamp fields found. Try --lines or choose a field and time format explicitly.", file=sys.stderr)
         return 0
 
     if any(re.search(r"[\x00-\x1f\x7f\u2018\u2019]", value)
@@ -1359,6 +1424,9 @@ def inspect_log(argv: list[str]) -> int:
     source = args.log_file.replace("'", "''")
     print("Try in PowerShell:", file=sys.stderr)
     options = f"--format {input_format} --time='{timestamp}' --interval 30s"
+    if "time_format" in profile:
+        print("Confirm the suggested epoch unit before using the mapping.", file=sys.stderr)
+        options += f" --time-format {profile['time_format']}"
     if args.log_file.startswith("-") and args.log_file != "-":
         print(f"  python log_summary.py bucket {options} -- '{source}'", file=sys.stderr)
     else:

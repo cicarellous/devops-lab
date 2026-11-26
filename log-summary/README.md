@@ -160,6 +160,20 @@ For existing scripts, `--until` remains inclusive in `timeline` and
 python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --before "2026-11-26T14:00:01Z"
 ```
 
+## Read epoch timestamps
+
+Timed commands default to ISO 8601. Use `--time-format epoch_s` for Unix seconds
+or `--time-format epoch_ms` for milliseconds. Profiles can set `time_format`
+per source. Window bounds still use ISO 8601.
+
+```powershell
+'{"timestamp_ms":1795701660000}' | python log_summary.py bucket - --format jsonl --time timestamp_ms --time-format epoch_ms --interval 1m --since 2026-11-26T14:01Z --before 2026-11-26T14:02Z
+```
+
+Use integer or decimal-string timestamps when exact precision matters. Values
+finer than a microsecond are skipped. `inspect` suggests a unit for plausible
+modern epoch values in timestamp-named fields. Review it before using it.
+
 ## Find when event activity changed
 
 ```powershell
@@ -247,5 +261,5 @@ From `log-summary/`, run the unit tests:
 python -m unittest -v
 ```
 
-In GitHub Actions, **Log Summary CI** shows separate Ubuntu and Windows test
-results and a code-quality job for Ruff and mypy. You can see each run in the repository's **Actions** tab.
+In GitHub Actions, **Log Summary CI** shows Python 3.12 tests on Ubuntu and Windows,
+Python 3.14 tests on Ubuntu, and a Ruff and mypy job. You can see each run in the repository's **Actions** tab.
