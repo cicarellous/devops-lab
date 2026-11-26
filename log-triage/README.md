@@ -60,6 +60,8 @@ replace `python3.12 log_triage.py` with `log-triage` after installing.
 
 ## Documentation
 
+Use a centralized log export or a UTF-8 stream from your approved logging CLI. See [Investigate without production host access](docs/runbook.md#investigate-without-production-host-access).
+
 - [Start with the runbook](docs/runbook.md). It walks through sample commands, expected results, and what to investigate next.
 - [Reference](docs/reference.md) for formats, field mappings, time windows, JSON, exit codes, and troubleshooting.
 - `python3.12 log_triage.py -h` lists commands. Add `-h` after any command for its flags.

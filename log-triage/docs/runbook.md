@@ -321,6 +321,56 @@ Unevaluable status: 3
 Handle exit 3 explicitly so missing observation data is visible. For other
 statuses and the comparison gate, see the [reference](reference.md#exit-codes).
 
+## Investigate without production host access
+
+Run Log Triage on your workstation or an approved analysis environment.
+Use your centralized logging platform to select the incident window and
+export the records you can access. If your account has dashboard access
+only, ask the team that owns the logs for an approved export of that slice.
+
+1. Start with one service and a narrow time range. Include a comparable
+   baseline window if you plan to use `compare`. Record the service, UTC
+   bounds, and query so someone else can reproduce the export.
+2. Export raw records as **JSON Lines** or plain text. Use one JSON object
+   per line. Preserve timestamps, service names, severity, messages, and
+   request or trace IDs where available. If the export is a CSV, a JSON
+   array, or an API response that wraps records, select an appropriate
+   export format or convert it to one record per line before analysis.
+3. Check whether the platform sampled, truncated, or paginated the export.
+   Check its count against the records Log Triage scanned. Rates and gates
+   describe the exported data. Use complete, comparable windows whenever
+   the result will inform an incident decision or automation.
+
+Practice with `incident.jsonl` as if a logging platform had exported it.
+Start by confirming its fields, then search the export for timeout events.
+
+```bash
+python3.12 log_triage.py inspect incident.jsonl --sample spread
+python3.12 log_triage.py search incident.jsonl --contains TIMEOUT --json
+```
+
+Expect `inspect` to suggest `ts` as a timestamp field and `request` as an ID
+field. Search reports 82 matches in 93 scanned records. If a real export
+uses different field names, use `inspect` to build a profile for that
+export. If you need the full incident workflow, continue with
+[trace a spike back to a request](#4-trace-a-spike-back-to-a-request).
+
+If your logging platform already provides an approved CLI that writes
+UTF-8 records to stdout, pipe that stream into Log Triage using `-` as
+the input path. To practice the same flow with the fixture:
+
+```bash
+python3.12 log_triage.py search - --contains TIMEOUT --json < incident.jsonl
+```
+
+```powershell
+Get-Content incident.jsonl | python log_triage.py search - --contains TIMEOUT --json
+```
+
+The counts are the same. The source is labeled `<stdin>`, so keep the
+original query or export identifier for your handoff. Save an export when
+you need to reproduce the report or inspect the original records later.
+
 ## Write a short incident handoff
 
 Capture the observation window and timezone, the files you searched, the
