@@ -28,7 +28,9 @@ python log_summary.py
 Run the remaining examples from `log-summary/`. The included `app.log` and
 `app.jsonl` represent the same 20 synthetic events, with interleaved requests,
 retries, and recurring error codes. Pass a UTF-8 file path (plain or `.gz`, with or without a BOM) or use `-` to read
-from standard input.
+from standard input. Redirected stdin must be UTF-8. In Windows PowerShell,
+set `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` if an upstream
+PowerShell command needs to send non-ASCII text.
 
 ## Inspect an unfamiliar log
 
@@ -46,7 +48,8 @@ review the new profile before using it. Existing files are kept intact.
 
 Empty results exit with status 0 by default. Add `--fail-on empty` to return
 3 instead. Guidance goes to stderr and distinguishes no matches, an empty
-window, and unusable input fields.
+window, and unusable input fields. For `inspect`, empty means there is no
+usable mapping to suggest. An empty result leaves `--profile-out` untouched.
 
 ## Summarize severity
 
@@ -62,7 +65,8 @@ JSON Lines uses the `severity` field by default. Its values are
 matched case-insensitively against INFO, WARNING, and ERROR. Coverage goes
 to stderr for JSON Lines and for text with unclassified lines. It counts
 lines after text filters, across all levels. Use `--levels INFO WARNING ERROR CRITICAL`
-to choose the severity vocabulary.
+to choose the severity vocabulary. `WARN` counts as `WARNING` unless you
+include `WARN` as its own level.
 
 Key-value logs can use `--format logfmt`. The parser reads consecutive
 `key=value` fields, including double-quoted values, after an optional ISO
@@ -137,7 +141,8 @@ python log_summary.py correlate app.log --format logfmt --key request_id --time 
 The report shows each ID's event count, first and last UTC timestamps, and
 observed span. The span is the difference between the first and last valid
 events present in the input. Use `--sort span` (the default) or `--sort count`.
-Records without a usable ID or timestamp count as skipped. Use `-` for stdin
+Coverage reconciles scanned records into used, skipped (missing a usable ID
+or timestamp), and outside the selected window. Use `-` for stdin
 and `python log_summary.py correlate -h` for all options. Use `timeline` with
 an ID from the report to inspect its individual events.
 
@@ -171,6 +176,8 @@ filtering. Empty buckets inside the reported range show zero observed
 events. Partial edge buckets show counts with no rate (`null` in JSON).
 Reports are limited to 10,000 buckets. Signature matching is exact unless
 you pass `--ignore-case`. Use `--level ERROR` to bucket by severity directly.
+JSON includes the severity selection, case rule, and `matched: false` when
+no events counted, even if the report contains zero-count buckets.
 
 ## Compare an incident with a baseline
 
@@ -224,7 +231,9 @@ python log_summary.py timeline incident.jsonl --profile incident-profile.json --
 
 Profile keys are `format`, `time`, `regex`, `signature`, `service`, `id`,
 `by` (group), and `level_field` (summary).
-Use `regex` for named captures in text logs. The `id` field supplies `--key`
+Use `regex` for named captures in text logs. For severity summary, the text
+profile regex captures `level` (or the configured `level_field`), while the
+CLI's `--regex` still filters whole lines. The `id` field supplies `--key`
 for timeline and correlation (`key` is an alias in the profile). Explicit
 flags override the profile. Bucket uses its signature mapping when you pass
 `--value`. Time

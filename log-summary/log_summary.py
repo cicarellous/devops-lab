@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from glob import glob
+from io import TextIOWrapper
 from itertools import chain, islice
 from math import isfinite
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Iterable, Iterator, TextIO, TypedDict
 
 
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
+LEVEL_ALIASES = {"WARN": "WARNING"}
 LOG_FORMATS = ("text", "jsonl", "logfmt")
 TIMESTAMP_PREFIX = re.compile(
     r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?"
@@ -31,6 +33,11 @@ class SeverityCoverage:
     unclassified: int = 0
 
 
+def normalize_level(value: str, levels: Iterable[str]) -> str:
+    level = value.strip().upper()
+    return level if level in levels else LEVEL_ALIASES.get(level, level)
+
+
 def count_levels(
     lines: Iterable[str],
     *,
@@ -39,6 +46,7 @@ def count_levels(
     output: TextIO | None = None,
     selected_level: str | None = None,
     level_field: str | None = None,
+    level_pattern: re.Pattern[str] | None = None,
     input_format: str = "jsonl",
     levels: tuple[str, ...] = LOG_LEVELS,
     coverage: SeverityCoverage | None = None,
@@ -46,6 +54,8 @@ def count_levels(
     """Count matching lines and optionally write them as they are read."""
     counts = dict.fromkeys(levels, 0)
     prefixes = LOG_LEVELS if levels == LOG_LEVELS else sorted(levels, key=len, reverse=True)
+    aliases = {alias: level for alias, level in LEVEL_ALIASES.items()
+               if alias not in counts and level in counts}
     for line_number, line in enumerate(lines, start=1):
         if contains not in line:
             continue
@@ -59,9 +69,16 @@ def count_levels(
                 if line.startswith(name, level_start):
                     level = name
                     break
+            if level is None and aliases:
+                for alias, canonical in aliases.items():
+                    end = level_start + len(alias)
+                    if line.startswith(alias, level_start) and (len(line) == end or line[end].isspace()):
+                        level = canonical
+                        break
         else:
-            value = log_field(event_fields(line, None, input_format), level_field)
-            level = value.strip().upper() if isinstance(value, str) else None
+            fields = event_fields(line.rstrip("\r\n"), level_pattern, input_format)
+            value = log_field(fields, level_field)
+            level = normalize_level(value, counts) if isinstance(value, str) else None
 
         if level is None or level not in counts:
             if coverage is not None:
@@ -83,6 +100,8 @@ def count_errors(lines: Iterable[str]) -> int:
 
 
 def stdin_lines() -> Iterable[str]:
+    if isinstance(sys.stdin, TextIOWrapper) and not sys.stdin.isatty():
+        sys.stdin.reconfigure(encoding="utf-8", errors="strict")
     first = sys.stdin.readline()
     if first:
         yield first.removeprefix("\ufeff")
@@ -181,11 +200,14 @@ def search_log(argv: list[str]) -> int:
         except (OSError, UnicodeError) as error:
             return report_input_error(args.log_file, error)
         if report is not None:
-            header = json.dumps({
+            header = {
                 "schema_version": 1, "command": "search", "source": source_name(args.log_file),
                 "coverage": {"scanned": number, "matched": matched, "displayed": displayed},
-            })
-            print(header[:-1] + ', "lines": [', end="")
+            }
+            print("{", end="")
+            for key, value in header.items():
+                print(f"{json.dumps(key)}: {json.dumps(value)}, ", end="")
+            print('"lines": [', end="")
             report.seek(0)
             shutil.copyfileobj(report, sys.stdout)
             print("]}")
@@ -649,10 +671,11 @@ def correlate_log(argv: list[str]) -> int:
     groups: dict[str, EventStats] = {}
     include_sources = args.json or len(mappings) > 1
     sources_by_id: dict[str, set[str]] = {}
-    coverage: list[tuple[str, int, int, int]] = []
+    coverage: list[dict[str, str | int]] = []
+    scanned = used = skipped = outside = 0
     for (path, mapping), pattern in zip(mappings, patterns):
         name = source_name(path)
-        source_scanned = source_skipped = source_used = 0
+        source_scanned = source_skipped = source_used = source_outside = 0
         try:
             with open_log(path) as log_file:
                 for line in log_file:
@@ -665,6 +688,7 @@ def correlate_log(argv: list[str]) -> int:
                         continue
 
                     if not since <= timestamp <= until or (exclusive_end and timestamp == until):
+                        source_outside += 1
                         continue
 
                     source_used += 1
@@ -679,10 +703,15 @@ def correlate_log(argv: list[str]) -> int:
                         stats.count += 1
         except (OSError, UnicodeError) as error:
             return report_input_error(path, error)
-        coverage.append((name, source_scanned, source_used, source_skipped))
+        coverage.append({
+            "source": name, "scanned": source_scanned, "used": source_used,
+            "skipped": source_skipped, "outside_window": source_outside,
+        })
+        scanned += source_scanned
+        used += source_used
+        skipped += source_skipped
+        outside += source_outside
 
-    scanned = sum(row[1] for row in coverage)
-    skipped = sum(row[3] for row in coverage)
     # Sort the IDs first to break ties consistently even when input is reordered.
     ranked = sorted(groups)
     if args.sort == "span":
@@ -698,12 +727,10 @@ def correlate_log(argv: list[str]) -> int:
             "total_rows": len(ranked),
             "coverage": {
                 "scanned": scanned,
-                "used": sum(row[2] for row in coverage),
+                "used": used,
                 "skipped": skipped,
-                "sources": [
-                    {"source": name, "scanned": seen, "used": used, "skipped": invalid}
-                    for name, seen, used, invalid in coverage
-                ],
+                "outside_window": outside,
+                "sources": coverage,
             },
             "results": [
                 {
@@ -733,9 +760,11 @@ def correlate_log(argv: list[str]) -> int:
         if args.top is not None:
             print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} IDs")
         if len(coverage) > 1:
-            for name, seen, used, invalid in coverage:
-                print(f"{name}: scanned {seen}, used {used}, skipped {invalid}")
-        print(f"Scanned: {scanned}  IDs: {len(groups)}  Skipped: {skipped}")
+            for source in coverage:
+                print(f"{source['source']}: scanned {source['scanned']}, used {source['used']}, "
+                      f"skipped {source['skipped']}, outside window {source['outside_window']}")
+        print(f"Scanned: {scanned}  IDs: {len(groups)}  Skipped: {skipped}  "
+              f"Used: {used}  Outside window: {outside}")
     if scanned and scanned == skipped:
         if len(mappings) == 1:
             mapping = mappings[0][1]
@@ -950,9 +979,9 @@ def compare_log(argv: list[str]) -> int:
         if len(coverage) > 1:
             for item in coverage:
                 print(f"{item['source']}: scanned {item['scanned']}, used {item['used']}, "
-                      f"skipped {item['skipped']}, outside windows {item['outside_windows']}; "
-                      f"baseline {item['baseline_used']}/{item['baseline_scanned']} used, "
-                      f"incident {item['incident_used']}/{item['incident_scanned']} used")
+                      f"skipped {item['skipped']}, outside {item['outside_windows']}")
+                print(f"  Baseline: {item['baseline_used']}/{item['baseline_scanned']} used  "
+                      f"Incident: {item['incident_used']}/{item['incident_scanned']} used")
         print(f"Unassigned (invalid or missing timestamp): {unknown_time}  Outside windows: {outside}")
     if not (unknown_time or baseline.scanned or incident.scanned or outside):
         print("The input is empty.", file=sys.stderr)
@@ -1000,7 +1029,7 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("--interval", required=True, type=interval_seconds, help="bucket width, e.g. 30s or 5m")
     add_window_arguments(parser, exclusive_until=True)
     parser.add_argument("--signature", help="field used to select events")
-    parser.add_argument("--level", help="filter severity, case-insensitively")
+    parser.add_argument("--level", help="filter severity, case-insensitively (WARN aliases WARNING)")
     parser.add_argument("--level-field", help="severity field (JSONL: severity; text or logfmt: level)")
     parser.add_argument("--value", help="exact value to count in the signature field")
     parser.add_argument("--ignore-case", action="store_true", help="match signature values case-insensitively")
@@ -1018,7 +1047,7 @@ def bucket_log(argv: list[str]) -> int:
     if args.level is not None:
         default_level = "severity" if args.format == "jsonl" else "level"
         args.signature = args.level_field if args.level_field is not None else default_level
-        args.value = args.level
+        args.value = normalize_level(args.level, LOG_LEVELS)
         args.ignore_case = True
     if args.value is not None and args.signature is None:
         parser.error("--value requires a signature field from --signature or --profile")
@@ -1069,6 +1098,8 @@ def bucket_log(argv: list[str]) -> int:
                         parser.error(limit_message)
                 if args.signature is not None:
                     value = event_id(log_field(fields, args.signature))
+                    if value is not None and args.level is not None:
+                        value = normalize_level(value, (args.value,))
                     if value is not None and args.ignore_case:
                         value = value.casefold()
                     if value != wanted:
@@ -1125,6 +1156,9 @@ def bucket_log(argv: list[str]) -> int:
             "interval_seconds": args.interval,
             "signature": args.signature,
             "value": args.value,
+            "level": args.level,
+            "ignore_case": args.ignore_case,
+            "matched": bool(counts),
             "coverage": coverage,
             "buckets": buckets,
         }))
@@ -1174,7 +1208,7 @@ def inspect_log(argv: list[str]) -> int:
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines (1-1000)")
-    parser.add_argument("--profile-out", metavar="FILE", help="save a suggested profile to a new file")
+    parser.add_argument("--profile-out", metavar="FILE", help="save a suggested profile to a new file; empty means no suggested mapping")
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     if not 1 <= args.lines <= 1000:
@@ -1246,9 +1280,11 @@ def inspect_log(argv: list[str]) -> int:
         candidates["time"] = timestamp_fields
         profile["time"] = timestamp_fields[0]
 
-    if args.profile_out:
-        if not profile:
-            parser.error("no structured fields to save in a profile")
+    if not candidates:
+        profile.clear()
+    if args.profile_out and not profile and args.fail_on != "empty":
+        parser.error("no usable field mapping to save in a profile")
+    if args.profile_out and profile:
         try:
             with Path(args.profile_out).open("x", encoding="utf-8", newline="\n") as destination:
                 json.dump(profile, destination, indent=2)
@@ -1298,9 +1334,14 @@ def inspect_log(argv: list[str]) -> int:
         return report_status(args, empty=True)
     if input_format is None:
         print("No JSON objects or key-value records sampled. Timed text commands need named regex captures.", file=sys.stderr)
-        return 0
+        return report_status(args, empty=True)
+    if not profile:
+        print("No usable field mapping suggested. Try a larger sample or map fields manually.", file=sys.stderr)
+        return report_status(args, empty=True)
     if args.profile_out:
         return 0
+    print("Save and review the suggested mapping with --profile-out FILE, then reuse it with --profile FILE.",
+          file=sys.stderr)
     if not timestamp_fields:
         print("No ISO timestamp fields found in the sample. Try --lines with a larger sample.", file=sys.stderr)
         return 0
@@ -1398,31 +1439,34 @@ def main() -> int:
     )
     parser.add_argument("--profile", metavar="FILE", help="JSON log mapping")
     parser.add_argument("--format", choices=LOG_FORMATS)
-    parser.add_argument("--level-field", help="severity field (JSONL: severity; logfmt: level)")
-    parser.add_argument("--levels", nargs="+", metavar="LEVEL", help="severity vocabulary (default: INFO WARNING ERROR)")
+    parser.add_argument("--level-field", help="severity field (JSONL: severity; logfmt or text profile: level)")
+    parser.add_argument("--levels", nargs="+", metavar="LEVEL", help="severity vocabulary (default: INFO WARNING ERROR; WARN aliases WARNING)")
     add_report_arguments(parser)
     args = parser.parse_args()
     if args.json and args.show_lines:
         parser.error("--json cannot be combined with --show-lines")
     regex_flag = args.regex
+    args.regex = None
     apply_log_mapping(parser, args, required=(), optional=("level_field",))
-    # Summary --regex filters whole lines; the profile regex maps fields for other commands.
-    args.regex = regex_flag
-    if args.level_field is not None and args.format == "text":
-        parser.error("--level-field requires --format jsonl or logfmt")
+    # Keep the CLI search pattern separate from the profile's field-mapping pattern.
+    level_pattern = compile_pattern(parser, args.regex) if args.format == "text" else None
+    if args.level_field is not None and args.format == "text" and level_pattern is None:
+        parser.error("--level-field requires structured input or a text profile regex")
     vocabulary = tuple(dict.fromkeys(level.upper() for level in args.levels)) if args.levels else LOG_LEVELS
     if any(re.fullmatch(r"[A-Z][A-Z0-9_-]*", level) is None for level in vocabulary):
         parser.error("--levels expects names like INFO or CRITICAL")
     if args.level is not None:
-        args.level = args.level.upper()
+        args.level = normalize_level(args.level, vocabulary)
         if args.level not in vocabulary:
             parser.error(f"argument --level: invalid choice: {args.level!r} (choose from {', '.join(vocabulary)})")
     coverage = SeverityCoverage()
     level_field = None
-    if args.format != "text":
+    if args.format != "text" or level_pattern is not None:
         default_level = "severity" if args.format == "jsonl" else "level"
         level_field = args.level_field if args.level_field is not None else default_level
-    pattern = compile_pattern(parser, args.regex)
+    if level_pattern is not None and level_field not in level_pattern.groupindex:
+        parser.error(f"profile regex must define a named severity capture {level_field!r}")
+    pattern = compile_pattern(parser, regex_flag)
     log_path = args.log_file
 
     try:
@@ -1434,6 +1478,7 @@ def main() -> int:
                 output=sys.stdout if args.show_lines else None,
                 selected_level=args.level,
                 level_field=level_field,
+                level_pattern=level_pattern,
                 input_format=args.format,
                 levels=vocabulary,
                 coverage=coverage,
@@ -1461,7 +1506,7 @@ def main() -> int:
         print("No lines to classify. Check the input and text filters.", file=sys.stderr)
     elif args.level and not counts[args.level]:
         print(f"No {args.level} entries matched.", file=sys.stderr)
-    if args.format != "text" or coverage.unclassified:
+    if args.format != "text" or level_pattern is not None or coverage.unclassified:
         print(
             f"Classified: {coverage.classified}  Unclassified: {coverage.unclassified}",
             file=sys.stderr,

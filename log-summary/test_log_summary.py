@@ -272,7 +272,7 @@ class CorrelateTests(unittest.TestCase):
             "6", "0:00:01.781000", "2026-11-26T14:00:00.000000+00:00",
             "2026-11-26T14:00:01.781000+00:00", '"r-100"',
         ])
-        self.assertEqual(rows[-1], "Scanned: 20  IDs: 5  Skipped: 0")
+        self.assertEqual(rows[-1], "Scanned: 20  IDs: 5  Skipped: 0  Used: 20  Outside window: 0")
 
     def test_count_sort_and_skipped_records(self):
         repo = Path(__file__).resolve().parent
@@ -295,7 +295,7 @@ class CorrelateTests(unittest.TestCase):
                 )
                 rows = result.stdout.splitlines()
                 self.assertTrue(rows[1].endswith(f'"{first_id}"'))
-                self.assertEqual(rows[-1], "Scanned: 7  IDs: 2  Skipped: 2")
+                self.assertEqual(rows[-1], "Scanned: 7  IDs: 2  Skipped: 2  Used: 5  Outside window: 0")
 
 
 class InputErrorTests(unittest.TestCase):
@@ -934,6 +934,104 @@ class AutomationContractTests(unittest.TestCase):
                                   "--level", "CRITICAL", "--json")
             self.assertEqual(bucket.returncode, 0, bucket.stderr)
             self.assertEqual(json.loads(bucket.stdout)["coverage"]["counted"], 1)
+
+
+class ReportCorrectnessTests(unittest.TestCase):
+    def run_cli(self, *args, data=None, io_encoding="utf-8"):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=data, capture_output=True,
+            env={**environ, "PYTHONIOENCODING": io_encoding},
+        )
+
+    def test_warn_alias_respects_explicit_vocabulary(self):
+        cases = [
+            (("WARN ready\n", []), "WARNING"),
+            (("level=warn message=x\n", ["--format", "logfmt"]), "WARNING"),
+            (('{"severity":"warn"}\n', ["--format", "jsonl", "--levels", "WARN", "WARNING"]), "WARN"),
+        ]
+        for (data, args), level in cases:
+            with self.subTest(level=level, args=args):
+                result = self.run_cli("-", "--json", *args, data=data.encode())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["counts"][level], 1)
+                self.assertEqual(report["coverage"], {"classified": 1, "unclassified": 0})
+
+    def test_text_profile_capture_is_independent_of_cli_regex_filter(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile.json"
+            profile.write_text(json.dumps({
+                "format": "text", "regex": r"priority=(?P<priority>\w+)",
+                "level_field": "priority",
+            }), encoding="utf-8")
+            result = self.run_cli(
+                "-", "--profile", str(profile), "--regex", "keep", "--json",
+                data=b"priority=warn keep\npriority=error ignore\npriority=error keep\n",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["counts"], {"INFO": 0, "WARNING": 1, "ERROR": 1})
+            profile.write_text('{"format":"text","regex":"(?P<other>.)"}', encoding="utf-8")
+            invalid = self.run_cli("-", "--profile", str(profile), "--json", data=b"ERROR hi\n")
+            self.assertEqual(invalid.returncode, 2)
+            self.assertIn(b"named severity capture 'level'", invalid.stderr)
+
+    def test_inspect_fail_on_no_mapping_leaves_profile_target_untouched(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile.json"
+            for data in (b"random text\n", b'{"name":"example"}\n'):
+                with self.subTest(data=data):
+                    result = self.run_cli(
+                        "inspect", "-", "--json", "--fail-on", "empty",
+                        "--profile-out", str(profile), data=data,
+                    )
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertIsNone(json.loads(result.stdout)["profile"])
+                    self.assertFalse(profile.exists())
+
+    def test_correlate_reports_all_coverage_including_outside_window(self):
+        args = ("correlate", "app.jsonl", "--format", "jsonl", "--key", "request_id",
+                "--time", "timestamp", "--since", "2026-11-26T14:00:01Z")
+        result = self.run_cli(*args, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        coverage = json.loads(result.stdout)["coverage"]
+        self.assertEqual(
+            [coverage[name] for name in ("scanned", "used", "skipped", "outside_window")],
+            [20, 12, 0, 8],
+        )
+        self.assertEqual(coverage["sources"], [
+            {"source": "app.jsonl", "scanned": 20, "used": 12, "skipped": 0, "outside_window": 8},
+        ])
+        text = self.run_cli(*args)
+        self.assertIn(b"Used: 12  Outside window: 8", text.stdout)
+
+    def test_bucket_metadata_distinguishes_severity_alias_and_zero_matches(self):
+        base = ("bucket", "-", "--format", "jsonl", "--time", "ts", "--interval", "1m",
+                "--since", "2026-11-26T14:00Z", "--before", "2026-11-26T14:01Z", "--json")
+        data = b'{"ts":"2026-11-26T14:00:30Z","severity":"warn"}\n'
+        severity = self.run_cli(*base, "--level", "WARNING", data=data)
+        self.assertEqual(severity.returncode, 0, severity.stderr)
+        report = json.loads(severity.stdout)
+        self.assertEqual((report["level"], report["ignore_case"], report["matched"]), ("WARNING", True, True))
+        self.assertEqual(report["buckets"][0]["count"], 1)
+        literal = self.run_cli(*base, "--signature", "severity", "--value", "WARNING", data=data)
+        self.assertEqual(literal.returncode, 0, literal.stderr)
+        report = json.loads(literal.stdout)
+        self.assertEqual((report["level"], report["ignore_case"], report["matched"]), (None, False, False))
+        self.assertEqual(report["buckets"][0]["count"], 0)
+
+    def test_redirected_stdin_reads_utf8_strictly_even_under_ascii_stdio(self):
+        data = ('\ufeff{"ts":"2026-11-26T14:00Z","id":"caf\u00e9"}\n').encode("utf-8")
+        result = self.run_cli(
+            "correlate", "-", "--format", "jsonl", "--time", "ts", "--key", "id",
+            "--json", data=data, io_encoding="ascii",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["results"][0]["id"], "caf\u00e9")
+        invalid = self.run_cli("search", "-", "--contains", "INFO", "--json", data=b"INFO \xff\n")
+        self.assertEqual(invalid.returncode, 1)
+        self.assertEqual(invalid.stdout, b"")
+        self.assertIn(b"Cannot read log", invalid.stderr)
 
 
 if __name__ == "__main__":
