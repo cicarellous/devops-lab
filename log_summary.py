@@ -4,17 +4,27 @@ from pathlib import Path
 from typing import Iterable
 
 
+LOG_LEVELS = ("INFO", "WARNING", "ERROR")
+
+
+def count_levels(lines: Iterable[str]) -> dict[str, int]:
+    """Count lines starting with each supported log level."""
+    counts = dict.fromkeys(LOG_LEVELS, 0)
+    for line in lines:
+        for level in LOG_LEVELS:
+            if line.startswith(level):
+                counts[level] += 1
+                break
+    return counts
+
+
 def count_errors(lines: Iterable[str]) -> int:
     """Count lines that start with ERROR."""
-    error_count = 0
-    for line in lines:
-        if line.startswith("ERROR"):
-            error_count += 1
-    return error_count
+    return count_levels(lines)["ERROR"]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Count lines starting with ERROR.")
+    parser = argparse.ArgumentParser(description="Count lines starting with INFO, WARNING, or ERROR.")
     parser.add_argument(
         "log_file",
         nargs="?",
@@ -26,12 +36,13 @@ def main() -> int:
 
     try:
         with log_path.open(encoding="utf-8") as log_file:
-            error_count = count_errors(log_file)
+            counts = count_levels(log_file)
     except FileNotFoundError:
         print(f"Log file not found: {log_path}", file=sys.stderr)
         return 1
 
-    print(f"ERROR entries: {error_count}")
+    for level, count in counts.items():
+        print(f"{level}: {count}")
     return 0
 
 
