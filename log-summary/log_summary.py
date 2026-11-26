@@ -1212,6 +1212,20 @@ def compare_log(argv: list[str]) -> int:
             "baseline_available": bool(baseline.used),
             "breach_count": len(breached),
         }
+    hidden_count = 0
+    highest_hidden = None
+    if breached and args.top is not None:
+        for delta, service, signature, *_ in islice(ranked, args.top, None):
+            if (service, signature) in breached:
+                hidden_count += 1
+                if highest_hidden is None:
+                    highest_hidden = {
+                        "service": service, "signature": signature, "delta_events_per_minute": float(delta),
+                    }
+    if gate_enabled:
+        gate_report["hidden_breach_count"] = hidden_count
+        gate_report["highest_hidden_breach"] = highest_hidden
+
     results = []
     for delta, service, signature, before, after, before_rate, after_rate in ranked[:args.top]:
         if not before.count:
@@ -1305,6 +1319,14 @@ def compare_log(argv: list[str]) -> int:
             return 3
         if breached:
             print(f"Increase gate breached by {len(breached)} signature(s).", file=sys.stderr)
+            if highest_hidden is not None:
+                print(
+                    f"--top hid {hidden_count} breach(es). Highest ranked: "
+                    f"{json.dumps(highest_hidden['signature'])}, "
+                    f"service={json.dumps(highest_hidden['service'])}, "
+                    f"+{highest_hidden['delta_events_per_minute']:.3f} events/min.",
+                    file=sys.stderr,
+                )
             return 4
     return report_status(args, empty=not ranked)
 
@@ -1323,6 +1345,7 @@ class TimeBucket(TypedDict):
     partial: bool
     baseline_count: NotRequired[float | None]
     spike: NotRequired[bool]
+    evaluated: NotRequired[bool]
 
 
 def spike_factor(value: str) -> float:
@@ -1346,7 +1369,7 @@ def bucket_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py bucket",
         description="Count observed events in aligned UTC time buckets.",
-        epilog="Text requires --regex. Choose --value with a signature field from --signature or --profile. Omitted bounds use observed timestamps. Partial buckets have no rate.",
+        epilog="Text requires --regex. Choose --value with a signature field from --signature or --profile. Omitted bounds use observed timestamps. Partial buckets have no rate and are excluded from spike detection. Use an aligned --before for a known complete window.",
     )
     parser.add_argument("log_file", nargs="?", help="log file path or - for stdin")
     add_source_option(parser)
@@ -1355,6 +1378,10 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument(
         "--spike-factor", type=spike_factor, metavar="N",
         help="flag counts above N times the median of the previous 5 full buckets (N > 1, median > 0)",
+    )
+    parser.add_argument(
+        "--spike-min-count", type=positive_count, metavar="N",
+        help="flag a full bucket with at least N events when the median is zero (requires --spike-factor)",
     )
     add_window_arguments(parser, exclusive_until=True)
     parser.add_argument("--signature", help="field used to select events")
@@ -1365,8 +1392,11 @@ def bucket_log(argv: list[str]) -> int:
     add_multiline_option(parser)
     add_report_arguments(parser, gate="spike")
     args = parser.parse_args(argv)
-    if args.fail_on == "spike" and args.spike_factor is None:
-        parser.error("--fail-on spike requires --spike-factor")
+    if args.spike_factor is None:
+        if args.fail_on == "spike":
+            parser.error("--fail-on spike requires --spike-factor")
+        if args.spike_min_count is not None:
+            parser.error("--spike-min-count requires --spike-factor")
     if args.level is not None and (args.signature is not None or args.value is not None):
         parser.error("--level cannot be combined with --signature or --value")
     if args.level_field is not None and args.level is None:
@@ -1466,6 +1496,7 @@ def bucket_log(argv: list[str]) -> int:
     end = end_bound if end_bound is not None else (last + 1 if last is not None else None)
     buckets: list[TimeBucket] = []
     history: deque[int] = deque(maxlen=SPIKE_BASELINE_BUCKETS)
+    evaluated_buckets = 0
     if start is not None and end is not None:
         first_bucket, last_bucket = start // width, (end - 1) // width
         if last_bucket - first_bucket + 1 > MAX_BUCKETS:
@@ -1489,8 +1520,18 @@ def bucket_log(argv: list[str]) -> int:
                         if len(history) == SPIKE_BASELINE_BUCKETS:
                             baseline = median(history)
                         history.append(count)
+                    evaluated = spike = False
+                    if baseline is not None and counts:
+                        if baseline > 0:
+                            evaluated = True
+                            spike = count > baseline * args.spike_factor
+                        elif args.spike_min_count is not None:
+                            evaluated = True
+                            spike = count >= args.spike_min_count
+                    evaluated_buckets += evaluated
                     bucket["baseline_count"] = baseline
-                    bucket["spike"] = baseline is not None and baseline > 0 and count > baseline * args.spike_factor
+                    bucket["evaluated"] = evaluated
+                    bucket["spike"] = spike
                 buckets.append(bucket)
         except OverflowError:
             parser.error("aligned bucket boundaries fall outside the supported timestamp range")
@@ -1530,7 +1571,11 @@ def bucket_log(argv: list[str]) -> int:
             "matched": bool(counts),
             "coverage": coverage,
             "buckets": buckets,
-            **({"spike_factor": args.spike_factor} if args.spike_factor is not None else {}),
+            **({
+                "spike_factor": args.spike_factor,
+                "spike_min_count": args.spike_min_count,
+                "evaluated_buckets": evaluated_buckets,
+            } if args.spike_factor is not None else {}),
         }))
     else:
         title = f"Interval: {args.interval}s"
@@ -1558,9 +1603,16 @@ def bucket_log(argv: list[str]) -> int:
             f"Scanned: {scanned}  Counted: {coverage['counted']}  "
             f"Invalid timestamp: {invalid}  Outside window: {outside}  Filtered: {filtered}{suffix}"
         )
-    if args.fail_on == "spike" and any(bucket.get("spike") for bucket in buckets):
-        print("Spike gate breached.", file=sys.stderr)
-        return 4
+        if args.spike_factor is not None:
+            print(f"Evaluated buckets: {evaluated_buckets}")
+    if args.fail_on == "spike":
+        if not evaluated_buckets:
+            print("Spike gate could not evaluate any buckets. Check the window, event counts, and baseline.",
+                  file=sys.stderr)
+            return 3
+        if any(bucket.get("spike") for bucket in buckets):
+            print(f"Spike gate breached. Evaluated buckets: {evaluated_buckets}.", file=sys.stderr)
+            return 4
     return report_status(args, empty=not counts)
 
 

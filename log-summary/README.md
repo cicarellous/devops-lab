@@ -216,14 +216,18 @@ Replace `TIMEOUT` with `QUEUE_WARNING` to see a steady rate. Text input requires
 `--regex` with named captures. Add `--json` for a versioned report with bucket
 boundaries, counts, rates, and coverage.
 
-Add `--spike-factor 3` to flag a full bucket whose event count exceeds
-three times the median of the previous five full buckets. Empty full
-buckets count as zero in the baseline. A zero median, insufficient
-history, or a partial bucket produces no spike flag. JSON adds
-`spike_factor` to the report and `baseline_count` and `spike` to each
-bucket. A missing baseline is represented by `null`. Add `--fail-on spike`
-to return 4 when any bucket is flagged. Without a flag, the spike gate
-returns 0, including when there are too few full buckets to evaluate.
+Add `--spike-factor 3` to flag a full bucket whose count exceeds three
+times the median of the previous five full buckets. Empty full buckets
+count as zero in the baseline. With a zero median, opt in with
+`--spike-min-count 20` to flag counts of 20 or more. Partial buckets and
+buckets with insufficient history are excluded. Supply an interval-aligned
+`--before` at the exclusive end of a known complete window to evaluate its
+last bucket.
+
+With `--fail-on spike`, exit 4 means a breach, 0 means at least one bucket
+was evaluated and none breached, and 3 means no bucket could be evaluated.
+JSON reports include `evaluated_buckets` and each bucket's `baseline_count`,
+`evaluated`, and `spike` when detection is enabled.
 
 
 Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps before signature
@@ -321,6 +325,8 @@ in a usable baseline only needs to meet the absolute threshold.
 If the baseline has no usable events, the gate returns 3. The gate
 checks every signature, including rows hidden by `--top`. JSON reports
 include the thresholds, breach count, and a `breached` flag on displayed rows.
+If `--top` hides any breaches, stderr and JSON identify the highest-ranked
+hidden breach and how many were hidden.
 
 ## Exit codes
 
@@ -329,7 +335,7 @@ include the thresholds, breach count, and a `breached` flag on displayed rows.
 | `0` | Completed, including empty results by default |
 | `1` | Input or output error |
 | `2` | Invalid arguments or profile |
-| `3` | Empty result with `--fail-on empty`, or no usable baseline for the increase gate |
+| `3` | Empty result with `--fail-on empty`, or a gate could not evaluate |
 | `4` | Spike or increase gate breached |
 
 ## Tests

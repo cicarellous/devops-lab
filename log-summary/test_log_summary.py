@@ -476,6 +476,11 @@ class CompareGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 4, result.stderr)
         report = json.loads(result.stdout)
         self.assertEqual(report["gate"]["breach_count"], 1)
+        self.assertEqual(report["gate"]["hidden_breach_count"], 1)
+        self.assertEqual(report["gate"]["highest_hidden_breach"], {
+            "signature": "low", "service": None, "delta_events_per_minute": 2,
+        })
+        self.assertIn('--top hid 1 breach(es). Highest ranked: "low"', result.stderr)
         self.assertEqual(report["results"][0]["signature"], "high")
         self.assertFalse(report["results"][0]["breached"])
 
@@ -502,7 +507,7 @@ class CompareGateTests(unittest.TestCase):
 
 
 class SpikeDetectionTests(unittest.TestCase):
-    def run_bucket(self, counts, *options):
+    def run_bucket(self, counts, *options, before="2026-11-26T14:08:30Z"):
         data = "".join(
             json.dumps({"ts": f"2026-11-26T14:{minute:02d}:20Z"}) + "\n"
             for minute, count in enumerate(counts)
@@ -511,7 +516,7 @@ class SpikeDetectionTests(unittest.TestCase):
         return subprocess.run(
             [sys.executable, "log_summary.py", "bucket", "-", "--format", "jsonl",
              "--time", "ts", "--interval", "1m", "--since", "2026-11-26T14:00:10Z",
-             "--before", "2026-11-26T14:08:30Z", *options],
+             *(("--before", before) if before else ()), *options],
             cwd=Path(__file__).resolve().parent, input=data, text=True, capture_output=True,
         )
 
@@ -546,6 +551,31 @@ class SpikeDetectionTests(unittest.TestCase):
         result = self.run_bucket([], "--fail-on", "spike")
         self.assertEqual(result.returncode, 2)
         self.assertIn("--fail-on spike requires --spike-factor", result.stderr)
+
+    def test_spike_gate_reports_unevaluable_windows(self):
+        options = ("--fail-on", "spike", "--spike-factor", "3", "--json")
+        for counts, before, extra in (
+            ([], "2026-11-26T14:08:30Z", ("--spike-min-count", "20")),
+            ([0, 2, 2, 2, 2, 2, 20], None, ()),
+            ([0, 0, 0, 0, 0, 0, 20], "2026-11-26T14:07:00Z", ()),
+        ):
+            with self.subTest(counts=counts, before=before):
+                result = self.run_bucket(counts, *options, *extra, before=before)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["evaluated_buckets"], 0)
+
+    def test_aligned_window_can_flag_zero_median_onset(self):
+        options = ("--fail-on", "spike", "--spike-factor", "3", "--spike-min-count", "20", "--json")
+        for count, status in ((19, 0), (20, 4)):
+            with self.subTest(count=count):
+                result = self.run_bucket([0, 0, 0, 0, 0, 0, count], *options,
+                                         before="2026-11-26T14:07:00Z")
+                self.assertEqual(result.returncode, status, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["evaluated_buckets"], 1)
+                self.assertTrue(report["buckets"][-1]["evaluated"])
+                self.assertEqual(report["buckets"][-1]["spike"], status == 4)
+        self.assertEqual(self.run_bucket([], "--spike-min-count", "20").returncode, 2)
 
     def test_factor_rejects_invalid_values(self):
         for value in ("1", "nan", "inf", "invalid"):
