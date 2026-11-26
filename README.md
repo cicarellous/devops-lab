@@ -1,6 +1,6 @@
 # devops-lab
 
-A small Python project for practicing scripting, testing, Git, and CI.
+A Python command-line tool for log analysis and operational troubleshooting. It reads logs from files or standard input, counts entries by severity, and supports text filtering and line-numbered output for incident triage.
 
 Run the log summary script:
 
