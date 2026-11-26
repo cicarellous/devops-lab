@@ -429,7 +429,7 @@ def compare_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py compare",
         description="Rank signature changes between baseline and incident windows.",
-        epilog="Windows include START and exclude END. Timestamps without offsets use UTC.",
+        epilog="Windows include START and exclude END. The baseline must end by the incident start. Times without offsets use UTC.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument("--format", choices=("text", "jsonl"), default="text")
@@ -555,7 +555,7 @@ def bucket_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py bucket",
         description="Count observed events in aligned UTC time buckets.",
-        epilog="Use --signature and --value together. Partial buckets have no rate.",
+        epilog="Text requires --regex. Use --signature and --value together. Omitted bounds use observed timestamps. Partial buckets have no rate.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument("--format", choices=("text", "jsonl"), default="text")
@@ -692,6 +692,7 @@ def main() -> int:
             "  bucket      Show observed event rates over time\n\n"
             "Examples:\n"
             "  python log_summary.py                 Count levels in app.log\n"
+            "  python log_summary.py app.jsonl --format jsonl\n"
             "  python log_summary.py app.log --level ERROR\n"
             "                                        Show only the ERROR count\n"
             '  python log_summary.py app.log --level ERROR --contains "timed out"\n'
@@ -731,7 +732,7 @@ def main() -> int:
         help="count only lines matching this Python regular expression",
     )
     parser.add_argument("--format", choices=("text", "jsonl"), default="text")
-    parser.add_argument("--level-field", help="JSONL severity field (default: severity)")
+    parser.add_argument("--level-field", help="top-level JSONL severity field (default: severity)")
     args = parser.parse_args()
     if args.level_field is not None and args.format != "jsonl":
         parser.error("--level-field requires --format jsonl")

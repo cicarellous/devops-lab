@@ -39,9 +39,10 @@ python log_summary.py app.log --level ERROR --contains "timed out" --show-lines
 python log_summary.py app.jsonl --format jsonl --level-field severity
 ```
 
-JSON Lines severity is matched case-insensitively. Coverage goes to stderr
-for JSON Lines and when text contains unclassified lines. Coverage applies
-after text filters and across all severity levels.
+JSON Lines uses the top-level `severity` field by default. Its values are
+matched case-insensitively against INFO, WARNING, and ERROR. Coverage goes
+to stderr for JSON Lines and for text with unclassified lines. It counts
+lines after text filters, across all levels.
 
 ## Search logs
 
@@ -116,6 +117,23 @@ Correlation spans are calculated from the events within the window.
 python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --until "2026-11-26T14:00:00.959Z"
 ```
 
+## Find when event activity changed
+
+```powershell
+python log_summary.py bucket incident.jsonl --format jsonl --time ts --interval 30s --signature code --value TIMEOUT --since 2026-11-26T14:00Z --until 2026-11-26T14:03Z
+```
+
+Timeouts jump at 14:01 UTC. Use that boundary in the `compare` example below.
+Replace `TIMEOUT` with `QUEUE_WARNING` to see a steady rate. Text input requires
+`--regex` with named captures. Add `--json` for a versioned report with bucket
+boundaries, counts, rates, and coverage.
+
+Buckets align to UTC epoch intervals. `--since` is inclusive and `--until`
+is exclusive. Omitted bounds use observed timestamps before signature
+filtering. Empty buckets inside the reported range show zero observed
+events. Partial edge buckets show counts with no rate (`null` in JSON).
+Reports are limited to 10,000 buckets.
+
 ## Compare an incident with a baseline
 
 ```powershell
@@ -130,22 +148,6 @@ shows coverage. `NEW` means the signature was unseen in the supplied baseline.
 Windows include their start and exclude their end. Use `--regex` with named
 captures for text logs. `--service` and `--id` are optional. Observed ID counts
 reflect only records with usable IDs. Rates use the full requested windows.
-
-## Find when event activity changed
-
-```powershell
-python log_summary.py bucket incident.jsonl --format jsonl --time ts --interval 30s --signature code --value TIMEOUT --since 2026-11-26T14:00Z --until 2026-11-26T14:03Z
-```
-
-This shows the timeout cluster around 14:01 UTC. Replace `TIMEOUT` with
-`QUEUE_WARNING` to see the flat comparison. Use those times with `compare`.
-Text logs use `--regex` with named captures. Add `--json` for versioned output.
-
-Buckets align to UTC epoch intervals. `--since` is inclusive and `--until`
-is exclusive. Omitted bounds use observed timestamps before signature
-filtering. Empty buckets inside the reported range show zero observed
-events. Partial edge buckets show counts with no rate (`null` in JSON).
-Reports are limited to 10,000 buckets.
 
 ## Tests
 
