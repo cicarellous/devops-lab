@@ -140,19 +140,22 @@ an ID from the report to inspect its individual events.
 
 ## Focus on an incident window
 
-Use `--since` and `--until` with `timeline` or `correlate`. Both bounds are
-optional and inclusive. Use ISO 8601 timestamps with an offset, or omit the
-offset to use UTC. Events outside the window are excluded from the report.
-Correlation spans are calculated from the events within the window.
+Use `--since` (inclusive) and `--before` (exclusive) with `timeline`,
+`correlate`, and `bucket`. Adjacent windows share a boundary without
+counting that event twice. `compare` uses the same rule for both windows.
+Use ISO 8601 timestamps. An omitted offset means UTC.
+
+For existing scripts, `--until` remains inclusive in `timeline` and
+`correlate`, and exclusive in `bucket`. Use one upper-bound flag at a time.
 
 ```powershell
-python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --until "2026-11-26T14:00:00.959Z"
+python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --before "2026-11-26T14:00:01Z"
 ```
 
 ## Find when event activity changed
 
 ```powershell
-python log_summary.py bucket incident.jsonl --format jsonl --time ts --interval 30s --signature code --value TIMEOUT --since 2026-11-26T14:00Z --until 2026-11-26T14:03Z
+python log_summary.py bucket incident.jsonl --format jsonl --time ts --interval 30s --signature code --value TIMEOUT --since 2026-11-26T14:00Z --before 2026-11-26T14:03Z
 ```
 
 Timeouts jump at 14:01 UTC. Use that boundary in the `compare` example below.
@@ -160,8 +163,7 @@ Replace `TIMEOUT` with `QUEUE_WARNING` to see a steady rate. Text input requires
 `--regex` with named captures. Add `--json` for a versioned report with bucket
 boundaries, counts, rates, and coverage.
 
-Buckets align to UTC epoch intervals. `--since` is inclusive and `--until`
-is exclusive. Omitted bounds use observed timestamps before signature
+Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps before signature
 filtering. Empty buckets inside the reported range show zero observed
 events. Partial edge buckets show counts with no rate (`null` in JSON).
 Reports are limited to 10,000 buckets. Signature matching is exact unless
@@ -214,4 +216,4 @@ From `log-summary/`, run the unit tests:
 python -m unittest -v
 ```
 
-GitHub Actions runs the unit tests on pushes to `main` and on pull requests targeting `main`. You can see each run in the repository's **Actions** tab.
+GitHub Actions runs the tests on Ubuntu and Windows for pushes to `main` and pull requests targeting it. You can see each run in the repository's **Actions** tab.

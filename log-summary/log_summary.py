@@ -265,13 +265,22 @@ def apply_log_mapping(
         parser.error(f"missing {', '.join(missing)}; supply flags or a --profile")
 
 
+def add_window_arguments(
+    parser: argparse.ArgumentParser, *, exclusive_until: bool = False
+) -> None:
+    parser.add_argument("--since", metavar="TIME", help="inclusive start (ISO 8601)")
+    end = parser.add_mutually_exclusive_group()
+    end.add_argument("--before", metavar="TIME", help="exclusive end (ISO 8601)")
+    until_help = "alias for --before" if exclusive_until else "inclusive end (legacy behavior)"
+    end.add_argument("--until", metavar="TIME", help=until_help)
+
+
 def add_event_arguments(parser: argparse.ArgumentParser, *, optional_file: bool = False) -> None:
     parser.add_argument("log_file", nargs="?" if optional_file else None,
                         help="log file path or - for stdin")
     add_mapping_arguments(parser)
     parser.add_argument("--key", help="ID field or named regex capture (profile: id)")
-    parser.add_argument("--since", metavar="TIME", help="include events at or after this ISO timestamp")
-    parser.add_argument("--until", metavar="TIME", help="include events at or before this ISO timestamp")
+    add_window_arguments(parser)
     parser.epilog = (
         "Timestamps use ISO 8601. Timestamps without an offset are treated as UTC. "
         "Use --format jsonl or logfmt for fields, or --regex for text."
@@ -356,17 +365,22 @@ def event_time(value: object) -> datetime | None:
 
 
 def event_window(
-    parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> tuple[datetime, datetime]:
+    parser: argparse.ArgumentParser, args: argparse.Namespace, *, exclusive_until: bool = False
+) -> tuple[datetime, datetime, bool]:
     since = event_time(args.since) if args.since is not None else datetime.min.replace(tzinfo=timezone.utc)
-    until = event_time(args.until) if args.until is not None else datetime.max.replace(tzinfo=timezone.utc)
+    end_flag = "--before" if args.before is not None else "--until"
+    end_value = args.before if args.before is not None else args.until
+    until = event_time(end_value) if end_value is not None else datetime.max.replace(tzinfo=timezone.utc)
+    exclusive_end = args.before is not None or (exclusive_until and args.until is not None)
     if since is None:
         parser.error("invalid --since timestamp: expected ISO 8601")
     if until is None:
-        parser.error("invalid --until timestamp: expected ISO 8601")
+        parser.error(f"invalid {end_flag} timestamp: expected ISO 8601")
+    if exclusive_end and since >= until:
+        parser.error(f"--since must be before {end_flag}")
     if since > until:
-        parser.error("--since must be at or before --until")
-    return since, until
+        parser.error(f"--since must be at or before {end_flag}")
+    return since, until, exclusive_end
 
 
 @dataclass
@@ -406,7 +420,7 @@ def timeline_log(argv: list[str]) -> int:
     parser.add_argument("--value", required=True, help="ID to match exactly")
     parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     args = parser.parse_args(argv)
-    since, until = event_window(parser, args)
+    since, until, exclusive_end = event_window(parser, args)
 
     if args.source:
         if args.log_file is not None or any(
@@ -451,7 +465,7 @@ def timeline_log(argv: list[str]) -> int:
                         source.skipped += 1
                         continue
                     source.valid_times += 1
-                    if since <= utc_time <= until:
+                    if since <= utc_time <= until and (not exclusive_end or utc_time != until):
                         events.append(TimelineEvent(utc_time, source.name, line_number, text))
                         source.matched += 1
         except FileNotFoundError:
@@ -497,7 +511,7 @@ def timeline_log(argv: list[str]) -> int:
         fields = ", ".join(sorted({repr(source.time) for source in sources}))
         print(f"No usable timestamps in {fields} for this ID. Run inspect to find timestamp fields.", file=sys.stderr)
     elif not events:
-        print("No matching events in the requested window. Check --since or --until.", file=sys.stderr)
+        print("No matching events in the requested window. Check the time bounds.", file=sys.stderr)
     return 0
 
 
@@ -520,7 +534,7 @@ def correlate_log(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     apply_log_mapping(parser, args, required=("key", "time"))
     pattern = event_pattern(parser, args)
-    since, until = event_window(parser, args)
+    since, until, exclusive_end = event_window(parser, args)
 
     groups: dict[str, EventStats] = {}
     scanned = 0
@@ -536,7 +550,7 @@ def correlate_log(argv: list[str]) -> int:
                     skipped += 1
                     continue
 
-                if not since <= timestamp <= until:
+                if not since <= timestamp <= until or (exclusive_end and timestamp == until):
                     continue
 
                 stats = groups.get(key)
@@ -571,7 +585,7 @@ def correlate_log(argv: list[str]) -> int:
     if scanned and scanned == skipped:
         print(f"No usable events. Run inspect to check the {args.key!r} and {args.time!r} mappings.", file=sys.stderr)
     elif scanned and not groups:
-        print("No usable events in the requested window. Check --since or --until.", file=sys.stderr)
+        print("No usable events in the requested window. Check the time bounds.", file=sys.stderr)
     elif not scanned:
         print("The input is empty.", file=sys.stderr)
     return 0
@@ -789,8 +803,7 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("log_file", help="log file path or - for stdin")
     add_mapping_arguments(parser)
     parser.add_argument("--interval", required=True, type=interval_seconds, help="bucket width, e.g. 30s or 5m")
-    parser.add_argument("--since", help="inclusive start of the report (ISO 8601)")
-    parser.add_argument("--until", help="exclusive end of the report (ISO 8601)")
+    add_window_arguments(parser, exclusive_until=True)
     parser.add_argument("--signature", help="field used to select events")
     parser.add_argument("--value", help="exact value to count in the signature field")
     parser.add_argument("--ignore-case", action="store_true", help="match signature values case-insensitively")
@@ -810,11 +823,9 @@ def bucket_log(argv: list[str]) -> int:
         required_fields = {args.time, args.signature} - {None}
         if not required_fields <= pattern.groupindex.keys():
             parser.error("--regex must capture --time and any --signature field")
-    since, until = event_window(parser, args)
-    if since >= until:
-        parser.error("--since must be before --until")
+    since, until, _ = event_window(parser, args, exclusive_until=True)
     start_bound = (since - EPOCH) // MICROSECOND if args.since is not None else None
-    end_bound = (until - EPOCH) // MICROSECOND if args.until is not None else None
+    end_bound = (until - EPOCH) // MICROSECOND if args.before is not None or args.until is not None else None
     width = args.interval * 1_000_000
     limit_message = f"report exceeds {MAX_BUCKETS} buckets; narrow the window or use a larger interval"
     if start_bound is not None and end_bound is not None:
@@ -891,7 +902,7 @@ def bucket_log(argv: list[str]) -> int:
     elif invalid == scanned:
         print(f"No usable timestamps in {args.time!r}. Run inspect to find timestamp fields.", file=sys.stderr)
     elif invalid + outside == scanned:
-        print("No usable events in the requested window. Check --since or --until.", file=sys.stderr)
+        print("No usable events in the requested window. Check the time bounds.", file=sys.stderr)
     elif not counts:
         print(f"No events match {args.signature!r}={args.value!r}. Check the signature field and value.", file=sys.stderr)
 

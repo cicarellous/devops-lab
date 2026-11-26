@@ -681,5 +681,118 @@ class InputCompatibilityTests(unittest.TestCase):
         self.assertIn("exceeds 10000 buckets", result.stderr)
 
 
+class WindowContractTests(unittest.TestCase):
+    log = (
+        '{"ts":"2026-11-26T14:00:30Z","id":"r1","code":"E1"}\n'
+        '{"ts":"2026-11-26T09:01:00-05:00","id":"r1","code":"E2"}\n'
+    )
+
+    def run_cli(self, *args, data=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent,
+            input=self.log if data is None else data, text=True, capture_output=True,
+        )
+
+    def test_adjacent_windows_assign_the_boundary_only_to_the_incident(self):
+        common = ("-", "--format", "jsonl", "--time", "ts")
+        windows = (
+            ("--since", "2026-11-26T14:00Z", "--before", "2026-11-26T14:01Z"),
+            ("--since", "2026-11-26T14:01Z", "--before", "2026-11-26T14:02Z"),
+        )
+        for window, line, signature in zip(windows, (1, 2), ("E1", "E2")):
+            with self.subTest(window=window):
+                timeline = self.run_cli(
+                    "timeline", *common, "--key", "id", "--value", "r1", "--json", *window,
+                )
+                self.assertEqual(timeline.returncode, 0, timeline.stderr)
+                self.assertEqual([event["line"] for event in json.loads(timeline.stdout)["events"]], [line])
+
+                correlate = self.run_cli("correlate", *common, "--key", "id", *window)
+                self.assertEqual(correlate.returncode, 0, correlate.stderr)
+                self.assertEqual(correlate.stdout.splitlines()[1].split()[0], "1")
+                self.assertIn("IDs: 1", correlate.stdout)
+
+                bucket = self.run_cli(
+                    "bucket", *common, "--interval", "1m", "--signature", "code",
+                    "--value", signature, "--json", *window,
+                )
+                self.assertEqual(bucket.returncode, 0, bucket.stderr)
+                report = json.loads(bucket.stdout)
+                buckets = report["buckets"]
+                self.assertEqual([(row["count"], row["partial"]) for row in buckets], [(1, False)])
+                self.assertEqual(report["coverage"]["outside_window"], 1)
+                self.assertEqual(report["coverage"]["filtered"], 0)
+
+        compare = self.run_cli(
+            "compare", *common, "--signature", "code", "--json",
+            "--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
+            "--incident", "2026-11-26T14:01Z", "2026-11-26T14:02Z",
+        )
+        self.assertEqual(compare.returncode, 0, compare.stderr)
+        rows = {row["signature"]: row for row in json.loads(compare.stdout)["results"]}
+        self.assertEqual((rows["E2"]["baseline"]["events"], rows["E2"]["incident"]["events"]), (0, 1))
+
+    def test_until_preserves_legacy_semantics_and_conflicts_with_before(self):
+        common = ("-", "--format", "jsonl", "--time", "ts")
+        bounds = ("--since", "2026-11-26T14:00Z", "--until", "2026-11-26T14:01Z")
+        timeline = self.run_cli("timeline", *common, "--key", "id", "--value", "r1", "--json", *bounds)
+        self.assertEqual(timeline.returncode, 0, timeline.stderr)
+        self.assertEqual(json.loads(timeline.stdout)["coverage"]["matched"], 2)
+        correlate = self.run_cli("correlate", *common, "--key", "id", *bounds)
+        self.assertEqual(correlate.returncode, 0, correlate.stderr)
+        self.assertEqual(correlate.stdout.splitlines()[1].split()[0], "2")
+        bucket = self.run_cli("bucket", *common, "--interval", "1m", "--json", *bounds)
+        self.assertEqual(bucket.returncode, 0, bucket.stderr)
+        self.assertEqual(json.loads(bucket.stdout)["coverage"]["counted"], 1)
+
+        for end_args, message in [
+            ((*bounds, "--before", "2026-11-26T14:02Z"), "not allowed"),
+            (("--before", "bad"), "invalid --before timestamp"),
+            (("--since", "2026-11-26T14:01Z", "--before", "2026-11-26T14:01Z"),
+             "--since must be before --before"),
+        ]:
+            result = self.run_cli("timeline", *common, "--key", "id", "--value", "r1", *end_args)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(message, result.stderr)
+
+    def test_empty_result_diagnostics_stay_on_stderr(self):
+        common = ("-", "--format", "jsonl", "--time", "ts")
+        timeline = self.run_cli(
+            "timeline", *common, "--key", "id", "--value", "missing", "--json",
+        )
+        self.assertEqual(timeline.returncode, 0, timeline.stderr)
+        self.assertEqual(json.loads(timeline.stdout)["events"], [])
+        self.assertIn("No events match ID", timeline.stderr)
+
+        timeline = self.run_cli(
+            "timeline", *common, "--key", "id", "--value", "r1", "--json",
+            "--before", "2026-11-26T14:00Z",
+        )
+        self.assertEqual(timeline.returncode, 0, timeline.stderr)
+        self.assertEqual(json.loads(timeline.stdout)["events"], [])
+        self.assertIn("requested window", timeline.stderr)
+
+        compare = self.run_cli(
+            "compare", "-", "--format", "jsonl", "--time", "wrong", "--signature", "code",
+            "--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
+            "--incident", "2026-11-26T14:01Z", "2026-11-26T14:02Z", "--json",
+        )
+        self.assertEqual(compare.returncode, 0, compare.stderr)
+        self.assertEqual(json.loads(compare.stdout)["results"], [])
+        self.assertIn("No usable timestamps in 'wrong'", compare.stderr)
+
+        for args, message in [
+            (("search", "-", "--contains", "missing"), "No matching lines"),
+            (("group", "-", "--format", "jsonl", "--by", "wrong"), "No usable values for 'wrong'"),
+            (("correlate", *common, "--key", "wrong"), "No usable events"),
+        ]:
+            with self.subTest(command=args[0]):
+                result = self.run_cli(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn(message, result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
