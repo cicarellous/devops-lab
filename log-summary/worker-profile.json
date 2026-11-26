@@ -1,6 +1,5 @@
 {
-  "format": "text",
-  "time": "ts",
-  "id": "job",
-  "regex": "^(?P<ts>\\S+) job=(?P<job>\\S+)"
+  "format": "logfmt",
+  "time": "timestamp",
+  "id": "job"
 }

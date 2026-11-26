@@ -2,6 +2,7 @@ import json
 import subprocess
 import sys
 import unittest
+from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -603,6 +604,81 @@ class InvestigationOutputTests(unittest.TestCase):
                 self.assertIn(totals, result.stdout)
                 invalid = self.run_cli(*args, "--top", "0", check=False)
                 self.assertEqual(invalid.returncode, 2)
+
+
+class InputCompatibilityTests(unittest.TestCase):
+    def run_cli(self, *args, input_text=None, check=True):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=input_text,
+            capture_output=True, encoding="utf-8", check=check,
+            env={**environ, "PYTHONIOENCODING": "utf-8"},
+        )
+
+    def test_bom_in_log_profile_and_stdin(self):
+        record = '{"level":"ERROR","code":"E1"}\n'
+        with TemporaryDirectory() as directory:
+            log = Path(directory) / "events.jsonl"
+            profile = Path(directory) / "profile.json"
+            log.write_text(record, encoding="utf-8-sig")
+            profile.write_text(
+                '{"format":"jsonl","by":"code","level_field":"level"}',
+                encoding="utf-8-sig",
+            )
+            result = self.run_cli(str(log), "--profile", str(profile), "--json")
+            report = json.loads(result.stdout)
+            self.assertEqual((report["command"], report["counts"]["ERROR"]), ("summary", 1))
+            self.assertIn('    1  "E1"', self.run_cli(
+                "group", str(log), "--profile", str(profile),
+            ).stdout)
+            result = self.run_cli("search", "-", "--contains", "INFO", input_text="\ufeffINFO Ready\n")
+            self.assertEqual(result.stdout, "1: INFO Ready\n")
+
+    def test_key_value_logs_support_quoted_values_and_saved_profile(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "worker.json"
+            result = self.run_cli("inspect", "worker-example.txt", "--profile-out", str(profile))
+            self.assertIn("Suggested format: logfmt", result.stdout)
+            self.assertEqual(json.loads(profile.read_text()), {
+                "format": "logfmt", "id": "job", "time": "timestamp",
+            })
+            existing = self.run_cli("inspect", "worker-example.txt", "--profile-out", str(profile), check=False)
+            self.assertEqual(existing.returncode, 1)
+            timeline = self.run_cli(
+                "timeline", "-", "--profile", str(profile), "--value", "job 1",
+                input_text='2026-11-26T14:00Z ERROR job="job 1" note="has spaces" free text\n',
+            )
+            self.assertEqual(timeline.stdout.splitlines()[0],
+                             '2026-11-26 14:00:00.000000+00:00  <stdin>:1  '
+                             '2026-11-26T14:00Z ERROR job="job 1" note="has spaces" free text')
+            self.assertIn("Matched: 1", timeline.stdout)
+
+    def test_rejects_regex_in_jsonl_profile_and_reports_empty_search(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "invalid.json"
+            profile.write_text('{"format":"jsonl","regex":"(.)"}', encoding="utf-8")
+            result = self.run_cli("group", "-", "--profile", str(profile), "--by", "code", check=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("profile regex applies only to text input", result.stderr)
+        empty = self.run_cli("search", "-", "--contains", "x", input_text="")
+        self.assertEqual(empty.stderr.strip(), "The input is empty.")
+        self.assertEqual(empty.stdout, "")
+
+    def test_bucket_text_labels_filter_and_rejects_oversized_bounds_before_open(self):
+        args = ("bucket", "incident.jsonl", "--profile", "incident-profile.json",
+                "--interval", "30s", "--value", "timeout", "--ignore-case")
+        result = self.run_cli(*args)
+        self.assertEqual(result.stdout.splitlines()[0],
+                         "Interval: 30s  Filter: code='timeout' (case-insensitive)")
+        self.assertIn("Counted: 82", result.stdout)
+        report = json.loads(self.run_cli(*args, "--json").stdout)
+        self.assertEqual((report["command"], report["source"]), ("bucket", "incident.jsonl"))
+        result = self.run_cli(
+            "bucket", "missing.log", "--format", "jsonl", "--time", "ts", "--interval", "1s",
+            "--since", "2026-11-26T00:00Z", "--until", "2026-11-27T00:00Z", check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("exceeds 10000 buckets", result.stderr)
 
 
 if __name__ == "__main__":

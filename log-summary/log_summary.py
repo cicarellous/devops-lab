@@ -13,8 +13,9 @@ from typing import ContextManager, Iterable, TextIO, TypedDict
 
 
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
+LOG_FORMATS = ("text", "jsonl", "logfmt")
 TIMESTAMP_PREFIX = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?"
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?"
     r"(?:Z|[+-]\d{2}:?\d{2})?[ \t]+"
 )
 
@@ -33,6 +34,7 @@ def count_levels(
     output: TextIO | None = None,
     selected_level: str | None = None,
     level_field: str | None = None,
+    input_format: str = "jsonl",
     coverage: SeverityCoverage | None = None,
 ) -> dict[str, int]:
     """Count matching lines and optionally write them as they are read."""
@@ -51,7 +53,7 @@ def count_levels(
                     level = name
                     break
         else:
-            value = event_fields(line, None).get(level_field)
+            value = event_fields(line, None, input_format).get(level_field)
             level = value.strip().upper() if isinstance(value, str) else None
 
         if level is None or level not in counts:
@@ -73,10 +75,23 @@ def count_errors(lines: Iterable[str]) -> int:
     return count_levels(lines)["ERROR"]
 
 
-def open_log(log_path: str) -> ContextManager[TextIO]:
+def stdin_lines() -> Iterable[str]:
+    first = sys.stdin.readline()
+    if first:
+        yield first.removeprefix("\ufeff")
+        yield from sys.stdin
+
+
+def open_log(log_path: str) -> ContextManager[Iterable[str]]:
     if log_path == "-":
-        return nullcontext(sys.stdin)
-    return Path(log_path).open(encoding="utf-8")
+        return nullcontext(stdin_lines())
+    return Path(log_path).open(encoding="utf-8-sig")
+
+
+def report_input_error(path: str, error: OSError | UnicodeError) -> int:
+    message = f"Log file not found: {path}" if isinstance(error, FileNotFoundError) else f"Cannot read log: {error}"
+    print(message, file=sys.stderr)
+    return 1
 
 
 def compile_pattern(parser: argparse.ArgumentParser, value: str | None) -> re.Pattern[str] | None:
@@ -107,6 +122,7 @@ def search_log(argv: list[str]) -> int:
 
     previous = deque(maxlen=args.context)
     context_end = 0
+    number = 0
     try:
         with open_log(args.log_file) as log_file:
             for number, line in enumerate(log_file, start=1):
@@ -120,19 +136,20 @@ def search_log(argv: list[str]) -> int:
                     print(f"{number}: {text}")
                 elif args.context:
                     previous.append((number, text))
-    except FileNotFoundError:
-        print(f"Log file not found: {args.log_file}", file=sys.stderr)
-        return 1
     except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
-    if not context_end:
+        return report_input_error(args.log_file, error)
+    if not number:
+        print("The input is empty.", file=sys.stderr)
+    elif not context_end:
         print("No matching lines. Check --contains or --regex.", file=sys.stderr)
     return 0
 
 
 def positive_count(value: str) -> int:
-    count = int(value)
+    try:
+        count = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
     if count < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
     return count
@@ -142,25 +159,23 @@ def group_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py group",
         description="Rank values extracted from text or JSON Lines logs by frequency.",
-        epilog="Text input requires --regex. For JSON Lines, use --format jsonl and a field name.",
+        epilog="Use a field from JSON Lines or logfmt, or a named regex capture for text.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument(
-        "--format", choices=("text", "jsonl"), default="text",
+        "--format", choices=LOG_FORMATS,
         help="input format (default: text)",
     )
-    parser.add_argument("--by", required=True, metavar="FIELD",
+    parser.add_argument("--profile", metavar="FILE", help="JSON log mapping")
+    parser.add_argument("--by", metavar="FIELD",
                         help="named regex group or top-level JSON field")
     parser.add_argument("--regex", metavar="PATTERN",
                         help="Python regex with a named capture for text input")
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     args = parser.parse_args(argv)
 
-    if args.format == "text" and args.regex is None:
-        parser.error("text input requires --regex")
-    if args.format == "jsonl" and args.regex is not None:
-        parser.error("--regex applies only to text input")
-    pattern = compile_pattern(parser, args.regex)
+    apply_log_mapping(parser, args, required=("by",))
+    pattern = input_pattern(parser, args)
     if pattern is not None and args.by not in pattern.groupindex:
         parser.error(f"--regex must define a named capture group {args.by!r}")
 
@@ -176,11 +191,7 @@ def group_log(argv: list[str]) -> int:
                     match = pattern.search(line.rstrip("\r\n"))
                     value = match.group(args.by) if match else None
                 else:
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    value = record.get(args.by) if isinstance(record, dict) else None
+                    value = event_fields(line, None, args.format).get(args.by)
                 if value is None or value == "" or not isinstance(value, (str, int, float, bool)):
                     continue
                 if isinstance(value, str):
@@ -188,12 +199,8 @@ def group_log(argv: list[str]) -> int:
                 else:
                     encoded_values[json.dumps(value)] += 1
                 grouped += 1
-    except FileNotFoundError:
-        print(f"Log file not found: {args.log_file}", file=sys.stderr)
-        return 1
     except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
+        return report_input_error(args.log_file, error)
 
     # Encode each distinct string once, preserving the report's ordering and escaping.
     encoded_strings = ((json.dumps(value), count) for value, count in strings.items())
@@ -214,7 +221,7 @@ def group_log(argv: list[str]) -> int:
 
 def add_mapping_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--profile", metavar="FILE", help="JSON log mapping; explicit flags override it")
-    parser.add_argument("--format", choices=("text", "jsonl"), help="input format (default: text)")
+    parser.add_argument("--format", choices=LOG_FORMATS, help="input format (default: text)")
     parser.add_argument("--time", help="timestamp field or named regex capture")
     parser.add_argument("--regex", help="named field captures for text input")
 
@@ -229,10 +236,10 @@ def apply_log_mapping(
     profile = {}
     if args.profile is not None:
         try:
-            profile = json.loads(Path(args.profile).read_text(encoding="utf-8"))
+            profile = json.loads(Path(args.profile).read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, ValueError) as error:
             parser.error(f"cannot load profile {args.profile!r}: {error}")
-        allowed = {"format", "time", "regex", "signature", "service", "id"}
+        allowed = {"format", "time", "regex", "signature", "service", "id", "by", "level_field"}
         if not isinstance(profile, dict):
             parser.error("profile must be a JSON object")
         for name, value in profile.items():
@@ -240,8 +247,10 @@ def apply_log_mapping(
                 parser.error(f"unknown profile field {name!r}")
             if not isinstance(value, str) or not value.strip():
                 parser.error(f"profile field {name!r} must be a nonempty string")
-        if "format" in profile and profile["format"] not in ("text", "jsonl"):
-            parser.error("profile format must be text or jsonl")
+        if "format" in profile and profile["format"] not in LOG_FORMATS:
+            parser.error("profile format must be text, jsonl, or logfmt")
+        if profile.get("format", "text") != "text" and "regex" in profile:
+            parser.error("profile regex applies only to text input")
 
     if args.format is None:
         args.format = profile.get("format", "text")
@@ -249,9 +258,9 @@ def apply_log_mapping(
         args.regex = profile.get("regex")
 
     for name in required + optional:
-        if getattr(args, name) is None:
+        if getattr(args, name, None) is None:
             setattr(args, name, profile.get("id" if name == "key" else name))
-    missing = [f"--{name}" for name in required if getattr(args, name) is None]
+    missing = [f"--{name}" for name in required if getattr(args, name, None) is None]
     if missing:
         parser.error(f"missing {', '.join(missing)}; supply flags or a --profile")
 
@@ -265,14 +274,14 @@ def add_event_arguments(parser: argparse.ArgumentParser, *, optional_file: bool 
     parser.add_argument("--until", metavar="TIME", help="include events at or before this ISO timestamp")
     parser.epilog = (
         "Timestamps use ISO 8601. Timestamps without an offset are treated as UTC. "
-        "Use --format jsonl for top-level JSON fields, or --regex for text."
+        "Use --format jsonl or logfmt for fields, or --regex for text."
     )
 
 
 def input_pattern(parser: argparse.ArgumentParser, args: argparse.Namespace) -> re.Pattern[str] | None:
     if args.format == "text" and args.regex is None:
         parser.error("text input requires --regex")
-    if args.format == "jsonl" and args.regex is not None:
+    if args.format != "text" and args.regex is not None:
         parser.error("--regex applies only to text input")
     pattern = compile_pattern(parser, args.regex)
     return pattern
@@ -285,7 +294,39 @@ def event_pattern(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     return pattern
 
 
-def event_fields(text: str, pattern: re.Pattern[str] | None) -> dict[str, object]:
+LOGFMT_PAIR = re.compile(
+    r'[ \t]*([^=\s"]+)=(?:"((?:[^"\\]|\\.)*)"|([^\s"]*))(?=\s|$)'
+)
+LOGFMT_LEVEL = re.compile(r"(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\s+", re.IGNORECASE)
+
+
+def logfmt_fields(text: str) -> dict[str, object]:
+    fields: dict[str, object] = {}
+    position = 0
+    timestamp = TIMESTAMP_PREFIX.match(text)
+    if timestamp:
+        fields["timestamp"] = timestamp[0].rstrip()
+        position = timestamp.end()
+    level = LOGFMT_LEVEL.match(text, position)
+    if level:
+        fields["level"] = level[1]
+        position = level.end()
+
+    while pair := LOGFMT_PAIR.match(text, position):
+        name, quoted, bare = pair.groups()
+        try:
+            fields[name] = json.loads(f'"{quoted}"') if quoted is not None else bare
+        except json.JSONDecodeError:
+            break
+        position = pair.end()
+    return fields
+
+
+def event_fields(
+    text: str, pattern: re.Pattern[str] | None, input_format: str = "jsonl"
+) -> dict[str, object]:
+    if input_format == "logfmt":
+        return logfmt_fields(text)
     if pattern is not None:
         match = pattern.search(text)
         return match.groupdict() if match else {}
@@ -334,6 +375,7 @@ class TimelineSource:
     key: str
     time: str
     pattern: re.Pattern[str] | None
+    input_format: str
     scanned: int = 0
     skipped: int = 0
     matching_ids: int = 0
@@ -386,7 +428,7 @@ def timeline_log(argv: list[str]) -> int:
     for path, mapping in mappings:
         apply_log_mapping(parser, mapping, required=("key", "time"))
         pattern = event_pattern(parser, mapping)
-        sources.append(TimelineSource(path, mapping.key, mapping.time, pattern))
+        sources.append(TimelineSource(path, mapping.key, mapping.time, pattern, mapping.format))
 
     events: list[TimelineEvent] = []
     for source in sources:
@@ -395,7 +437,7 @@ def timeline_log(argv: list[str]) -> int:
                 for line_number, line in enumerate(log_file, start=1):
                     source.scanned += 1
                     text = line.rstrip("\r\n")
-                    fields = event_fields(text, source.pattern)
+                    fields = event_fields(text, source.pattern, source.input_format)
                     key = event_id(fields.get(source.key))
                     if key is None:
                         source.skipped += 1
@@ -430,6 +472,7 @@ def timeline_log(argv: list[str]) -> int:
     if args.json:
         print(json.dumps({
             "schema_version": 1,
+            "command": "timeline",
             "value": args.value,
             "coverage": {"scanned": scanned, "matched": len(events), "skipped": skipped,
                          "sources": source_coverage},
@@ -486,7 +529,7 @@ def correlate_log(argv: list[str]) -> int:
         with open_log(args.log_file) as log_file:
             for line in log_file:
                 scanned += 1
-                fields = event_fields(line.rstrip("\r\n"), pattern)
+                fields = event_fields(line.rstrip("\r\n"), pattern, args.format)
                 key = event_id(fields.get(args.key))
                 timestamp = event_time(fields.get(args.time))
                 if key is None or timestamp is None:
@@ -503,12 +546,8 @@ def correlate_log(argv: list[str]) -> int:
                     stats.first = min(stats.first, timestamp)
                     stats.last = max(stats.last, timestamp)
                     stats.count += 1
-    except FileNotFoundError:
-        print(f"Log file not found: {args.log_file}", file=sys.stderr)
-        return 1
     except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
+        return report_input_error(args.log_file, error)
 
     # Sort the IDs first to break ties consistently even when input is reordered.
     ranked = sorted(groups)
@@ -609,7 +648,7 @@ def compare_log(argv: list[str]) -> int:
     try:
         with open_log(args.log_file) as log_file:
             for line_number, line in enumerate(log_file, start=1):
-                record = event_fields(line.rstrip("\r\n"), pattern)
+                record = event_fields(line.rstrip("\r\n"), pattern, args.format)
                 timestamp = event_time(record.get(args.time))
                 if timestamp is None:
                     unknown_time += 1
@@ -633,12 +672,8 @@ def compare_log(argv: list[str]) -> int:
                 if group not in window.groups:
                     window.groups[group] = SignatureStats()
                 window.groups[group].record(line_number, event_key)
-    except FileNotFoundError:
-        print(f"Log file not found: {args.log_file}", file=sys.stderr)
-        return 1
     except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
+        return report_input_error(args.log_file, error)
 
     empty = SignatureStats()
     rows = []
@@ -693,6 +728,8 @@ def compare_log(argv: list[str]) -> int:
     if args.json:
         print(json.dumps({
             "schema_version": 1,
+            "command": "compare",
+            "source": "<stdin>" if args.log_file == "-" else args.log_file,
             "total_rows": len(ranked),
             "coverage": {
                 "baseline": {"start": baseline.start.isoformat(), "end": baseline.end.isoformat(),
@@ -756,6 +793,7 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("--until", help="exclusive end of the report (ISO 8601)")
     parser.add_argument("--signature", help="field used to select events")
     parser.add_argument("--value", help="exact value to count in the signature field")
+    parser.add_argument("--ignore-case", action="store_true", help="match signature values case-insensitively")
     parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     args = parser.parse_args(argv)
     apply_log_mapping(
@@ -778,6 +816,13 @@ def bucket_log(argv: list[str]) -> int:
     start_bound = (since - EPOCH) // MICROSECOND if args.since is not None else None
     end_bound = (until - EPOCH) // MICROSECOND if args.until is not None else None
     width = args.interval * 1_000_000
+    limit_message = f"report exceeds {MAX_BUCKETS} buckets; narrow the window or use a larger interval"
+    if start_bound is not None and end_bound is not None:
+        if (end_bound - 1) // width - start_bound // width + 1 > MAX_BUCKETS:
+            parser.error(limit_message)
+    if args.ignore_case and args.value is None:
+        parser.error("--ignore-case requires --value")
+    wanted = args.value.casefold() if args.ignore_case else args.value
 
     first = last = None
     scanned = invalid = outside = filtered = 0
@@ -786,7 +831,7 @@ def bucket_log(argv: list[str]) -> int:
         with open_log(args.log_file) as log_file:
             for line in log_file:
                 scanned += 1
-                fields = event_fields(line.rstrip("\r\n"), pattern)
+                fields = event_fields(line.rstrip("\r\n"), pattern, args.format)
                 timestamp = event_time(fields.get(args.time))
                 if timestamp is None:
                     invalid += 1
@@ -798,16 +843,18 @@ def bucket_log(argv: list[str]) -> int:
                 tick = (timestamp - EPOCH) // MICROSECOND
                 first = tick if first is None else min(first, tick)
                 last = tick if last is None else max(last, tick)
-                if args.signature is not None and event_id(fields.get(args.signature)) != args.value:
-                    filtered += 1
-                    continue
+                if args.signature is not None:
+                    value = event_id(fields.get(args.signature))
+                    if value is not None and args.ignore_case:
+                        value = value.casefold()
+                    if value != wanted:
+                        filtered += 1
+                        continue
                 counts[tick // width] += 1
-    except FileNotFoundError:
-        print(f"Log file not found: {args.log_file}", file=sys.stderr)
-        return 1
+                if len(counts) > MAX_BUCKETS:
+                    parser.error(limit_message)
     except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
+        return report_input_error(args.log_file, error)
 
     start = start_bound if start_bound is not None else first
     end = end_bound if end_bound is not None else (last + 1 if last is not None else None)
@@ -815,7 +862,7 @@ def bucket_log(argv: list[str]) -> int:
     if start is not None and end is not None:
         first_bucket, last_bucket = start // width, (end - 1) // width
         if last_bucket - first_bucket + 1 > MAX_BUCKETS:
-            parser.error(f"report exceeds {MAX_BUCKETS} buckets; narrow the window or use a larger interval")
+            parser.error(limit_message)
         try:
             for index in range(first_bucket, last_bucket + 1):
                 bucket_start = index * width
@@ -851,6 +898,8 @@ def bucket_log(argv: list[str]) -> int:
     if args.json:
         print(json.dumps({
             "schema_version": 1,
+            "command": "bucket",
+            "source": "<stdin>" if args.log_file == "-" else args.log_file,
             "interval_seconds": args.interval,
             "signature": args.signature,
             "value": args.value,
@@ -858,6 +907,12 @@ def bucket_log(argv: list[str]) -> int:
             "buckets": buckets,
         }))
     else:
+        title = f"Interval: {args.interval}s"
+        if args.signature is not None:
+            title += f"  Filter: {args.signature}={args.value!r}"
+            if args.ignore_case:
+                title += " (case-insensitive)"
+        print(title)
         print("START (UTC)                       COUNT  EVENTS/MIN")
         for bucket in buckets:
             rate = bucket["events_per_minute"]
@@ -884,12 +939,15 @@ def inspect_log(argv: list[str]) -> int:
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines (1-1000)")
+    parser.add_argument("--profile-out", metavar="FILE", help="save a suggested profile to a new file")
     args = parser.parse_args(argv)
     if not 1 <= args.lines <= 1000:
         parser.error("--lines must be between 1 and 1000")
 
     sampled = objects = timestamp_prefixes = 0
-    fields: dict[str, FieldSample] = {}
+    logfmt_lines = 0
+    json_fields: dict[str, FieldSample] = {}
+    native_fields: dict[str, FieldSample] = {}
     try:
         with open_log(args.log_file) as log_file:
             for line in islice(log_file, args.lines):
@@ -898,11 +956,17 @@ def inspect_log(argv: list[str]) -> int:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     record = None
-                if not isinstance(record, dict):
+                if isinstance(record, dict):
+                    objects += 1
+                    fields = json_fields
+                else:
                     if TIMESTAMP_PREFIX.match(line):
                         timestamp_prefixes += 1
-                    continue
-                objects += 1
+                    record = logfmt_fields(line)
+                    if not record.keys() - {"timestamp", "level"}:
+                        continue
+                    logfmt_lines += 1
+                    fields = native_fields
                 for name, value in record.items():
                     if name not in fields:
                         fields[name] = FieldSample()
@@ -911,20 +975,27 @@ def inspect_log(argv: list[str]) -> int:
                     sample.types.add(type(value).__name__)
                     if isinstance(value, str) and event_time(value) is not None:
                         sample.timestamps += 1
-    except FileNotFoundError:
-        print(f"Log file not found: {args.log_file}", file=sys.stderr)
-        return 1
     except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
+        return report_input_error(args.log_file, error)
 
     print(f"Sampled: {sampled}  JSON objects: {objects}  Text timestamp prefixes: {timestamp_prefixes}")
     if not sampled:
+        if args.profile_out:
+            parser.error("no structured fields to save in a profile")
         print("The input is empty.", file=sys.stderr)
         return 0
-    if not objects:
-        print("No JSON objects sampled. For timed text commands, pass --regex with named captures.")
+    if not (objects or logfmt_lines):
+        print("No JSON objects or key-value records sampled. Timed text commands need named regex captures.")
+        if args.profile_out:
+            parser.error("no structured fields to save in a profile")
         return 0
+
+    input_format = "jsonl" if objects >= logfmt_lines else "logfmt"
+    fields = json_fields if input_format == "jsonl" else native_fields
+    print(f"Suggested format: {input_format}")
+    if logfmt_lines:
+        print(f"Key-value records: {logfmt_lines}")
+    profile = {"format": input_format}
 
     print("Top-level fields (presence across sampled lines):")
     for name, sample in sorted(fields.items()):
@@ -932,23 +1003,36 @@ def inspect_log(argv: list[str]) -> int:
         timestamp_hint = f" | ISO timestamps: {sample.timestamps}" if sample.timestamps else ""
         print(f"  {json.dumps(name)}: {sample.present}/{sampled} | {types}{timestamp_hint}")
 
-    for label, candidates in (
-        ("Signature", ("code", "error_code", "signature", "event", "event_name")),
-        ("ID", ("request_id", "request", "trace_id", "job_id", "transaction_id", "id")),
-        ("Service", ("service", "service_name", "component")),
-        ("Severity", ("severity", "level", "log_level", "severity_text")),
+    for role, label, candidates in (
+        ("signature", "Signature", ("code", "error_code", "signature", "event", "event_name")),
+        ("id", "ID", ("request_id", "request", "trace_id", "job_id", "job", "transaction_id", "id")),
+        ("service", "Service", ("service", "service_name", "component")),
+        ("level_field", "Severity", ("severity", "level", "log_level", "severity_text")),
     ):
         choices = [
             name for name in sorted(fields)
             if name.lower() in candidates and fields[name].types & {"str", "int", "float"}
         ]
         if choices:
+            profile[role] = max(choices, key=lambda name: fields[name].present)
             print(f"{label} candidates (by name): {', '.join(map(json.dumps, choices))}")
 
     timestamp_fields = sorted(
         (name for name in fields if fields[name].timestamps),
         key=lambda name: (-fields[name].timestamps, name),
     )
+    if timestamp_fields:
+        profile["time"] = timestamp_fields[0]
+    if args.profile_out:
+        try:
+            with Path(args.profile_out).open("x", encoding="utf-8", newline="\n") as destination:
+                json.dump(profile, destination, indent=2)
+                destination.write("\n")
+        except OSError as error:
+            print(f"Cannot save profile {args.profile_out!r}: {error}", file=sys.stderr)
+            return 1
+        print(f"Saved suggested profile: {args.profile_out!r}", file=sys.stderr)
+        return 0
     if not timestamp_fields:
         print("No ISO timestamp fields found in the sample. Try --lines with a larger sample.", file=sys.stderr)
         return 0
@@ -958,10 +1042,15 @@ def inspect_log(argv: list[str]) -> int:
            for value in (timestamp_fields[0], args.log_file)):
         print("Use bucket -h to pass the selected timestamp field and file manually.")
         return 0
+    if "level_field" in profile:
+        severity = profile["level_field"]
+        # Use a simple field token for the displayed example.
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", severity):
+            print(f"Severity summary options: --format {input_format} --level-field {severity}")
     timestamp = timestamp_fields[0].replace("'", "''")
     source = args.log_file.replace("'", "''")
     print("Try in PowerShell:")
-    options = f"--format jsonl --time='{timestamp}' --interval 30s"
+    options = f"--format {input_format} --time='{timestamp}' --interval 30s"
     if args.log_file.startswith("-") and args.log_file != "-":
         print(f"  python log_summary.py bucket {options} -- '{source}'")
     else:
@@ -988,7 +1077,7 @@ def main() -> int:
         return inspect_log(sys.argv[2:])
 
     parser = argparse.ArgumentParser(
-        description="Count INFO, WARNING, and ERROR entries in text or JSON Lines.",
+        description="Count INFO, WARNING, and ERROR entries in text, JSON Lines, or logfmt.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Commands (add -h after a command for its options):\n"
@@ -1040,15 +1129,24 @@ def main() -> int:
         metavar="PATTERN",
         help="count only lines matching this Python regular expression",
     )
-    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
-    parser.add_argument("--level-field", help="top-level JSONL severity field (default: severity)")
+    parser.add_argument("--profile", metavar="FILE", help="JSON log mapping")
+    parser.add_argument("--format", choices=LOG_FORMATS)
+    parser.add_argument("--level-field", help="severity field (JSONL: severity; logfmt: level)")
+    parser.add_argument("--json", action="store_true", help="emit versioned severity counts as JSON")
     args = parser.parse_args()
-    if args.level_field is not None and args.format != "jsonl":
-        parser.error("--level-field requires --format jsonl")
+    if args.json and args.show_lines:
+        parser.error("--json cannot be combined with --show-lines")
+    regex_flag = args.regex
+    apply_log_mapping(parser, args, required=(), optional=("level_field",))
+    # Summary --regex filters whole lines; the profile regex maps fields for other commands.
+    args.regex = regex_flag
+    if args.level_field is not None and args.format == "text":
+        parser.error("--level-field requires --format jsonl or logfmt")
     coverage = SeverityCoverage()
     level_field = None
-    if args.format == "jsonl":
-        level_field = args.level_field if args.level_field is not None else "severity"
+    if args.format != "text":
+        default_level = "severity" if args.format == "jsonl" else "level"
+        level_field = args.level_field if args.level_field is not None else default_level
     pattern = compile_pattern(parser, args.regex)
     log_path = args.log_file
 
@@ -1061,18 +1159,24 @@ def main() -> int:
                 output=sys.stdout if args.show_lines else None,
                 selected_level=args.level,
                 level_field=level_field,
+                input_format=args.format,
                 coverage=coverage,
             )
-    except FileNotFoundError:
-        print(f"Log file not found: {log_path}", file=sys.stderr)
-        return 1
     except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
+        return report_input_error(log_path, error)
 
     levels = (args.level,) if args.level else LOG_LEVELS
-    for level in levels:
-        print(f"{level}: {counts[level]}")
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "command": "summary",
+            "source": "<stdin>" if log_path == "-" else log_path,
+            "counts": {level: counts[level] for level in levels},
+            "coverage": {"classified": coverage.classified, "unclassified": coverage.unclassified},
+        }))
+    else:
+        for level in levels:
+            print(f"{level}: {counts[level]}")
     if not coverage.classified and coverage.unclassified:
         print("No severity levels recognized. Run inspect to check the input format and fields.", file=sys.stderr)
         if args.format == "text" and Path(log_path).suffix.lower() in {".jsonl", ".ndjson"}:
@@ -1081,7 +1185,7 @@ def main() -> int:
         print("No lines to classify. Check the input and text filters.", file=sys.stderr)
     elif args.level and not counts[args.level]:
         print(f"No {args.level} entries matched.", file=sys.stderr)
-    if args.format == "jsonl" or coverage.unclassified:
+    if args.format != "text" or coverage.unclassified:
         print(
             f"Classified: {coverage.classified}  Unclassified: {coverage.unclassified}",
             file=sys.stderr,

@@ -27,7 +27,7 @@ python log_summary.py
 
 Run the remaining examples from `log-summary/`. The included `app.log` and
 `app.jsonl` represent the same 20 synthetic events, with interleaved requests,
-retries, and recurring error codes. Pass a UTF-8 file path or use `-` to read
+retries, and recurring error codes. Pass a UTF-8 file path (with or without a BOM) or use `-` to read
 from standard input.
 
 ## Inspect an unfamiliar log
@@ -40,7 +40,9 @@ Inspect samples the first 100 lines by default. It shows top-level field
 types, presence, and timestamp candidates. On `incident.jsonl`, look for
 `ts`, `code`, and `request`. Run the suggested `bucket` command, then add
 `--signature code --value TIMEOUT` to isolate the jump at 14:01 UTC.
-For text logs, inspect reports recognized timestamp prefixes.
+For key-value logs, inspect suggests `logfmt`. Save a suggested mapping with
+`python log_summary.py inspect app.log --profile-out app-profile.json`, then
+review the new profile before using it. Existing files are kept intact.
 
 Empty results still exit with status 0. Guidance goes to stderr and
 distinguishes no matches, an empty window, and unusable input fields.
@@ -60,6 +62,11 @@ matched case-insensitively against INFO, WARNING, and ERROR. Coverage goes
 to stderr for JSON Lines and for text with unclassified lines. It counts
 lines after text filters, across all levels.
 
+Key-value logs can use `--format logfmt`. The parser reads consecutive
+`key=value` fields, including double-quoted values, after an optional ISO
+timestamp and severity. Those prefixes supply `timestamp` and `level`.
+Trailing free text remains visible in the original record.
+
 ## Search logs
 
 Search any text log with original line numbers and surrounding context:
@@ -75,7 +82,7 @@ is printed once.
 
 ## Group log entries
 
-Use a named regex capture for plain text or a top-level field for JSON Lines.
+Use a named regex capture for plain text or a field from JSON Lines or logfmt.
 
 ```powershell
 python log_summary.py group app.log --regex 'code=(?P<code>E\d{4})' --by code
@@ -96,7 +103,7 @@ Select an ID and timestamp from JSON Lines fields or named regex captures in tex
 
 ```powershell
 python log_summary.py timeline app.jsonl --format jsonl --key request_id --value r-100 --time timestamp
-python log_summary.py timeline app.log --regex '^(?P<ts>\S+).*request_id=(?P<id>\S+)' --key id --value r-100 --time ts
+python log_summary.py timeline app.log --format logfmt --key request_id --value r-100 --time timestamp
 ```
 
 Both commands reconstruct the same six events for `r-100`. The tool sorts by
@@ -113,7 +120,7 @@ python log_summary.py timeline --source incident.jsonl incident-profile.json --s
 ```
 
 Each `--source` pairs a file with its own profile. This example follows the
-same ID across JSON Lines and text. The report includes per-source coverage.
+same ID across JSON Lines and logfmt. The report includes per-source coverage.
 
 ## Compare event groups
 
@@ -121,7 +128,7 @@ Use the same field mappings as `timeline` to compare every ID in a log:
 
 ```powershell
 python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --sort span
-python log_summary.py correlate app.log --regex '^(?P<ts>\S+).*request_id=(?P<id>\S+)' --key id --time ts --sort count
+python log_summary.py correlate app.log --format logfmt --key request_id --time timestamp --sort count
 ```
 
 The report shows each ID's event count, first and last UTC timestamps, and
@@ -157,7 +164,8 @@ Buckets align to UTC epoch intervals. `--since` is inclusive and `--until`
 is exclusive. Omitted bounds use observed timestamps before signature
 filtering. Empty buckets inside the reported range show zero observed
 events. Partial edge buckets show counts with no rate (`null` in JSON).
-Reports are limited to 10,000 buckets.
+Reports are limited to 10,000 buckets. Signature matching is exact unless
+you pass `--ignore-case`.
 
 ## Compare an incident with a baseline
 
@@ -178,12 +186,13 @@ reflect only records with usable IDs. Rates use the full requested windows.
 
 Use `--top N` with `group`, `correlate`, or `compare` to show the first N
 ranked rows. Coverage still describes the entire input. Add `--json` to
-`compare`, `timeline`, or `bucket` for versioned output on stdout.
+`compare`, `timeline`, or `bucket` for versioned output on stdout. The severity summary also accepts `--json`.
+Each JSON report identifies its command.
 
 ## Reuse field mappings
 
 Save your log mapping in a JSON file and pass it to `bucket`, `compare`,
-`timeline`, or `correlate` through `--profile`. See
+`timeline`, `correlate`, `group`, or the severity summary through `--profile`. See
 [`incident-profile.json`](incident-profile.json) for an example.
 
 ```powershell
@@ -191,7 +200,8 @@ python log_summary.py bucket incident.jsonl --profile incident-profile.json --in
 python log_summary.py timeline incident.jsonl --profile incident-profile.json --value incident-00
 ```
 
-Profile keys are `format`, `time`, `regex`, `signature`, `service`, and `id`.
+Profile keys are `format`, `time`, `regex`, `signature`, `service`, `id`,
+`by` (group), and `level_field` (summary).
 Use `regex` for named captures in text logs. The `id` field supplies `--key`
 for timeline and correlation. Explicit flags override the profile. Time
 windows, requested values, and output options stay on the command line.
