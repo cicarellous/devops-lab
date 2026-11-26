@@ -173,6 +173,15 @@ class MultiFileSearchTests(unittest.TestCase):
             self.assertIn("app.log:2-3: ERROR first", text.stdout)
             self.assertIn("app.log.1.gz:3: ERROR second", text.stdout)
 
+    def test_single_input_json_always_lists_sources(self):
+        with TemporaryDirectory() as directory:
+            result = self.run_search(directory, "-", "--contains", "ERROR", "--json", data="ERROR stdin\n")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["source"], "<stdin>")
+            self.assertEqual(report["sources"], ["<stdin>"])
+            self.assertNotIn("source", report["lines"][0])
+
     def test_accepts_stdin_once_and_rejects_unmatched_globs(self):
         with TemporaryDirectory() as directory:
             (Path(directory) / "app.log").write_text("ERROR file\n", encoding="utf-8")
@@ -1383,6 +1392,11 @@ class DisplayTimezoneTests(unittest.TestCase):
                 shifted_json = self.run_cli(*args, *zone, "--json")
                 self.assertEqual(shifted_json.returncode, 0, shifted_json.stderr)
                 self.assertEqual(shifted_json.stdout, default_json.stdout)
+
+    def test_unavailable_named_zone_gives_actionable_error(self):
+        result = self.run_cli("timeline", "--value", "r-100", "--display-timezone", "Example/Missing")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Check the IANA name or install tzdata", result.stderr)
 
     def test_invalid_offset_is_a_usage_error(self):
         result = self.run_cli("timeline", "--value", "r-100", "--display-timezone", "UTC+24:00")

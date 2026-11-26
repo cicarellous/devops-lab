@@ -319,7 +319,7 @@ def search_log(argv: list[str]) -> int:
             }
             header = {
                 "schema_version": 1, "command": "search", "source": None if multiple else source_name(paths[0]),
-                **({"sources": [source_name(path) for path in paths]} if multiple else {}),
+                "sources": [source_name(path) for path in paths],
                 "coverage": coverage,
             }
             print(json.dumps(header).removesuffix("}"), ', "lines": [', sep="", end="")
@@ -1044,8 +1044,10 @@ def correlate_log(argv: list[str]) -> int:
             ],
         }))
     else:
-        zone_label = str(args.display_timezone or timezone.utc)
-        heading = f"EVENTS  OBSERVED SPAN   FIRST ({zone_label})                       LAST ({zone_label})                        ID"
+        if args.display_timezone is not None:
+            print(f"Display timezone: {args.display_timezone}")
+        time_label = " (UTC)" if args.display_timezone is None else ""
+        heading = f"{'EVENTS':6}  {'OBSERVED SPAN':14}  {'FIRST' + time_label:32}  {'LAST' + time_label:32}  ID"
         print(heading + ("  SOURCES" if len(mappings) > 1 else ""))
         for key in ranked[:args.top]:
             stats = groups[key]
@@ -2026,19 +2028,19 @@ def main() -> int:
             "  inspect     Sample input and suggest field mappings\n\n"
             "Exit codes: 0 success, 1 I/O error, 2 usage error, 3 empty or missing gate data, 4 gate breached.\n\n"
             "Examples:\n"
-            "  python log_summary.py                 Count levels in app.log\n"
-            "  python log_summary.py app.jsonl --format jsonl\n"
-            "  python log_summary.py app.log --level ERROR\n"
+            "  python3.12 log_summary.py                 Count levels in app.log\n"
+            "  python3.12 log_summary.py app.jsonl --format jsonl\n"
+            "  python3.12 log_summary.py app.log --level ERROR\n"
             "                                        Show only the ERROR count\n"
-            '  python log_summary.py app.log --level ERROR --contains "timed out"\n'
+            '  python3.12 log_summary.py app.log --level ERROR --contains "timed out"\n'
             "                                        Count ERROR lines containing timed out\n"
-            '  python log_summary.py app.log --level ERROR --contains "timed out" --show-lines\n'
+            '  python3.12 log_summary.py app.log --level ERROR --contains "timed out" --show-lines\n'
             "                                        Print matching lines with line numbers\n"
             "  python3.12 log_summary.py - --level ERROR < app.log\n"
             "                                        Read UTF-8 stdin on Linux\n"
             "  Get-Content app.log | python log_summary.py - --level ERROR\n"
             "                                        Read from a PowerShell pipeline\n"
-            '  python log_summary.py app.log --regex "timed out|lookup failed"'
+            '  python3.12 log_summary.py app.log --regex "timed out|lookup failed"'
         ),
     )
     parser.add_argument("--version", action="version", version=f"Log Summary {VERSION}")

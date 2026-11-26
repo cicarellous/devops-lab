@@ -112,9 +112,9 @@ python3.12 log_summary.py search - --contains "timed out" < app.log
 
 Pass multiple paths or quoted globs to search current and rotated logs,
 including `.gz` files. Context stays within each file. When several inputs
-are searched, text prefixes each result with its source and JSON adds
-`sources` to the report and `source` to each result. Use `-` once to include
-stdin.
+are searched, text prefixes each result with its source and JSON includes
+`source` on each result. JSON always lists the inputs under `sources`.
+Use `-` once to include stdin.
 
 
 Use `--contains` for case-sensitive literal text or `--regex` for a Python regular

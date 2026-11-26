@@ -113,7 +113,8 @@ jobs:
             --volume "$GITHUB_WORKSPACE/log-summary:/workspace:ro" \
             --workdir /workspace \
             --env PYTHONDONTWRITEBYTECODE=1 \
-            --entrypoint python3.12 \
+            --env PYTHONUTF8=1 \
+            --entrypoint /usr/bin/python3.12 \
             registry.access.redhat.com/ubi8/python-312:latest \
             -m unittest -v
 
