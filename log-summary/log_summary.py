@@ -1352,6 +1352,14 @@ MAX_BUCKETS = 10_000
 SPIKE_BASELINE_BUCKETS = 5
 
 
+class BucketExample(TypedDict):
+    source: str
+    line: int
+    end_line: int
+    id: str | None
+    preview: str
+
+
 class TimeBucket(TypedDict):
     start: str
     end: str
@@ -1360,6 +1368,7 @@ class TimeBucket(TypedDict):
     partial: bool
     baseline_count: NotRequired[float | None]
     spike: NotRequired[bool]
+    examples: NotRequired[list[BucketExample]]
     evaluated: NotRequired[bool]
 
 
@@ -1398,6 +1407,11 @@ def bucket_log(argv: list[str]) -> int:
         "--spike-min-count", type=positive_count, metavar="N",
         help="flag a full bucket with at least N events when the median is zero (requires --spike-factor)",
     )
+    parser.add_argument(
+        "--spike-examples", type=positive_count, metavar="N",
+        help="show the first N counted events per spike (1-10, requires --spike-factor)",
+    )
+    parser.add_argument("--id", help="optional correlation ID field for spike examples")
     add_window_arguments(parser, exclusive_until=True)
     parser.add_argument("--signature", help="field used to select events")
     parser.add_argument("--level", help="filter severity, case-insensitively (WARN aliases WARNING)")
@@ -1407,6 +1421,11 @@ def bucket_log(argv: list[str]) -> int:
     add_multiline_option(parser)
     add_report_arguments(parser, gate="spike")
     args = parser.parse_args(argv)
+    example_limit = args.spike_examples or 0
+    if example_limit and (example_limit > 10 or args.spike_factor is None):
+        parser.error("--spike-examples requires a limit from 1 to 10 and --spike-factor")
+    if args.id is not None and not example_limit:
+        parser.error("--id requires --spike-examples")
     if args.spike_factor is None:
         if args.fail_on == "spike":
             parser.error("--fail-on spike requires --spike-factor")
@@ -1418,7 +1437,9 @@ def bucket_log(argv: list[str]) -> int:
         parser.error("--level-field requires --level")
     if args.signature is not None and args.value is None:
         parser.error("--signature requires --value")
-    optional = ("level_field",) if args.level is not None else (("signature",) if args.value is not None else ())
+    optional: tuple[str, ...] = ("level_field",) if args.level is not None else (("signature",) if args.value is not None else ())
+    if example_limit:
+        optional += ("id",)
     mappings = source_mappings(parser, args, required=("time",), optional=optional)
     selected_value = normalize_level(args.level, LOG_LEVELS) if args.level is not None else args.value
     ignore_case = args.ignore_case or args.level is not None
@@ -1432,9 +1453,9 @@ def bucket_log(argv: list[str]) -> int:
             parser.error(f"{path!r}: --value requires a signature field from --signature or --profile")
         pattern = input_pattern(parser, mapping)
         if pattern is not None:
-            required_fields = {mapping.time, signature} - {None}
+            required_fields = {mapping.time, signature, getattr(mapping, "id", None)} - {None}
             if not required_fields <= pattern.groupindex.keys():
-                parser.error(f"{path!r}: --regex must capture --time and any filter field")
+                parser.error(f"{path!r}: --regex must capture --time and any filter or ID field")
         source_specs.append((path, mapping, signature, pattern))
 
     since, until, _ = event_window(parser, args, exclusive_until=True)
@@ -1453,15 +1474,18 @@ def bucket_log(argv: list[str]) -> int:
     first = last = None
     scanned = invalid = outside = filtered = physical_lines = 0
     counts: Counter[int] = Counter()
+    examples: dict[int, list[BucketExample]] = {}
     sources = []
     for path, mapping, signature, pattern in source_specs:
         source_lines = source_scanned = source_counted = source_invalid = source_outside = source_filtered = 0
-        times = RecordTimeReader(source_name(path), mapping.time, mapping.time_format)
+        name = source_name(path)
+        id_field = getattr(mapping, "id", None) if example_limit else None
+        times = RecordTimeReader(name, mapping.time, mapping.time_format)
         parse_time = event_time if times.time_format == "iso" else times.parse
         try:
             with open_log(path) as log_file:
                 records = log_records(log_file, multiline=args.multiline and mapping.format != "jsonl")
-                for _, source_lines, header, _ in records:
+                for line_number, source_lines, header, _ in records:
                     source_scanned += 1
                     fields = event_fields(header.rstrip("\r\n"), pattern, mapping.format)
                     timestamp = parse_time(log_field(fields, mapping.time))
@@ -1490,7 +1514,15 @@ def bucket_log(argv: list[str]) -> int:
                         if value != wanted:
                             source_filtered += 1
                             continue
-                    counts[tick // width] += 1
+                    bucket_index = tick // width
+                    counts[bucket_index] += 1
+                    if counts[bucket_index] <= example_limit:
+                        preview = header.rstrip("\r\n")
+                        examples.setdefault(bucket_index, []).append({
+                            "source": name, "line": line_number, "end_line": source_lines,
+                            "id": event_id(log_field(fields, id_field)) if id_field else None,
+                            "preview": preview if len(preview) <= 240 else preview[:237] + "...",
+                        })
                     source_counted += 1
         except (OSError, UnicodeError) as error:
             return report_input_error(path, error)
@@ -1547,6 +1579,8 @@ def bucket_log(argv: list[str]) -> int:
                     bucket["baseline_count"] = baseline
                     bucket["evaluated"] = evaluated
                     bucket["spike"] = spike
+                    if spike and example_limit:
+                        bucket["examples"] = examples[index]
                 buckets.append(bucket)
         except OverflowError:
             parser.error("aligned bucket boundaries fall outside the supported timestamp range")
@@ -1586,6 +1620,7 @@ def bucket_log(argv: list[str]) -> int:
             "matched": bool(counts),
             "coverage": coverage,
             "buckets": buckets,
+            **({"spike_examples": example_limit} if example_limit else {}),
             **({
                 "spike_factor": args.spike_factor,
                 "spike_min_count": args.spike_min_count,
@@ -1607,6 +1642,11 @@ def bucket_log(argv: list[str]) -> int:
             baseline = bucket.get("baseline_count")
             spike_label = f"  SPIKE (baseline {baseline:g})" if bucket.get("spike") and baseline is not None else ""
             print(f'{bucket["start"]:32}  {bucket["count"]:5}  {rate_text}{spike_label}')
+            for example in bucket.get("examples", []):
+                location = line_range(example["line"], example["end_line"])
+                event_key = example["id"]
+                id_text = f" id={json.dumps(event_key)}" if event_key is not None else ""
+                print(f"  {example['source']}:{location}{id_text}  {example['preview']}")
         if args.source:
             for source in sources:
                 source_suffix = f", physical lines {source['physical_lines']}" if args.multiline else ""

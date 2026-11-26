@@ -244,6 +244,13 @@ When detection is enabled, JSON reports include `spike_factor`,
 `spike_min_count`, and `evaluated_buckets`. Each bucket includes
 `baseline_count`, `evaluated`, and `spike`.
 
+Add `--spike-examples 3` to show the first three counted events from each
+flagged bucket in input order. Each example includes the source, original
+line range, and a header preview of up to 240 characters. Use `--id FIELD`
+or an `id` mapping in the source profile to include a correlation ID.
+JSON includes an `examples` array on each flagged bucket when requested.
+
+
 
 Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps before signature
 filtering. Empty buckets inside the reported range show zero observed

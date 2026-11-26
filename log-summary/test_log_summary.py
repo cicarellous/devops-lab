@@ -549,9 +549,9 @@ class CompareGateTests(unittest.TestCase):
 class SpikeDetectionTests(unittest.TestCase):
     def run_bucket(self, counts, *options, before="2026-11-26T14:08:30Z"):
         data = "".join(
-            json.dumps({"ts": f"2026-11-26T14:{minute:02d}:20Z"}) + "\n"
+            json.dumps({"ts": f"2026-11-26T14:{minute:02d}:20Z", "request_id": f"r-{minute}-{event}"}) + "\n"
             for minute, count in enumerate(counts)
-            for _ in range(count)
+            for event in range(count)
         )
         return subprocess.run(
             [sys.executable, "log_summary.py", "bucket", "-", "--format", "jsonl",
@@ -616,6 +616,25 @@ class SpikeDetectionTests(unittest.TestCase):
                 self.assertTrue(report["buckets"][-1]["evaluated"])
                 self.assertEqual(report["buckets"][-1]["spike"], status == 4)
         self.assertEqual(self.run_bucket([], "--spike-min-count", "20").returncode, 2)
+
+    def test_spike_examples_include_bounded_evidence_and_ids(self):
+        options = ("--spike-factor", "3", "--spike-examples", "2", "--id", "request_id")
+        counts = [0, 2, 2, 2, 2, 2, 7]
+        result = self.run_bucket(counts, *options, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["spike_examples"], 2)
+        self.assertTrue(all("examples" not in bucket for bucket in report["buckets"][:6]))
+        examples = report["buckets"][6]["examples"]
+        self.assertEqual([(row["source"], row["line"], row["end_line"], row["id"]) for row in examples],
+                         [("<stdin>", 11, 11, "r-6-0"), ("<stdin>", 12, 12, "r-6-1")])
+        self.assertIn("r-6-0", examples[0]["preview"])
+        text = self.run_bucket(counts, *options)
+        self.assertIn('<stdin>:11 id="r-6-0"', text.stdout)
+        for invalid in (("--spike-examples", "2"), ("--id", "request_id"),
+                        ("--spike-factor", "3", "--spike-examples", "11")):
+            with self.subTest(options=invalid):
+                self.assertEqual(self.run_bucket(counts, *invalid).returncode, 2)
 
     def test_factor_rejects_invalid_values(self):
         for value in ("1", "nan", "inf", "invalid"):
