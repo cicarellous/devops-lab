@@ -300,7 +300,8 @@ ranked rows. Coverage still describes the entire input. Every command accepts
 `--json` for one versioned report on stdout. Each report identifies its command.
 Use `search --json` for matching lines and context, or severity summary
 `--json` for counts. JSON reports always include `coverage.physical_lines`. For `inspect`, this
-counts only sampled lines. Summary, group, and bucket also include
+counts only sampled lines and the report includes the `sample` mode.
+Summary, group, and bucket also include
 `coverage.sources` for a single file or stdin.
 
 ## Reuse field mappings

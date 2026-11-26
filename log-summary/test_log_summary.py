@@ -8,7 +8,7 @@ from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from log_summary import count_errors, count_levels, event_time
+from log_summary import count_errors, count_levels, event_time, spread_sample
 
 
 class CountErrorsTests(unittest.TestCase):
@@ -593,6 +593,20 @@ class InspectTests(unittest.TestCase):
             capture_output=True, text=True, check=True,
         )
 
+    def test_spread_sample_is_bounded_ordered_and_retains_endpoints(self):
+        for size in (0, 1, 2, 3, 5, 10, 50, 100, 1000):
+            records = [(line, line, str(line), str(line)) for line in range(1, size + 1)]
+            for limit in range(1, 16):
+                with self.subTest(size=size, limit=limit):
+                    sample = list(spread_sample(iter(records), limit))
+                    self.assertEqual(len(sample), min(size, limit))
+                    starts = [start for start, _, _ in sample]
+                    self.assertEqual(starts, sorted(set(starts)))
+                    if size:
+                        self.assertEqual(starts[0], 1)
+                        if limit > 1:
+                            self.assertEqual(starts[-1], size)
+
     def test_spread_sampling_retains_late_fields_and_sampled_line_count(self):
         data = ('2026-11-26T14:00:00Z INFO Started\n  first frame\n'
                 'INFO Progress\nINFO Closing\n'
@@ -600,6 +614,8 @@ class InspectTests(unittest.TestCase):
         args = ("inspect", "-", "--lines", "2", "--multiline", "--json")
         head = json.loads(self.run_cli(*args, input_text=data).stdout)
         spread = json.loads(self.run_cli(*args, "--sample", "spread", input_text=data).stdout)
+        self.assertEqual(head["sample"], "head")
+        self.assertEqual(spread["sample"], "spread")
         self.assertEqual(head["coverage"]["json_objects"], 0)
         self.assertEqual(spread["coverage"]["json_objects"], 1)
         self.assertEqual(spread["coverage"]["sampled"], 2)

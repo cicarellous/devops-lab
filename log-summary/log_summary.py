@@ -1663,11 +1663,12 @@ def spread_sample(
     capacity = max(0, limit - 2)
     for index, (start, end, header, _) in enumerate(records):
         if last is not None and capacity:
-            slot = index - 1 if index <= capacity else rng.randrange(index)
-            if slot == len(interior):
+            if len(interior) < capacity:
                 interior.append(last)
-            elif slot < capacity:
-                interior[slot] = last
+            else:
+                slot = rng.randrange(index)
+                if slot < capacity:
+                    interior[slot] = last
         last = (start, end, header)
     yield from sorted(interior)
     if last is not None and limit > 1:
@@ -1804,6 +1805,7 @@ def inspect_log(argv: list[str]) -> int:
         print(json.dumps({
             "schema_version": 1,
             "command": "inspect",
+            "sample": args.sample,
             "source": source_name(args.log_file),
             "coverage": {
                 "sampled": sampled, "json_objects": objects, "logfmt_lines": logfmt_lines,
