@@ -8,7 +8,7 @@ from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from log_summary import count_errors, count_levels, event_time, spread_sample
+from log_triage import count_errors, count_levels, event_time, spread_sample
 
 
 class CountErrorsTests(unittest.TestCase):
@@ -50,7 +50,7 @@ class ShowLinesTests(unittest.TestCase):
         result = subprocess.run(
             [
                 sys.executable,
-                "log_summary.py",
+                "log_triage.py",
                 "app.log",
                 "--level",
                 "ERROR",
@@ -77,7 +77,7 @@ class StdinTests(unittest.TestCase):
     def test_counts_errors_from_stdin(self):
         repo = Path(__file__).resolve().parent
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "-", "--level", "ERROR"],
+            [sys.executable, "log_triage.py", "-", "--level", "ERROR"],
             cwd=repo,
             input=(repo / "app.log").read_text(encoding="utf-8"),
             capture_output=True,
@@ -92,7 +92,7 @@ class RegexTests(unittest.TestCase):
         result = subprocess.run(
             [
                 sys.executable,
-                "log_summary.py",
+                "log_triage.py",
                 "app.log",
                 "--level", "ERROR",
                 "--regex", "acquisition timed out|lookup failed",
@@ -114,7 +114,7 @@ class RegexTests(unittest.TestCase):
 
     def test_rejects_invalid_regex_before_opening_file(self):
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "missing.log", "--regex", "["],
+            [sys.executable, "log_triage.py", "missing.log", "--regex", "["],
             cwd=Path(__file__).resolve().parent,
             capture_output=True,
             text=True,
@@ -127,7 +127,7 @@ class RegexTests(unittest.TestCase):
 class SearchTests(unittest.TestCase):
     def test_searches_arbitrary_text_and_merges_overlapping_context(self):
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "search", "-", "--regex",
+            [sys.executable, "log_triage.py", "search", "-", "--regex",
              "timeout|refused", "--context", "1"],
             cwd=Path(__file__).resolve().parent,
             input="before\n2026-11-26 timeout\n  stack frame\nconnection refused\nafter\nskipped\n",
@@ -146,7 +146,7 @@ class SearchTests(unittest.TestCase):
 
 class MultiFileSearchTests(unittest.TestCase):
     def run_search(self, directory, *options, data=None):
-        script = Path(__file__).resolve().with_name("log_summary.py")
+        script = Path(__file__).resolve().with_name("log_triage.py")
         return subprocess.run(
             [sys.executable, str(script), "search", *options],
             cwd=directory, text=True, input=data, capture_output=True,
@@ -203,7 +203,7 @@ class GroupTests(unittest.TestCase):
         for options in cases:
             with self.subTest(options=options):
                 result = subprocess.run(
-                    [sys.executable, "log_summary.py", "group", *options, "--by", "code"],
+                    [sys.executable, "log_triage.py", "group", *options, "--by", "code"],
                     cwd=repo,
                     capture_output=True,
                     text=True,
@@ -222,7 +222,7 @@ class GroupTests(unittest.TestCase):
 
     def test_jsonl_stdin_skips_invalid_and_missing_values(self):
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "group", "-", "--format", "jsonl",
+            [sys.executable, "log_triage.py", "group", "-", "--format", "jsonl",
              "--by", "service"],
             cwd=Path(__file__).resolve().parent,
             input='{"service":"gateway"}\ninvalid\n{}\n{"service":null}\n{"service":[]}\n',
@@ -237,7 +237,7 @@ class GroupTests(unittest.TestCase):
 
     def test_text_group_requires_the_named_capture(self):
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "group", "app.log",
+            [sys.executable, "log_triage.py", "group", "app.log",
              "--regex", "(?P<other>ERROR)", "--by", "code"],
             cwd=Path(__file__).resolve().parent,
             capture_output=True,
@@ -257,7 +257,7 @@ class TimelineTests(unittest.TestCase):
         ]
         for filename, options in formats:
             with self.subTest(filename=filename):
-                command = [sys.executable, "log_summary.py", "timeline"]
+                command = [sys.executable, "log_triage.py", "timeline"]
                 options += ["--value", "r-100", "--time", "timestamp"]
                 events = (repo / filename).read_text(encoding="utf-8").splitlines()
                 reversed_input = "\n".join(reversed(events)) + "\n"
@@ -286,7 +286,7 @@ class TimelineTests(unittest.TestCase):
 
     def test_counts_invalid_records_and_sorts_by_absolute_time(self):
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "timeline", "-", "--format", "jsonl",
+            [sys.executable, "log_triage.py", "timeline", "-", "--format", "jsonl",
              "--key", "id", "--value", "a", "--time", "time"],
             cwd=Path(__file__).resolve().parent,
             input='{"id":"a","time":"2026-11-26T10:00:00-05:00"}\n'
@@ -303,7 +303,7 @@ class TimelineTests(unittest.TestCase):
 class CorrelateTests(unittest.TestCase):
     def test_reports_are_identical_for_text_and_reversed_jsonl(self):
         repo = Path(__file__).resolve().parent
-        command = [sys.executable, "log_summary.py", "correlate"]
+        command = [sys.executable, "log_triage.py", "correlate"]
         text = subprocess.run(
             [*command, "app.log", "--key", "id", "--time", "ts",
              "--regex", r"^(?P<ts>\S+).*request_id=(?P<id>\S+)"],
@@ -338,7 +338,7 @@ class CorrelateTests(unittest.TestCase):
         for ranking, first_id in [("count", "busy"), ("span", "wide")]:
             with self.subTest(ranking=ranking):
                 result = subprocess.run(
-                    [sys.executable, "log_summary.py", "correlate", "-",
+                    [sys.executable, "log_triage.py", "correlate", "-",
                      "--format", "jsonl", "--key", "id", "--time", "ts",
                      "--sort", ranking],
                     cwd=repo, input=log, capture_output=True, text=True, check=True,
@@ -353,7 +353,7 @@ class InputErrorTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             log = Path(directory) / "invalid.log"
             log.write_bytes(b"INFO invalid byte: \xff\n")
-            script = Path(__file__).with_name("log_summary.py").resolve()
+            script = Path(__file__).with_name("log_triage.py").resolve()
             for args in ([str(log)], ["search", str(log), "--contains", "INFO"]):
                 with self.subTest(args=args):
                     result = subprocess.run(
@@ -369,7 +369,7 @@ class CompareTests(unittest.TestCase):
     def run_compare(self, source, *mapping, baseline=None, incident=None, input_text=None):
         return subprocess.run(
             [
-                sys.executable, "log_summary.py", "compare", source, *mapping,
+                sys.executable, "log_triage.py", "compare", source, *mapping,
                 "--baseline", *(baseline or ["2026-11-26T14:00Z", "2026-11-26T14:01Z"]),
                 "--incident", *(incident or ["2026-11-26T14:01Z", "2026-11-26T14:03Z"]),
             ],
@@ -430,7 +430,7 @@ class CompareTests(unittest.TestCase):
 class StructuredSummaryTests(unittest.TestCase):
     def test_jsonl_maps_configurable_severity_and_reports_unclassified(self):
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "-", "--format", "jsonl",
+            [sys.executable, "log_triage.py", "-", "--format", "jsonl",
              "--level-field", "priority", "--level", "ERROR", "--show-lines"],
             cwd=Path(__file__).resolve().parent,
             input='{"priority":"info"}\ninvalid\n{"priority":" error "}\n{"priority":"DEBUG"}\n{}\n',
@@ -441,7 +441,7 @@ class StructuredSummaryTests(unittest.TestCase):
 
     def test_text_summary_reports_unclassified_records(self):
         result = subprocess.run(
-            [sys.executable, "log_summary.py", "-"], cwd=Path(__file__).resolve().parent,
+            [sys.executable, "log_triage.py", "-"], cwd=Path(__file__).resolve().parent,
             input='{"severity":"ERROR"}\n', capture_output=True, text=True, check=True,
         )
         self.assertIn("ERROR: 0", result.stdout)
@@ -452,7 +452,7 @@ class StructuredSummaryTests(unittest.TestCase):
 class BucketTests(unittest.TestCase):
     def run_bucket(self, log_file, *options, input_text=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", "bucket", log_file, "--time", "ts",
+            [sys.executable, "log_triage.py", "bucket", log_file, "--time", "ts",
              "--interval", "30s", "--json", *options],
             cwd=Path(__file__).resolve().parent, input=input_text,
             capture_output=True, text=True, check=True,
@@ -509,7 +509,7 @@ class CompareGateTests(unittest.TestCase):
             for _ in range(count)
         )
         return subprocess.run(
-            [sys.executable, "log_summary.py", "compare", "-", "--format", "jsonl",
+            [sys.executable, "log_triage.py", "compare", "-", "--format", "jsonl",
              "--time", "ts", "--signature", "code", "--json",
              "--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
              "--incident", "2026-11-26T14:01Z", "2026-11-26T14:03Z", *options],
@@ -563,7 +563,7 @@ class SpikeDetectionTests(unittest.TestCase):
             for event in range(count)
         )
         return subprocess.run(
-            [sys.executable, "log_summary.py", "bucket", "-", "--format", "jsonl",
+            [sys.executable, "log_triage.py", "bucket", "-", "--format", "jsonl",
              "--time", "ts", "--interval", "1m", "--since", "2026-11-26T14:00:10Z",
              *(("--before", before) if before else ()), *options],
             cwd=Path(__file__).resolve().parent, input=data, text=True, capture_output=True,
@@ -656,7 +656,7 @@ class SpikeDetectionTests(unittest.TestCase):
 class InspectTests(unittest.TestCase):
     def run_cli(self, *args, input_text=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=input_text,
             capture_output=True, text=True, check=True,
         )
@@ -691,8 +691,8 @@ class InspectTests(unittest.TestCase):
         self.assertEqual(spread["profile"]["time"], "ts")
 
     def test_version_and_summary_of_file_named_like_a_command(self):
-        self.assertEqual(self.run_cli("--version").stdout.strip(), "Log Summary 0.1.0")
-        script = Path(__file__).resolve().with_name("log_summary.py")
+        self.assertEqual(self.run_cli("--version").stdout.strip(), "Log Triage 0.1.0")
+        script = Path(__file__).resolve().with_name("log_triage.py")
         with TemporaryDirectory() as directory:
             (Path(directory) / "search").write_text("ERROR Example\n", encoding="utf-8")
             result = subprocess.run(
@@ -739,7 +739,7 @@ class InspectTests(unittest.TestCase):
 class InspectFollowThroughTests(unittest.TestCase):
     def run_cli(self, *args, data=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=data,
             text=True, encoding="utf-8", capture_output=True, check=True,
         )
@@ -768,7 +768,7 @@ class InspectFollowThroughTests(unittest.TestCase):
     def test_suggested_bucket_command_preserves_multiline(self):
         result = self.run_cli("inspect", "stacktrace-example.txt", "--multiline")
         suggestion = next(line.strip() for line in result.stderr.splitlines()
-                          if " log_summary.py bucket " in line)
+                          if " log_triage.py bucket " in line)
         report = json.loads(self.run_cli(*shlex.split(suggestion)[2:], "--json").stdout)
         coverage = report["coverage"]
         self.assertEqual((coverage["scanned"], coverage["physical_lines"], coverage["invalid_timestamp"]),
@@ -779,7 +779,7 @@ class InspectFollowThroughTests(unittest.TestCase):
             log = Path(directory) / "night's log.jsonl"
             log.write_text(json.dumps({"event's time": "2026-11-26T14:01:00Z"}), encoding="utf-8")
             result = self.run_cli("inspect", str(log))
-            suggestion = next(line for line in result.stderr.splitlines() if " log_summary.py bucket " in line)
+            suggestion = next(line for line in result.stderr.splitlines() if " log_triage.py bucket " in line)
             if sys.platform == "win32":
                 self.assertIn("night''s log.jsonl", suggestion)
                 self.assertIn("--time='event''s time'", suggestion)
@@ -793,7 +793,7 @@ class InspectFollowThroughTests(unittest.TestCase):
         data = '{"ts":"2020-01-01T00:00:00Z"}\n{"ts":"2021-01-01T00:00:00Z"}\n'
         result = self.run_cli("inspect", "-", data=data)
         suggestion = next(line.strip() for line in result.stderr.splitlines()
-                          if " log_summary.py bucket " in line)
+                          if " log_triage.py bucket " in line)
         report = json.loads(self.run_cli(*shlex.split(suggestion)[2:], "--json", data=data).stdout)
         self.assertEqual(report["coverage"]["counted"], 2)
         self.assertLessEqual(len(report["buckets"]), 10_000)
@@ -822,7 +822,7 @@ class InspectFollowThroughTests(unittest.TestCase):
 class ProfileTests(unittest.TestCase):
     def run_cli(self, *args, input_text=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=input_text,
             capture_output=True, text=True,
         )
@@ -877,7 +877,7 @@ class ProfileTests(unittest.TestCase):
 class InvestigationOutputTests(unittest.TestCase):
     def run_cli(self, *args, check=True):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, capture_output=True,
             text=True, check=check,
         )
@@ -940,7 +940,7 @@ class InvestigationOutputTests(unittest.TestCase):
 class InputCompatibilityTests(unittest.TestCase):
     def run_cli(self, *args, input_text=None, check=True):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=input_text,
             capture_output=True, encoding="utf-8", check=check,
             env={**environ, "PYTHONIOENCODING": "utf-8"},
@@ -1021,7 +1021,7 @@ class WindowContractTests(unittest.TestCase):
 
     def run_cli(self, *args, data=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent,
             input=self.log if data is None else data, text=True, capture_output=True,
         )
@@ -1134,7 +1134,7 @@ class MultiSourceAnalysisTests(unittest.TestCase):
 
     def run_cli(self, *args, check=True):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent,
             capture_output=True, text=True, check=check,
         )
@@ -1181,7 +1181,7 @@ class MultiSourceAnalysisTests(unittest.TestCase):
 class AutomationContractTests(unittest.TestCase):
     def run_cli(self, *args, data=None, env=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=data,
             text=True, capture_output=True, env=env,
         )
@@ -1285,7 +1285,7 @@ class AutomationContractTests(unittest.TestCase):
 class ReportCorrectnessTests(unittest.TestCase):
     def run_cli(self, *args, data=None, io_encoding="utf-8"):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=data, capture_output=True,
             env={**environ, "PYTHONIOENCODING": io_encoding},
         )
@@ -1384,7 +1384,7 @@ class ReportCorrectnessTests(unittest.TestCase):
 class DisplayTimezoneTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, text=True, capture_output=True,
         )
 
@@ -1422,7 +1422,7 @@ class DisplayTimezoneTests(unittest.TestCase):
 class EpochTimestampTests(unittest.TestCase):
     def run_cli(self, *args, data=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=data,
             text=True, capture_output=True,
         )
@@ -1531,7 +1531,7 @@ class EpochTimestampTests(unittest.TestCase):
 class ReportTrustTests(unittest.TestCase):
     def run_cli(self, *args, data=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=data,
             text=True, capture_output=True,
         )
@@ -1604,7 +1604,7 @@ class ReportTrustTests(unittest.TestCase):
 class MultilineTests(unittest.TestCase):
     def run_cli(self, *args, data=None):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=data,
             text=True, capture_output=True, check=True,
         )
@@ -1670,7 +1670,7 @@ class MultilineTests(unittest.TestCase):
 class MultilineParityTests(unittest.TestCase):
     def run_cli(self, *args, data=None, check=True):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, input=data,
             text=True, encoding="utf-8", capture_output=True, check=check,
         )
@@ -1747,7 +1747,7 @@ class MultiSourceTotalsTests(unittest.TestCase):
 
     def run_cli(self, *args, check=True):
         return subprocess.run(
-            [sys.executable, "log_summary.py", *args],
+            [sys.executable, "log_triage.py", *args],
             cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=check,
         )
 

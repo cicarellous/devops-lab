@@ -247,7 +247,7 @@ def report_status(args: argparse.Namespace, *, empty: bool) -> int:
 
 def search_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="log_summary.py search",
+        prog="log_triage.py search",
         description="Search any text log and print matching lines with surrounding context.",
         epilog="Supply --contains, --regex, or both. With both, a line must match both filters.",
     )
@@ -348,7 +348,7 @@ def positive_count(value: str) -> int:
 
 def group_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="log_summary.py group",
+        prog="log_triage.py group",
         description="Rank extracted field values by frequency.",
         epilog="Use a field from JSON Lines or logfmt, or a named regex capture for text.",
     )
@@ -829,7 +829,7 @@ class TimelineEvent:
 
 def timeline_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="log_summary.py timeline",
+        prog="log_triage.py timeline",
         description="Show events for one ID in chronological order.",
     )
     add_event_arguments(parser)
@@ -946,7 +946,7 @@ class EventStats:
 
 def correlate_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="log_summary.py correlate",
+        prog="log_triage.py correlate",
         description="Summarize event counts and observed time spans by ID.",
     )
     add_event_arguments(parser)
@@ -1137,7 +1137,7 @@ def positive_threshold(value: str) -> float:
 
 def compare_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="log_summary.py compare",
+        prog="log_triage.py compare",
         description="Rank signature changes between baseline and incident windows.",
         epilog="Windows include START and exclude END. The baseline must end by the incident start. Times without offsets use UTC.",
     )
@@ -1447,7 +1447,7 @@ def interval_seconds(value: str) -> int:
 
 def bucket_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="log_summary.py bucket",
+        prog="log_triage.py bucket",
         description="Count observed events in aligned UTC time buckets.",
         epilog="Text requires --regex. Choose --value with a signature field from --signature or --profile. Omitted bounds use observed timestamps. Partial buckets have no rate and are excluded from spike detection. Use an aligned --before for a known complete window.",
     )
@@ -1789,7 +1789,7 @@ def spread_sample(
 
 def inspect_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="log_summary.py inspect",
+        prog="log_triage.py inspect",
         description="Sample a log and suggest field mappings.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
@@ -1994,9 +1994,9 @@ def inspect_log(argv: list[str]) -> int:
         print("Confirm the suggested epoch unit before using the mapping.", file=sys.stderr)
         options += f" --time-format {profile['time_format']}"
     if args.log_file.startswith("-") and args.log_file != "-":
-        print(f"  {interpreter} log_summary.py bucket {options} -- '{source}'", file=sys.stderr)
+        print(f"  {interpreter} log_triage.py bucket {options} -- '{source}'", file=sys.stderr)
     else:
-        print(f"  {interpreter} log_summary.py bucket '{source}' {options}", file=sys.stderr)
+        print(f"  {interpreter} log_triage.py bucket '{source}' {options}", file=sys.stderr)
     if args.log_file == "-":
         print("Pipe the input into the suggested command again.", file=sys.stderr)
     return 0
@@ -2030,13 +2030,13 @@ def main() -> int:
             "  inspect     Sample input and suggest field mappings\n\n"
             "Exit codes: 0 success, 1 I/O error, 2 usage error, 3 empty or missing gate data, 4 gate breached.\n\n"
             "Examples (use python in an activated Windows environment):\n"
-            '  python3.12 log_summary.py app.log --level ERROR --contains "timed out"\n'
-            "  python3.12 log_summary.py app.jsonl --format jsonl --json\n"
-            "  python3.12 log_summary.py - --level ERROR < app.log  # Bash\n"
-            "  Get-Content app.log | python log_summary.py - --level ERROR  # PowerShell"
+            '  python3.12 log_triage.py app.log --level ERROR --contains "timed out"\n'
+            "  python3.12 log_triage.py app.jsonl --format jsonl --json\n"
+            "  python3.12 log_triage.py - --level ERROR < app.log  # Bash\n"
+            "  Get-Content app.log | python log_triage.py - --level ERROR  # PowerShell"
         ),
     )
-    parser.add_argument("--version", action="version", version=f"Log Summary {VERSION}")
+    parser.add_argument("--version", action="version", version=f"Log Triage {VERSION}")
     parser.add_argument(
         "log_file",
         nargs="?",
