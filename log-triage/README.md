@@ -66,4 +66,4 @@ replace `python3.12 log_triage.py` with `log-triage` after installing.
 
 ## License
 
-[MIT](LICENSE).
+Log Triage is licensed under the [MIT License](LICENSE).
