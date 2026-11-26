@@ -15,11 +15,13 @@ from io import TextIOWrapper
 from itertools import chain, islice
 from math import isfinite
 from pathlib import Path
+from random import Random
 from statistics import median
 from tempfile import SpooledTemporaryFile
 from typing import Iterable, Iterator, NotRequired, TextIO, TypedDict
 
 
+VERSION = "0.1.0"
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
 LEVEL_ALIASES = {"WARN": "WARNING"}
 LOG_FORMATS = ("text", "jsonl", "logfmt")
@@ -228,7 +230,11 @@ def compile_pattern(parser: argparse.ArgumentParser, value: str | None) -> re.Pa
 def add_report_arguments(parser: argparse.ArgumentParser, *, gate: str = "") -> None:
     parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     choices = ("empty", gate) if gate else ("empty",)
-    help_text = f"exit 3 on empty results or 4 on {gate}" if gate else "exit 3 when the result is empty"
+    help_text = "exit 3 when the result is empty"
+    if gate == "increase":
+        help_text += ". For increase, exit 4 on a breach or 3 if the baseline has no usable events"
+    elif gate == "spike":
+        help_text += ". For spike, exit 4 on a breach or 3 if no bucket can be evaluated"
     parser.add_argument("--fail-on", choices=choices, help=help_text)
 
 
@@ -307,10 +313,7 @@ def search_log(argv: list[str]) -> int:
                 "schema_version": 1, "command": "search", "source": source_name(args.log_file),
                 "coverage": coverage,
             }
-            print("{", end="")
-            for key, value in header.items():
-                print(f"{json.dumps(key)}: {json.dumps(value)}, ", end="")
-            print('"lines": [', end="")
+            print(json.dumps(header).removesuffix("}"), ', "lines": [', sep="", end="")
             report.seek(0)
             shutil.copyfileobj(report, sys.stdout)
             print("]}")
@@ -1646,6 +1649,31 @@ def inspect_json_fields(record: dict[str, object]) -> dict[str, object]:
     return fields
 
 
+def spread_sample(
+    records: Iterator[tuple[int, int, str, str]], limit: int,
+) -> Iterator[tuple[int, int, str]]:
+    """Keep the endpoints and a reproducible reservoir of interior headers."""
+    first = next(records, None)
+    if first is None:
+        return
+    yield first[:3]
+    rng = Random(0)
+    interior: list[tuple[int, int, str]] = []
+    last = None
+    capacity = max(0, limit - 2)
+    for index, (start, end, header, _) in enumerate(records):
+        if last is not None and capacity:
+            slot = index - 1 if index <= capacity else rng.randrange(index)
+            if slot == len(interior):
+                interior.append(last)
+            elif slot < capacity:
+                interior[slot] = last
+        last = (start, end, header)
+    yield from sorted(interior)
+    if last is not None and limit > 1:
+        yield last
+
+
 def inspect_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py inspect",
@@ -1653,6 +1681,10 @@ def inspect_log(argv: list[str]) -> int:
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines or multiline records (1-1000)")
+    parser.add_argument(
+        "--sample", choices=("head", "spread"), default="head",
+        help="head stops at --lines (default). Spread scans all input and samples across it",
+    )
     parser.add_argument("--profile-out", metavar="FILE", help="write a new profile when a usable mapping is found")
     add_multiline_option(parser)
     add_report_arguments(parser)
@@ -1667,8 +1699,13 @@ def inspect_log(argv: list[str]) -> int:
     try:
         with open_log(args.log_file) as log_file:
             records = log_records(log_file, multiline=args.multiline, preserve_jsonl=True)
-            for _, physical_lines, line, _ in islice(records, args.lines):
+            sample_records = (
+                spread_sample(records, args.lines) if args.sample == "spread"
+                else (record[:3] for record in islice(records, args.lines))
+            )
+            for start, end, line in sample_records:
                 sampled += 1
+                physical_lines += end - start + 1
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
@@ -1851,20 +1888,18 @@ def inspect_log(argv: list[str]) -> int:
 
 
 def main() -> int:
-    if sys.argv[1:2] == ["search"]:
-        return search_log(sys.argv[2:])
-    if sys.argv[1:2] == ["group"]:
-        return group_log(sys.argv[2:])
-    if sys.argv[1:2] == ["timeline"]:
-        return timeline_log(sys.argv[2:])
-    if sys.argv[1:2] == ["correlate"]:
-        return correlate_log(sys.argv[2:])
-    if sys.argv[1:2] == ["compare"]:
-        return compare_log(sys.argv[2:])
-    if sys.argv[1:2] == ["bucket"]:
-        return bucket_log(sys.argv[2:])
-    if sys.argv[1:2] == ["inspect"]:
-        return inspect_log(sys.argv[2:])
+    commands = {
+        "search": search_log,
+        "group": group_log,
+        "timeline": timeline_log,
+        "correlate": correlate_log,
+        "compare": compare_log,
+        "bucket": bucket_log,
+        "inspect": inspect_log,
+    }
+    argv = sys.argv[1:]
+    if argv and argv[0] in commands:
+        return commands[argv[0]](argv[1:])
 
     parser = argparse.ArgumentParser(
         description="Count INFO, WARNING, and ERROR entries in text, JSON Lines, or logfmt.",
@@ -1893,10 +1928,11 @@ def main() -> int:
             '  python log_summary.py app.log --regex "timed out|lookup failed"'
         ),
     )
+    parser.add_argument("--version", action="version", version=f"Log Summary {VERSION}")
     parser.add_argument(
         "log_file",
         nargs="?",
-        help="log file path or - for stdin (default: app.log beside this script)",
+        help="log file path or - for stdin (default: app.log beside this script). Use -- before a filename matching a command.",
     )
     parser.add_argument(
         "--level",

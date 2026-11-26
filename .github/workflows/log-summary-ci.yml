@@ -22,6 +22,12 @@ jobs:
             python: "3.12"
           - platform: Ubuntu
             runner: ubuntu-latest
+            python: "3.13"
+          - platform: Ubuntu
+            runner: ubuntu-latest
+            python: "3.14"
+          - platform: Windows
+            runner: windows-latest
             python: "3.14"
     steps:
       - name: Check out repository

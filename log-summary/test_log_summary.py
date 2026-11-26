@@ -593,6 +593,30 @@ class InspectTests(unittest.TestCase):
             capture_output=True, text=True, check=True,
         )
 
+    def test_spread_sampling_retains_late_fields_and_sampled_line_count(self):
+        data = ('2026-11-26T14:00:00Z INFO Started\n  first frame\n'
+                'INFO Progress\nINFO Closing\n'
+                '{"ts":"2026-11-26T14:20:00Z","code":"END"}\n')
+        args = ("inspect", "-", "--lines", "2", "--multiline", "--json")
+        head = json.loads(self.run_cli(*args, input_text=data).stdout)
+        spread = json.loads(self.run_cli(*args, "--sample", "spread", input_text=data).stdout)
+        self.assertEqual(head["coverage"]["json_objects"], 0)
+        self.assertEqual(spread["coverage"]["json_objects"], 1)
+        self.assertEqual(spread["coverage"]["sampled"], 2)
+        self.assertEqual(spread["coverage"]["physical_lines"], 3)
+        self.assertEqual(spread["profile"]["time"], "ts")
+
+    def test_version_and_summary_of_file_named_like_a_command(self):
+        self.assertEqual(self.run_cli("--version").stdout.strip(), "Log Summary 0.1.0")
+        script = Path(__file__).resolve().with_name("log_summary.py")
+        with TemporaryDirectory() as directory:
+            (Path(directory) / "search").write_text("ERROR Example\n", encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(script), "--", "search"], cwd=directory,
+                capture_output=True, text=True, check=True,
+            )
+        self.assertIn("ERROR: 1", result.stdout)
+
     def test_inspects_incident_with_usable_bucket_suggestion(self):
         result = self.run_cli("inspect", "incident.jsonl")
         self.assertIn('Timestamp candidates: "ts"', result.stdout)

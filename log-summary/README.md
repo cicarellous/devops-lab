@@ -38,7 +38,11 @@ PowerShell command needs to send non-ASCII text.
 python log_summary.py inspect incident.jsonl
 ```
 
-Inspect samples the first 100 lines by default. It shows top-level field
+Inspect samples the first 100 lines by default. Add `--sample spread` to
+scan the full input once, including gzip or stdin, while retaining at most
+`--lines` sampled records. Spread keeps the first and last records when
+`--lines` is at least 2 and samples the interior reproducibly. With
+`--lines 1` it keeps the first record. It shows top-level field
 types, presence, and timestamp candidates. On `incident.jsonl`, look for
 `ts`, `code`, and `request`. Run the suggested `bucket` command, then add
 `--signature code --value TIMEOUT` to isolate the jump at 14:01 UTC.
@@ -59,6 +63,8 @@ be saved, with a warning if timed commands need an explicit `--time`.
 
 Run the log summary with the included `app.log` as the default. The summary
 recognizes severity at the start of a line or after an ISO timestamp.
+Use `python log_summary.py -- search` to summarize a file named `search`.
+Run `python log_summary.py --version` to display the CLI version.
 
 ```powershell
 python log_summary.py app.log --level ERROR --contains "timed out" --show-lines
@@ -226,8 +232,9 @@ last bucket.
 
 With `--fail-on spike`, exit 4 means a breach, 0 means at least one bucket
 was evaluated and none breached, and 3 means no bucket could be evaluated.
-JSON reports include `evaluated_buckets` and each bucket's `baseline_count`,
-`evaluated`, and `spike` when detection is enabled.
+When detection is enabled, JSON reports include `spike_factor`,
+`spike_min_count`, and `evaluated_buckets`. Each bucket includes
+`baseline_count`, `evaluated`, and `spike`.
 
 
 Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps before signature
@@ -347,4 +354,4 @@ python -m unittest -v
 ```
 
 In GitHub Actions, **Log Summary CI** shows Python 3.12 tests on Ubuntu and Windows,
-Python 3.14 tests on Ubuntu, and a Ruff and mypy job. You can see each run in the repository's **Actions** tab.
+Python 3.13 tests on Ubuntu, Python 3.14 tests on Ubuntu and Windows, and a Ruff and mypy job. You can see each run in the repository's **Actions** tab.
