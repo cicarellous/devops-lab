@@ -99,6 +99,24 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+  rhel8-user-space:
+    name: Unit tests / Red Hat UBI 8 / Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Run tests in Red Hat UBI 8
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/log-summary:/workspace:ro" \
+            --workdir /workspace \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            --entrypoint python3.12 \
+            registry.access.redhat.com/ubi8/python-312:latest \
+            -m unittest -v
+
   code-quality:
     name: Code quality / Ruff and mypy
     runs-on: ubuntu-latest

@@ -6,23 +6,35 @@ and observed spans across IDs. It reads files or standard input.
 
 | Task | Command |
 | --- | --- |
-| Discover a log's format and fields | `python log_summary.py inspect -h` |
-| Count entries by severity | `python log_summary.py [FILE]` |
-| Find matching lines and nearby context | `python log_summary.py search -h` |
-| Rank values by frequency | `python log_summary.py group -h` |
-| Reconstruct one ID's events | `python log_summary.py timeline -h` |
-| Rank IDs by event count or observed span | `python log_summary.py correlate -h` |
-| Compare event rates before and during an incident | `python log_summary.py compare -h` |
-| Find when event activity changed | `python log_summary.py bucket -h` |
+| Discover a log's format and fields | `python3.12 log_summary.py inspect -h` |
+| Count entries by severity | `python3.12 log_summary.py [FILE]` |
+| Find matching lines and nearby context | `python3.12 log_summary.py search -h` |
+| Rank values by frequency | `python3.12 log_summary.py group -h` |
+| Reconstruct one ID's events | `python3.12 log_summary.py timeline -h` |
+| Rank IDs by event count or observed span | `python3.12 log_summary.py correlate -h` |
+| Compare event rates before and during an incident | `python3.12 log_summary.py compare -h` |
+| Find when event activity changed | `python3.12 log_summary.py bucket -h` |
 
 ## Quick start
 
 Use Python 3.12 or later. Log Summary uses the Python standard library.
+Linux is the primary platform. On **RHEL 8.10**, install Python 3.12
+from AppStream and invoke it explicitly:
 
-```powershell
+```bash
+sudo dnf install python3.12
+python3.12 --version
+```
+
+See [Red Hat's Python installation guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_basic_system_settings/installing-and-using-dynamic-programming-languages_configuring-basic-system-settings).
+On Windows, use Python 3.12 or later and substitute `python` for
+`python3.12` in an activated virtual environment. Run the following
+from the repository root:
+
+```bash
 # From the devops-lab repository root
 cd log-summary
-python log_summary.py
+python3.12 log_summary.py
 ```
 
 Run the remaining examples from `log-summary/`. The included `app.log` and
@@ -30,12 +42,17 @@ Run the remaining examples from `log-summary/`. The included `app.log` and
 retries, and recurring error codes. Pass a UTF-8 file path (plain or `.gz`, with or without a BOM) or use `-` to read
 from standard input. Redirected stdin must be UTF-8. In Windows PowerShell,
 set `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` if an upstream
-PowerShell command needs to send non-ASCII text.
+PowerShell command needs to send non-ASCII text. Use a PowerShell
+pipeline in place of Bash's input redirection:
+
+```powershell
+Get-Content app.log | python log_summary.py - --level ERROR
+```
 
 ## Inspect an unfamiliar log
 
-```powershell
-python log_summary.py inspect incident.jsonl
+```bash
+python3.12 log_summary.py inspect incident.jsonl
 ```
 
 Inspect samples the first 100 lines by default. Add `--sample spread` to
@@ -47,7 +64,7 @@ types, presence, and timestamp candidates. On `incident.jsonl`, look for
 `ts`, `code`, and `request`. Run the suggested `bucket` command, then add
 `--signature code --value TIMEOUT` to isolate the jump at 14:01 UTC.
 For key-value logs, inspect suggests `logfmt`. Save a suggested mapping with
-`python log_summary.py inspect app.log --profile-out app-profile.json`, then
+`python3.12 log_summary.py inspect app.log --profile-out app-profile.json`, then
 review the new profile before using it. Inspect uses the inferred signature as
 the default grouping field (`by`). Its bucket suggestion preserves
 `--multiline` and chooses an interval for the sampled time span. Longer logs
@@ -63,12 +80,12 @@ be saved, with a warning if timed commands need an explicit `--time`.
 
 Run the log summary with the included `app.log` as the default. The summary
 recognizes severity at the start of a line or after an ISO timestamp.
-Use `python log_summary.py -- search` to summarize a file named `search`.
-Run `python log_summary.py --version` to display the CLI version.
+Use `python3.12 log_summary.py -- search` to summarize a file named `search`.
+Run `python3.12 log_summary.py --version` to display the CLI version.
 
-```powershell
-python log_summary.py app.log --level ERROR --contains "timed out" --show-lines
-python log_summary.py app.jsonl --format jsonl --level-field severity
+```bash
+python3.12 log_summary.py app.log --level ERROR --contains "timed out" --show-lines
+python3.12 log_summary.py app.jsonl --format jsonl --level-field severity
 ```
 
 JSON Lines uses the `severity` field by default. Its values are
@@ -87,10 +104,10 @@ Trailing free text remains visible in the original record.
 
 Search any text log with original line numbers and surrounding context:
 
-```powershell
-python log_summary.py search app.log --regex "timed out|lookup failed" --context 2
-python log_summary.py search "app.log*" --contains "timed out" --context 2
-Get-Content app.log | python log_summary.py search - --contains "timed out"
+```bash
+python3.12 log_summary.py search app.log --regex "timed out|lookup failed" --context 2
+python3.12 log_summary.py search "app.log*" --contains "timed out" --context 2
+python3.12 log_summary.py search - --contains "timed out" < app.log
 ```
 
 Pass multiple paths or quoted globs to search current and rotated logs,
@@ -115,11 +132,11 @@ mappings read its header. JSON Lines stays line-based in structured commands and
 a JSON object. A multiline record exceeding 10,000 lines or 1 MiB of UTF-8
 text stops the command with an input error and the record's starting line.
 
-```powershell
-python log_summary.py search stacktrace-example.txt --multiline --contains TimeoutError --context 1
-python log_summary.py stacktrace-example.txt --multiline --contains TimeoutError --show-lines
-python log_summary.py timeline stacktrace-example.txt --format logfmt --time timestamp --key request_id --value r1 --multiline
-python log_summary.py bucket stacktrace-example.txt --format logfmt --time timestamp --interval 1m --multiline
+```bash
+python3.12 log_summary.py search stacktrace-example.txt --multiline --contains TimeoutError --context 1
+python3.12 log_summary.py stacktrace-example.txt --multiline --contains TimeoutError --show-lines
+python3.12 log_summary.py timeline stacktrace-example.txt --format logfmt --time timestamp --key request_id --value r1 --multiline
+python3.12 log_summary.py bucket stacktrace-example.txt --format logfmt --time timestamp --interval 1m --multiline
 ```
 
 Search context counts records in multiline mode. Search and timeline JSON
@@ -132,10 +149,10 @@ separately from logical records.
 Use a named regex capture for text or a field from JSON Lines or logfmt. Use
 dotted paths such as `event.code` for nested JSON fields.
 
-```powershell
-python log_summary.py group app.log --regex 'code=(?P<code>E\d{4})' --by code
-python log_summary.py group app.jsonl --format jsonl --by code
-Get-Content app.jsonl | python log_summary.py group - --format jsonl --by service
+```bash
+python3.12 log_summary.py group app.log --regex 'code=(?P<code>E\d{4})' --by code
+python3.12 log_summary.py group app.jsonl --format jsonl --by code
+python3.12 log_summary.py group - --format jsonl --by service < app.jsonl
 ```
 
 Both error-code reports rank `E1042` (4), `E2007` (3), and `E3001` (1).
@@ -149,9 +166,9 @@ contributed to the report.
 
 Select an ID and timestamp from JSON Lines fields or named regex captures in text.
 
-```powershell
-python log_summary.py timeline app.jsonl --format jsonl --key request_id --value r-100 --time timestamp
-python log_summary.py timeline app.log --format logfmt --key request_id --value r-100 --time timestamp
+```bash
+python3.12 log_summary.py timeline app.jsonl --format jsonl --key request_id --value r-100 --time timestamp
+python3.12 log_summary.py timeline app.log --format logfmt --key request_id --value r-100 --time timestamp
 ```
 
 Both commands reconstruct the same six events for `r-100`. The tool sorts by
@@ -159,14 +176,14 @@ ISO 8601 timestamp and prints each record with its UTC time and source line.
 Ties retain source and line order. Timestamps without an offset are treated as
 UTC. The footer reports records that cannot yield an ID or matching events with
 an invalid or missing timestamp. Use `-` in place of the file path for stdin
-and `python log_summary.py timeline -h` for all options. Coverage separates
+and `python3.12 log_summary.py timeline -h` for all options. Coverage separates
 matched events, events for the same ID outside the window, other IDs, and
 skipped records (missing ID or unusable timestamp for the requested ID).
 
 ### Follow an ID across sources
 
-```powershell
-python log_summary.py timeline --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --value incident-00 --json
+```bash
+python3.12 log_summary.py timeline --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --value incident-00 --json
 ```
 
 Each `--source` pairs a file with its own profile. This example follows the
@@ -176,9 +193,9 @@ same ID across JSON Lines and logfmt. The report includes per-source coverage.
 
 Use the same field mappings as `timeline` to compare every ID in a log:
 
-```powershell
-python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --sort span
-python log_summary.py correlate app.log --format logfmt --key request_id --time timestamp --sort count
+```bash
+python3.12 log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --sort span
+python3.12 log_summary.py correlate app.log --format logfmt --key request_id --time timestamp --sort count
 ```
 
 The report shows each ID's event count, first and last UTC timestamps, and
@@ -186,7 +203,7 @@ observed span. The span is the difference between the first and last valid
 events present in the input. Use `--sort span` (the default) or `--sort count`.
 Coverage reconciles scanned records into used, skipped (missing a usable ID
 or timestamp), and outside the selected window. Use `-` for stdin
-and `python log_summary.py correlate -h` for all options. Use `timeline` with
+and `python3.12 log_summary.py correlate -h` for all options. Use `timeline` with
 an ID from the report to inspect its individual events.
 
 ## Focus on an incident window
@@ -199,8 +216,8 @@ Use ISO 8601 timestamps. An omitted offset means UTC.
 For existing scripts, `--until` remains inclusive in `timeline` and
 `correlate`, and exclusive in `bucket`. Use one upper-bound flag at a time.
 
-```powershell
-python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --before "2026-11-26T14:00:01Z"
+```bash
+python3.12 log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --before "2026-11-26T14:00:01Z"
 ```
 
 ## Read epoch timestamps
@@ -209,8 +226,8 @@ Timed commands default to ISO 8601. Use `--time-format epoch_s` for Unix seconds
 or `--time-format epoch_ms` for milliseconds. Profiles can set `time_format`
 per source. Window bounds still use ISO 8601.
 
-```powershell
-'{"timestamp_ms":1795701660000}' | python log_summary.py bucket - --format jsonl --time timestamp_ms --time-format epoch_ms --interval 1m --since 2026-11-26T14:01Z --before 2026-11-26T14:02Z
+```bash
+printf '%s\n' '{"timestamp_ms":1795701660000}' | python3.12 log_summary.py bucket - --format jsonl --time timestamp_ms --time-format epoch_ms --interval 1m --since 2026-11-26T14:01Z --before 2026-11-26T14:02Z
 ```
 
 Use integer or decimal-string timestamps when exact precision matters. Values
@@ -221,8 +238,8 @@ unit. The selected unit still governs the results.
 
 ## Find when event activity changed
 
-```powershell
-python log_summary.py bucket incident.jsonl --format jsonl --time ts --interval 30s --signature code --value TIMEOUT --since 2026-11-26T14:00Z --before 2026-11-26T14:03Z
+```bash
+python3.12 log_summary.py bucket incident.jsonl --format jsonl --time ts --interval 30s --signature code --value TIMEOUT --since 2026-11-26T14:00Z --before 2026-11-26T14:03Z
 ```
 
 Timeouts jump at 14:01 UTC. Use that boundary in the `compare` example below.
@@ -262,8 +279,8 @@ no events counted, even if the report contains zero-count buckets.
 
 ## Compare an incident with a baseline
 
-```powershell
-python log_summary.py compare incident.jsonl --format jsonl --time ts --signature code --service service --id request --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z
+```bash
+python3.12 log_summary.py compare incident.jsonl --format jsonl --time ts --signature code --service service --id request --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z
 ```
 
 The synthetic example shows 80 timeout events across 12 observed IDs and a
@@ -283,9 +300,9 @@ Use the same `--source FILE PROFILE` pairs with `compare`, `correlate`, and
 `timeline`. Each profile maps the fields in its own file. Quote a glob such
 as `'logs/*.jsonl.gz'` to apply one profile to all matching files.
 
-```powershell
-python log_summary.py compare --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z
-python log_summary.py correlate --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --top 3
+```bash
+python3.12 log_summary.py compare --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z
+python3.12 log_summary.py correlate --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --top 3
 ```
 
 Compare shows coverage per source and window, and links examples to the source
@@ -298,10 +315,10 @@ For combined totals, severity summary uses each profile's `level_field`,
 When you filter a bucket with `--value`, each profile supplies its own
 `signature` field. Use `--level` for a severity filter instead.
 
-```powershell
-python log_summary.py --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --multiline
-python log_summary.py group --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --multiline
-python log_summary.py bucket --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --interval 1m --value E1042 --multiline --since 2026-11-26T14:00Z --before 2026-11-26T14:02Z
+```bash
+python3.12 log_summary.py --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --multiline
+python3.12 log_summary.py group --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --multiline
+python3.12 log_summary.py bucket --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --interval 1m --value E1042 --multiline --since 2026-11-26T14:00Z --before 2026-11-26T14:02Z
 ```
 
 Summary shows the severity counts for each source. `--level` limits the
@@ -313,8 +330,8 @@ With `--source`, summary `--show-lines` includes the source and line range.
 Use `--display-timezone` with `timeline`, `correlate`, `compare`, or
 `bucket` to show local clock times in text reports.
 
-```powershell
-python log_summary.py timeline app.jsonl --profile app-jsonl-profile.json --key request_id --value r-100 --display-timezone UTC-03:00
+```bash
+python3.12 log_summary.py timeline app.jsonl --profile app-jsonl-profile.json --key request_id --value r-100 --display-timezone UTC-03:00
 ```
 
 Use a fixed offset such as `UTC-03:00` or an IANA name such as
@@ -341,9 +358,9 @@ Save your log mapping in a JSON file and pass it to `bucket`, `compare`,
 `timeline`, `correlate`, `group`, or the severity summary through `--profile`. See
 [`incident-profile.json`](incident-profile.json) for an example.
 
-```powershell
-python log_summary.py bucket incident.jsonl --profile incident-profile.json --interval 30s --value TIMEOUT
-python log_summary.py timeline incident.jsonl --profile incident-profile.json --value incident-00
+```bash
+python3.12 log_summary.py bucket incident.jsonl --profile incident-profile.json --interval 30s --value TIMEOUT
+python3.12 log_summary.py timeline incident.jsonl --profile incident-profile.json --value incident-00
 ```
 
 Profile keys are `format`, `time`, `time_format`, `regex`, `signature`,
@@ -381,11 +398,12 @@ hidden breach and how many were hidden.
 
 From `log-summary/`, run the unit tests:
 
-```powershell
-python -m unittest -v
+```bash
+python3.12 -m unittest -v
 ```
 
-In GitHub Actions, **Log Summary CI** shows Python 3.12 tests on Ubuntu and Windows,
+In GitHub Actions, **Log Summary CI** runs the suite in Red Hat UBI 8
+with Python 3.12. It also shows Python 3.12 tests on Ubuntu and Windows,
 Python 3.13 tests on Ubuntu, Python 3.14 tests on Ubuntu and Windows, and a Ruff and mypy job. You can see each run in the repository's **Actions** tab.
 
 The Ubuntu Python 3.14 job also publishes line and branch coverage for

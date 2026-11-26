@@ -759,17 +759,32 @@ class InspectFollowThroughTests(unittest.TestCase):
     def test_suggested_bucket_command_preserves_multiline(self):
         result = self.run_cli("inspect", "stacktrace-example.txt", "--multiline")
         suggestion = next(line.strip() for line in result.stderr.splitlines()
-                          if line.strip().startswith("python log_summary.py bucket"))
+                          if " log_summary.py bucket " in line)
         report = json.loads(self.run_cli(*shlex.split(suggestion)[2:], "--json").stdout)
         coverage = report["coverage"]
         self.assertEqual((coverage["scanned"], coverage["physical_lines"], coverage["invalid_timestamp"]),
                          (3, 6, 0))
 
+    def test_inspect_quotes_apostrophes_for_the_host_shell(self):
+        with TemporaryDirectory() as directory:
+            log = Path(directory) / "night's log.jsonl"
+            log.write_text(json.dumps({"event's time": "2026-11-26T14:01:00Z"}), encoding="utf-8")
+            result = self.run_cli("inspect", str(log))
+            suggestion = next(line for line in result.stderr.splitlines() if " log_summary.py bucket " in line)
+            if sys.platform == "win32":
+                self.assertIn("night''s log.jsonl", suggestion)
+                self.assertIn("--time='event''s time'", suggestion)
+            else:
+                argv = shlex.split(suggestion)
+                self.assertEqual(argv[3], str(log))
+                self.assertIn("--time=event's time", argv)
+                self.assertEqual(argv[0], f"python{sys.version_info.major}.{sys.version_info.minor}")
+
     def test_suggested_bucket_interval_handles_sparse_input(self):
         data = '{"ts":"2020-01-01T00:00:00Z"}\n{"ts":"2021-01-01T00:00:00Z"}\n'
         result = self.run_cli("inspect", "-", data=data)
         suggestion = next(line.strip() for line in result.stderr.splitlines()
-                          if line.strip().startswith("python log_summary.py bucket"))
+                          if " log_summary.py bucket " in line)
         report = json.loads(self.run_cli(*shlex.split(suggestion)[2:], "--json", data=data).stdout)
         self.assertEqual(report["coverage"]["counted"], 2)
         self.assertLessEqual(len(report["buckets"]), 10_000)
@@ -1184,7 +1199,8 @@ class AutomationContractTests(unittest.TestCase):
         self.assertEqual(report["command"], "inspect")
         self.assertEqual(report["profile"]["time"], "event.ts")
         self.assertEqual(report["profile"]["signature"], "event.code")
-        self.assertIn("Try in PowerShell", inspect.stderr)
+        shell = "PowerShell" if sys.platform == "win32" else "a POSIX shell"
+        self.assertIn(f"Try in {shell}", inspect.stderr)
         group = self.run_cli("group", "-", "--format", "jsonl", "--by", "event.code",
                              "--json", data=data)
         self.assertEqual(group.returncode, 0, group.stderr)

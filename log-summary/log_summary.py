@@ -1971,9 +1971,13 @@ def inspect_log(argv: list[str]) -> int:
         # Use a simple field token for the displayed example.
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", severity):
             print(f"Severity summary options: --format {input_format} --level-field {severity}", file=sys.stderr)
-    timestamp = timestamp_fields[0].replace("'", "''")
-    source = args.log_file.replace("'", "''")
-    print("Try in PowerShell:", file=sys.stderr)
+    windows = sys.platform == "win32"
+    apostrophe = "''" if windows else "'\"'\"'"
+    timestamp = timestamp_fields[0].replace("'", apostrophe)
+    source = args.log_file.replace("'", apostrophe)
+    interpreter = "python" if windows else f"python{sys.version_info.major}.{sys.version_info.minor}"
+    shell = "PowerShell" if windows else "a POSIX shell"
+    print(f"Try in {shell}:", file=sys.stderr)
     first, last = fields[timestamp_fields[0]].time_bounds[time_modes[timestamp_fields[0]][0]]
     # Reserve an extra aligned bucket since the first sample may be off the boundary.
     span_us = (last - first) // MICROSECOND
@@ -1986,9 +1990,9 @@ def inspect_log(argv: list[str]) -> int:
         print("Confirm the suggested epoch unit before using the mapping.", file=sys.stderr)
         options += f" --time-format {profile['time_format']}"
     if args.log_file.startswith("-") and args.log_file != "-":
-        print(f"  python log_summary.py bucket {options} -- '{source}'", file=sys.stderr)
+        print(f"  {interpreter} log_summary.py bucket {options} -- '{source}'", file=sys.stderr)
     else:
-        print(f"  python log_summary.py bucket '{source}' {options}", file=sys.stderr)
+        print(f"  {interpreter} log_summary.py bucket '{source}' {options}", file=sys.stderr)
     if args.log_file == "-":
         print("Pipe the input into the suggested command again.", file=sys.stderr)
     return 0
@@ -2030,6 +2034,8 @@ def main() -> int:
             "                                        Count ERROR lines containing timed out\n"
             '  python log_summary.py app.log --level ERROR --contains "timed out" --show-lines\n'
             "                                        Print matching lines with line numbers\n"
+            "  python3.12 log_summary.py - --level ERROR < app.log\n"
+            "                                        Read UTF-8 stdin on Linux\n"
             "  Get-Content app.log | python log_summary.py - --level ERROR\n"
             "                                        Read from a PowerShell pipeline\n"
             '  python log_summary.py app.log --regex "timed out|lookup failed"'
