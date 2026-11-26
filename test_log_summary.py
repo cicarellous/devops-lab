@@ -46,7 +46,7 @@ class ShowLinesTests(unittest.TestCase):
             [
                 sys.executable,
                 "log_summary.py",
-                "sample.log",
+                "app.log",
                 "--level",
                 "ERROR",
                 "--contains",
@@ -60,7 +60,11 @@ class ShowLinesTests(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout.splitlines(),
-            ["5: ERROR Request timed out", "ERROR: 1"],
+            [
+                "8: 2026-11-26T14:00:00.959Z ERROR service=database request_id=r-100 status=503 code=E1042 Connection acquisition timed out",
+                "13: 2026-11-26T14:00:01.644Z ERROR service=payments request_id=r-101 status=504 code=E2007 Authorization retry timed out",
+                "ERROR: 2",
+            ],
         )
 
 
@@ -70,12 +74,12 @@ class StdinTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "log_summary.py", "-", "--level", "ERROR"],
             cwd=repo,
-            input=(repo / "sample.log").read_text(encoding="utf-8"),
+            input=(repo / "app.log").read_text(encoding="utf-8"),
             capture_output=True,
             text=True,
             check=True,
         )
-        self.assertEqual(result.stdout, "ERROR: 2\n")
+        self.assertEqual(result.stdout, "ERROR: 5\n")
 
 
 class RegexTests(unittest.TestCase):
@@ -84,9 +88,9 @@ class RegexTests(unittest.TestCase):
             [
                 sys.executable,
                 "log_summary.py",
-                "sample.log",
+                "app.log",
                 "--level", "ERROR",
-                "--regex", "timed out|connection failed",
+                "--regex", "acquisition timed out|lookup failed",
                 "--show-lines",
             ],
             cwd=Path(__file__).resolve().parent,
@@ -96,7 +100,11 @@ class RegexTests(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout.splitlines(),
-            ["2: ERROR Database connection failed", "5: ERROR Request timed out", "ERROR: 2"],
+            [
+                "8: 2026-11-26T14:00:00.959Z ERROR service=database request_id=r-100 status=503 code=E1042 Connection acquisition timed out",
+                "9: 2026-11-26T14:00:01.096Z ERROR service=orders request_id=r-100 status=503 code=E1042 Order lookup failed",
+                "ERROR: 2",
+            ],
         )
 
     def test_rejects_invalid_regex_before_opening_file(self):
@@ -183,6 +191,52 @@ class GroupTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("named capture group 'code'", result.stderr)
+
+
+class TimelineTests(unittest.TestCase):
+    def test_reconstructs_same_request_from_both_formats_and_reversed_input(self):
+        repo = Path(__file__).resolve().parent
+        expected_times = ["00.000", "00.274", "00.548", "00.959", "01.096", "01.781"]
+        formats = [
+            ("app.log", ["--regex", r"^(?P<timestamp>\S+).*request_id=(?P<id>\S+)", "--key", "id"]),
+            ("app.jsonl", ["--format", "jsonl", "--key", "request_id"]),
+        ]
+        for filename, options in formats:
+            with self.subTest(filename=filename):
+                command = [sys.executable, "log_summary.py", "timeline"]
+                options += ["--value", "r-100", "--time", "timestamp"]
+                events = (repo / filename).read_text(encoding="utf-8").splitlines()
+                reversed_input = "\n".join(reversed(events)) + "\n"
+                file_result = subprocess.run(
+                    [*command, filename, *options], cwd=repo, capture_output=True,
+                    text=True, check=True,
+                )
+                stdin_result = subprocess.run(
+                    [*command, "-", *options], cwd=repo, input=reversed_input,
+                    capture_output=True, text=True, check=True,
+                )
+                self.assertEqual(stdin_result.stdout, file_result.stdout)
+                rows = stdin_result.stdout.splitlines()
+                self.assertEqual(rows[-1], "Scanned: 20  Matched: 6  Skipped: 0")
+                self.assertEqual(
+                    [row.split("  ", 1)[0] for row in rows[:-1]],
+                    [f"2026-11-26 14:00:{time}000+00:00" for time in expected_times],
+                )
+
+    def test_counts_invalid_records_and_sorts_by_absolute_time(self):
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "timeline", "-", "--format", "jsonl",
+             "--key", "id", "--value", "a", "--time", "time"],
+            cwd=Path(__file__).resolve().parent,
+            input='{"id":"a","time":"2026-11-26T10:00:00-05:00"}\n'
+                  '{"id":"a","time":"2026-11-26T14:00:00Z"}\n'
+                  '{"id":"a","time":"invalid"}\ninvalid\n{"id":"b"}\n',
+            capture_output=True, text=True, check=True,
+        )
+        rows = result.stdout.splitlines()
+        self.assertTrue(rows[0].startswith("2026-11-26 14:00:00.000000+00:00"))
+        self.assertTrue(rows[1].startswith("2026-11-26 15:00:00.000000+00:00"))
+        self.assertEqual(rows[2], "Scanned: 5  Matched: 2  Skipped: 2")
 
 
 if __name__ == "__main__":

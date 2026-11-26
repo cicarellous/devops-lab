@@ -4,11 +4,16 @@ import re
 import sys
 from collections import Counter, deque
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, TextIO
 
 
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
+TIMESTAMP_PREFIX = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?[ \t]+"
+)
 
 
 def count_levels(
@@ -26,8 +31,10 @@ def count_levels(
             continue
         if pattern is not None and pattern.search(line.rstrip("\r\n")) is None:
             continue
+        timestamp = TIMESTAMP_PREFIX.match(line)
+        level_start = timestamp.end() if timestamp else 0
         for level in LOG_LEVELS:
-            if line.startswith(level):
+            if line.startswith(level, level_start):
                 counts[level] += 1
                 if output is not None and selected_level in (None, level):
                     text = line.rstrip("\r\n")
@@ -37,7 +44,7 @@ def count_levels(
 
 
 def count_errors(lines: Iterable[str]) -> int:
-    """Count lines that start with ERROR."""
+    """Count lines whose severity prefix is ERROR."""
     return count_levels(lines)["ERROR"]
 
 
@@ -149,36 +156,111 @@ def group_log(argv: list[str]) -> int:
     return 0
 
 
+def timeline_log(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="log_summary.py timeline",
+        description="Show events for one ID in chronological order.",
+    )
+    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
+    parser.add_argument("--key", required=True, help="ID field or named regex capture")
+    parser.add_argument("--value", required=True, help="ID to match exactly")
+    parser.add_argument("--time", required=True, help="timestamp field or named regex capture")
+    parser.add_argument("--regex", help="text pattern capturing the ID and timestamp")
+    parser.epilog = (
+        "Timestamps use ISO 8601. Timestamps without an offset are treated as UTC. "
+        "Use --format jsonl for top-level JSON fields, or --regex for text."
+    )
+    args = parser.parse_args(argv)
+    if args.format == "text" and args.regex is None:
+        parser.error("text input requires --regex")
+    if args.format == "jsonl" and args.regex is not None:
+        parser.error("--regex applies only to text input")
+    pattern = compile_pattern(parser, args.regex)
+    if pattern is not None and not {args.key, args.time} <= pattern.groupindex.keys():
+        parser.error("--regex must define named captures for --key and --time")
+
+    events: list[tuple[datetime, str]] = []
+    scanned = 0
+    skipped = 0
+    try:
+        with open_log(args.log_file) as log_file:
+            for line in log_file:
+                scanned += 1
+                text = line.rstrip("\r\n")
+                if pattern is not None:
+                    match = pattern.search(text)
+                    fields = match.groupdict() if match else {}
+                else:
+                    try:
+                        record = json.loads(text)
+                    except json.JSONDecodeError:
+                        record = None
+                    fields = record if isinstance(record, dict) else {}
+                key = fields.get(args.key)
+                if not isinstance(key, (str, int, float)) or isinstance(key, bool) or key == "":
+                    skipped += 1
+                    continue
+                if str(key) != args.value:
+                    continue
+
+                raw_time = fields.get(args.time)
+                if not isinstance(raw_time, str):
+                    skipped += 1
+                    continue
+                try:
+                    timestamp = datetime.fromisoformat(raw_time)
+                    utc_time = timestamp.replace(tzinfo=timezone.utc) if timestamp.tzinfo is None else (
+                        timestamp.astimezone(timezone.utc)
+                    )
+                except (ValueError, OverflowError):
+                    skipped += 1
+                    continue
+                events.append((utc_time, text))
+    except FileNotFoundError:
+        print(f"Log file not found: {args.log_file}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"Cannot read log: {error}", file=sys.stderr)
+        return 1
+
+    for timestamp, text in sorted(events, key=lambda event: event[0]):
+        print(f"{timestamp.isoformat(sep=' ', timespec='microseconds')}  {text}")
+    print(f"Scanned: {scanned}  Matched: {len(events)}  Skipped: {skipped}")
+    return 0
+
+
 def main() -> int:
     if sys.argv[1:2] == ["search"]:
         return search_log(sys.argv[2:])
     if sys.argv[1:2] == ["group"]:
         return group_log(sys.argv[2:])
+    if sys.argv[1:2] == ["timeline"]:
+        return timeline_log(sys.argv[2:])
 
     parser = argparse.ArgumentParser(
-        description="Count lines starting with INFO, WARNING, or ERROR.",
+        description="Count INFO, WARNING, and ERROR entries, with optional ISO timestamps.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Commands: search, group. Run either command with -h for details.\n\n"
+            "Commands: search, group, timeline. Run any command with -h for details.\n\n"
             "Examples:\n"
-            "  python log_summary.py                 Count levels in sample.log\n"
-            "  python log_summary.py app.log         Count levels in app.log\n"
+            "  python log_summary.py                 Count levels in app.log\n"
             "  python log_summary.py app.log --level ERROR\n"
             "                                        Show only the ERROR count\n"
-            '  python log_summary.py sample.log --level ERROR --contains "timed out"\n'
+            '  python log_summary.py app.log --level ERROR --contains "timed out"\n'
             "                                        Count ERROR lines containing timed out\n"
-            '  python log_summary.py sample.log --level ERROR --contains "timed out" --show-lines\n'
+            '  python log_summary.py app.log --level ERROR --contains "timed out" --show-lines\n'
             "                                        Print matching lines with line numbers\n"
-            "  Get-Content sample.log | python log_summary.py - --level ERROR\n"
+            "  Get-Content app.log | python log_summary.py - --level ERROR\n"
             "                                        Read from a PowerShell pipeline\n"
-            '  python log_summary.py sample.log --regex "timed out|connection failed"'
+            '  python log_summary.py app.log --regex "timed out|lookup failed"'
         ),
     )
     parser.add_argument(
         "log_file",
         nargs="?",
-        default=str(Path(__file__).with_name("sample.log")),
-        help="log file path or - for stdin (default: sample.log beside this script)",
+        default=str(Path(__file__).with_name("app.log")),
+        help="log file path or - for stdin (default: app.log beside this script)",
     )
     parser.add_argument(
         "--level",

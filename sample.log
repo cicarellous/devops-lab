@@ -1,6 +1,0 @@
-INFO Server started
-ERROR Database connection failed
-WARNING Retrying connection
-INFO Connection restored
-ERROR Request timed out
-INFO Server stopped
