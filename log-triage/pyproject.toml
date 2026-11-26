@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "log-triage"
+dynamic = ["version"]
+description = "Investigate incidents in local logs with timelines, rate comparisons, and automation gates."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["logs", "incident-triage", "sre", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Logging",
+]
+
+[project.scripts]
+log-triage = "log_triage.cli:main"
+
+[project.urls]
+Repository = "https://github.com/cicarellous/devops-lab"
+Documentation = "https://github.com/cicarellous/devops-lab/tree/main/log-triage"
+Issues = "https://github.com/cicarellous/devops-lab/issues"
+
+[tool.setuptools]
+packages = ["log_triage"]
+
+[tool.setuptools.dynamic]
+version = {attr = "log_triage._version.__version__"}
+
+[tool.setuptools.package-data]
+log_triage = ["app.log"]

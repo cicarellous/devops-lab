@@ -60,7 +60,7 @@ candidates, including nested JSON fields. On `incident.jsonl`, look for
 `ts`, `code`, and `request`. Run the suggested `bucket` command, then add
 `--signature code --value TIMEOUT` to isolate the jump at 14:01 UTC.
 For key-value logs, inspect suggests `logfmt`. Save a suggested mapping with
-`python3.12 log_triage.py inspect app.log --profile-out app-profile.json`, then
+`python3.12 log_triage.py inspect log_triage/app.log --profile-out app-profile.json`, then
 review the new profile before using it. Inspect uses the inferred signature as
 the default grouping field (`by`). Its bucket suggestion preserves
 `--multiline` and chooses an interval for the sampled time span. Longer logs
@@ -73,13 +73,13 @@ warns when timed commands will need an explicit `--time`.
 
 ## Summarize severity
 
-Run the log summary with the included `app.log` as the default. The summary
+Run the log summary with the included `log_triage/app.log` as the default. The summary
 recognizes severity at the start of a line or after an ISO timestamp.
 Use `python3.12 log_triage.py -- search` to summarize a file named `search`.
 Run `python3.12 log_triage.py --version` to display the CLI version.
 
 ```bash
-python3.12 log_triage.py app.log --level ERROR --contains "timed out" --show-lines
+python3.12 log_triage.py log_triage/app.log --level ERROR --contains "timed out" --show-lines
 python3.12 log_triage.py app.jsonl --format jsonl --level-field severity
 ```
 
@@ -96,9 +96,9 @@ and `--show-lines` to print the evidence before the counts in text output.
 Search any text log with original line numbers and surrounding context:
 
 ```bash
-python3.12 log_triage.py search app.log --regex "timed out|lookup failed" --context 2
-python3.12 log_triage.py search "app.log*" --contains "timed out" --context 2
-python3.12 log_triage.py search - --contains "timed out" < app.log
+python3.12 log_triage.py search log_triage/app.log --regex "timed out|lookup failed" --context 2
+python3.12 log_triage.py search "log_triage/app.log*" --contains "timed out" --context 2
+python3.12 log_triage.py search - --contains "timed out" < log_triage/app.log
 ```
 
 Pass multiple paths or quoted globs to search current and rotated logs,
@@ -138,7 +138,7 @@ Use a named regex capture for text or a field from JSON Lines or logfmt. Use
 dotted paths such as `event.code` for nested JSON fields.
 
 ```bash
-python3.12 log_triage.py group app.log --regex 'code=(?P<code>E\d{4})' --by code
+python3.12 log_triage.py group log_triage/app.log --regex 'code=(?P<code>E\d{4})' --by code
 python3.12 log_triage.py group app.jsonl --format jsonl --by code
 python3.12 log_triage.py group - --format jsonl --by service < app.jsonl
 ```
@@ -156,7 +156,7 @@ Select an ID and timestamp from JSON Lines, logfmt, or named regex captures.
 
 ```bash
 python3.12 log_triage.py timeline app.jsonl --format jsonl --key request_id --value r-100 --time timestamp
-python3.12 log_triage.py timeline app.log --format logfmt --key request_id --value r-100 --time timestamp
+python3.12 log_triage.py timeline log_triage/app.log --format logfmt --key request_id --value r-100 --time timestamp
 ```
 
 Both commands reconstruct the same six events for `r-100`. The tool sorts by
@@ -183,7 +183,7 @@ Use the same field mappings as `timeline` to compare every ID in a log:
 
 ```bash
 python3.12 log_triage.py correlate app.jsonl --format jsonl --key request_id --time timestamp --sort span
-python3.12 log_triage.py correlate app.log --format logfmt --key request_id --time timestamp --sort count
+python3.12 log_triage.py correlate log_triage/app.log --format logfmt --key request_id --time timestamp --sort count
 ```
 
 The report shows each ID's event count, first and last UTC timestamps, and
@@ -409,6 +409,29 @@ hidden breach and how many were hidden.
 | Named timezone unavailable | Confirm the IANA name and install timezone data if needed, or use a fixed offset. |
 | PowerShell garbles piped text | Set `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` before piping non-ASCII text. |
 
+## Build and install a distribution
+
+From `log-triage/`, use an activated Python 3.12+ environment:
+
+```bash
+python -m pip install build
+python -m build
+```
+
+The `dist/` directory contains a wheel (`.whl`) and a source archive
+(`.tar.gz`). For an offline RHEL host, transfer the wheel and install it
+in an activated Python 3.12 environment:
+
+```bash
+python -m pip install --no-index --no-deps ./dist/log_triage-0.1.0-py3-none-any.whl
+log-triage --version
+log-triage
+```
+
+Use the actual wheel path on the target host. The wheel is platform
+independent and includes the default sample log. The source archive also
+includes the runbook, reference, and exercise files.
+
 ## Tests
 
 From `log-triage/`, run the unit tests:
@@ -422,5 +445,5 @@ with Python 3.12. It also shows Python 3.12 tests on Ubuntu and Windows,
 Python 3.13 tests on Ubuntu, Python 3.14 tests on Ubuntu and Windows, and a Ruff and mypy job. View the runs in the repository?s **Actions** tab.
 
 The Ubuntu Python 3.14 job also publishes line and branch coverage for
-`log_triage.py` in the run summary, including CLI subprocesses launched by
+`log_triage/cli.py` in the run summary, including CLI subprocesses launched by
 the tests. Coverage reporting has no minimum percentage.

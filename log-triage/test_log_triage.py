@@ -8,7 +8,7 @@ from os import environ
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from log_triage import count_errors, count_levels, event_time, spread_sample
+from log_triage.cli import count_errors, count_levels, event_time, spread_sample
 
 
 class CountErrorsTests(unittest.TestCase):
@@ -51,7 +51,7 @@ class ShowLinesTests(unittest.TestCase):
             [
                 sys.executable,
                 "log_triage.py",
-                "app.log",
+                "log_triage/app.log",
                 "--level",
                 "ERROR",
                 "--contains",
@@ -79,7 +79,7 @@ class StdinTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "log_triage.py", "-", "--level", "ERROR"],
             cwd=repo,
-            input=(repo / "app.log").read_text(encoding="utf-8"),
+            input=(repo / "log_triage/app.log").read_text(encoding="utf-8"),
             capture_output=True,
             text=True,
             check=True,
@@ -93,7 +93,7 @@ class RegexTests(unittest.TestCase):
             [
                 sys.executable,
                 "log_triage.py",
-                "app.log",
+                "log_triage/app.log",
                 "--level", "ERROR",
                 "--regex", "acquisition timed out|lookup failed",
                 "--show-lines",
@@ -197,7 +197,7 @@ class GroupTests(unittest.TestCase):
     def test_groups_equivalent_text_and_jsonl_examples(self):
         repo = Path(__file__).resolve().parent
         cases = [
-            ["app.log", "--regex", r"code=(?P<code>E\d{4})"],
+            ["log_triage/app.log", "--regex", r"code=(?P<code>E\d{4})"],
             ["app.jsonl", "--format", "jsonl"],
         ]
         for options in cases:
@@ -237,7 +237,7 @@ class GroupTests(unittest.TestCase):
 
     def test_text_group_requires_the_named_capture(self):
         result = subprocess.run(
-            [sys.executable, "log_triage.py", "group", "app.log",
+            [sys.executable, "log_triage.py", "group", "log_triage/app.log",
              "--regex", "(?P<other>ERROR)", "--by", "code"],
             cwd=Path(__file__).resolve().parent,
             capture_output=True,
@@ -252,7 +252,7 @@ class TimelineTests(unittest.TestCase):
         repo = Path(__file__).resolve().parent
         expected_times = ["00.000", "00.274", "00.548", "00.959", "01.096", "01.781"]
         formats = [
-            ("app.log", ["--regex", r"^(?P<timestamp>\S+).*request_id=(?P<id>\S+)", "--key", "id"]),
+            ("log_triage/app.log", ["--regex", r"^(?P<timestamp>\S+).*request_id=(?P<id>\S+)", "--key", "id"]),
             ("app.jsonl", ["--format", "jsonl", "--key", "request_id"]),
         ]
         for filename, options in formats:
@@ -305,7 +305,7 @@ class CorrelateTests(unittest.TestCase):
         repo = Path(__file__).resolve().parent
         command = [sys.executable, "log_triage.py", "correlate"]
         text = subprocess.run(
-            [*command, "app.log", "--key", "id", "--time", "ts",
+            [*command, "log_triage/app.log", "--key", "id", "--time", "ts",
              "--regex", r"^(?P<ts>\S+).*request_id=(?P<id>\S+)"],
             cwd=repo, capture_output=True, text=True, check=True,
         )

@@ -1,0 +1,3 @@
+include .coveragerc log_triage.py test_log_triage.py
+include app.jsonl incident.jsonl *-profile.json *-example.txt
+include docs/*.md

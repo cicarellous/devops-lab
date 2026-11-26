@@ -99,6 +99,19 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Build and smoke-test distributions
+        if: matrix.python == '3.12'
+        working-directory: log-triage
+        shell: bash
+        run: |
+          python -m pip install build
+          python -m build --outdir "$RUNNER_TEMP/log-triage-dist"
+          python -m pip install --no-deps "$RUNNER_TEMP"/log-triage-dist/*.whl
+          cd "$RUNNER_TEMP"
+          log-triage --version
+          log-triage -h
+          log-triage | grep -F 'ERROR: 5'
+
   rhel8-user-space:
     name: Unit tests / Red Hat UBI 8 / Python 3.12
     runs-on: ubuntu-latest
@@ -117,6 +130,33 @@ jobs:
             --entrypoint /usr/bin/python3.12 \
             registry.access.redhat.com/ubi8/python-312:latest \
             -m unittest -v
+
+      - name: Set up Python for the wheel build
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build a wheel for the RHEL install check
+        working-directory: log-triage
+        shell: bash
+        run: |
+          python -m pip install build
+          python -m build --wheel --outdir "$RUNNER_TEMP/log-triage-dist"
+
+      - name: Install and smoke-test the wheel in Red Hat UBI 8
+        shell: bash
+        run: |
+          docker run --rm \
+            --volume "$RUNNER_TEMP/log-triage-dist:/dist:ro" \
+            --entrypoint /bin/bash \
+            registry.access.redhat.com/ubi8/python-312:latest \
+            -e -u -o pipefail -c '
+              /usr/bin/python3.12 -m venv /tmp/log-triage-env
+              /tmp/log-triage-env/bin/python -m pip install --no-index --no-deps /dist/*.whl
+              cd /tmp
+              /tmp/log-triage-env/bin/log-triage --version
+              /tmp/log-triage-env/bin/log-triage | grep -F "ERROR: 5"
+            '
 
   code-quality:
     name: Code quality / Ruff and mypy
@@ -138,13 +178,13 @@ jobs:
         id: lint
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         working-directory: log-triage
-        run: python -m ruff check log_triage.py test_log_triage.py
+        run: python -m ruff check log_triage log_triage.py test_log_triage.py
 
       - name: Type check with mypy
         id: types
         if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         working-directory: log-triage
-        run: python -m mypy --python-version 3.12 log_triage.py
+        run: python -m mypy --python-version 3.12 log_triage/cli.py
 
       - name: Summarize code quality
         if: always()

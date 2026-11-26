@@ -43,7 +43,7 @@ time and compare the result.
 Run a severity summary on the bundled plain-text log.
 
 ```bash
-python3.12 log_triage.py app.log
+python3.12 log_triage.py log_triage/app.log
 ```
 
 Expected output:
@@ -59,7 +59,7 @@ see the error entries containing the exact text `timed out`, add a severity
 filter and print the matching lines before the count.
 
 ```bash
-python3.12 log_triage.py app.log --level ERROR --contains "timed out" --show-lines
+python3.12 log_triage.py log_triage/app.log --level ERROR --contains "timed out" --show-lines
 ```
 
 Expected output, shown in part:
@@ -70,12 +70,12 @@ Expected output, shown in part:
 ERROR: 2
 ```
 
-The numbers at the left are line numbers in `app.log`. A warning also
+The numbers at the left are line numbers in `log_triage/app.log`. A warning also
 contains `timed out` but the severity filter excludes it. Use `search`
 without a severity filter to see it and its neighbors.
 
 ```bash
-python3.12 log_triage.py search app.log --contains "timed out" --context 1
+python3.12 log_triage.py search log_triage/app.log --contains "timed out" --context 1
 ```
 
 The matches are at lines 6, 8, and 13. Line 7 appears once as context for
@@ -160,8 +160,8 @@ Split the sample into a compressed rotation and a current file.
 
 ```bash
 scratch=$(mktemp -d)
-head -n 8 app.log | gzip -c > "$scratch/app.log.1.gz"
-tail -n +9 app.log > "$scratch/app.log"
+head -n 8 log_triage/app.log | gzip -c > "$scratch/app.log.1.gz"
+tail -n +9 log_triage/app.log > "$scratch/app.log"
 python3.12 log_triage.py search "$scratch/app.log*" --contains "timed out" --context 1
 ```
 
@@ -174,7 +174,7 @@ You can practice multi-file input on Windows without creating a rotation.
 This searches two bundled files and prints the source on every result:
 
 ```powershell
-python log_triage.py search app.log stacktrace-example.txt --contains "timed out" --context 1
+python log_triage.py search log_triage/app.log stacktrace-example.txt --contains "timed out" --context 1
 ```
 
 Look for `app.log:6:` and a line prefixed with `stacktrace-example.txt:`.
@@ -261,7 +261,7 @@ events/minute** because the incident window is twice as long.
 Start with a JSON report whose counts you already know:
 
 ```bash
-python3.12 log_triage.py search app.log --contains "timed out" --context 1 --json
+python3.12 log_triage.py search log_triage/app.log --contains "timed out" --context 1 --json
 ```
 
 Look for this part of the report:
@@ -278,7 +278,7 @@ Look for this part of the report:
 These fields are under `coverage`. In PowerShell, read them directly:
 
 ```powershell
-python log_triage.py search app.log --contains "timed out" --context 1 --json | ConvertFrom-Json | Select-Object -ExpandProperty coverage
+python log_triage.py search log_triage/app.log --contains "timed out" --context 1 --json | ConvertFrom-Json | Select-Object -ExpandProperty coverage
 ```
 
 A **gate** uses an exit status to tell automation whether a condition was
