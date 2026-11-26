@@ -78,5 +78,38 @@ class StdinTests(unittest.TestCase):
         self.assertEqual(result.stdout, "ERROR: 2\n")
 
 
+class RegexTests(unittest.TestCase):
+    def test_matches_alternatives_and_shows_line_numbers(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "log_summary.py",
+                "sample.log",
+                "--level", "ERROR",
+                "--regex", "timed out|connection failed",
+                "--show-lines",
+            ],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["2: ERROR Database connection failed", "5: ERROR Request timed out", "ERROR: 2"],
+        )
+
+    def test_rejects_invalid_regex_before_opening_file(self):
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "missing.log", "--regex", "["],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("invalid --regex pattern", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

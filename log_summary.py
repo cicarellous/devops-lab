@@ -1,4 +1,5 @@
 import argparse
+import re
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -12,6 +13,7 @@ def count_levels(
     lines: Iterable[str],
     *,
     contains: str = "",
+    pattern: re.Pattern[str] | None = None,
     output: TextIO | None = None,
     selected_level: str | None = None,
 ) -> dict[str, int]:
@@ -19,6 +21,8 @@ def count_levels(
     counts = dict.fromkeys(LOG_LEVELS, 0)
     for line_number, line in enumerate(lines, start=1):
         if contains not in line:
+            continue
+        if pattern is not None and pattern.search(line.rstrip("\r\n")) is None:
             continue
         for level in LOG_LEVELS:
             if line.startswith(level):
@@ -50,7 +54,8 @@ def main() -> int:
             '  python log_summary.py sample.log --level ERROR --contains "timed out" --show-lines\n'
             "                                        Print matching lines with line numbers\n"
             "  Get-Content sample.log | python log_summary.py - --level ERROR\n"
-            "                                        Read from a PowerShell pipeline"
+            "                                        Read from a PowerShell pipeline\n"
+            '  python log_summary.py sample.log --regex "timed out|connection failed"'
         ),
     )
     parser.add_argument(
@@ -75,7 +80,16 @@ def main() -> int:
         action="store_true",
         help="print matching lines with original line numbers before the counts",
     )
+    parser.add_argument(
+        "--regex",
+        metavar="PATTERN",
+        help="count only lines matching this Python regular expression",
+    )
     args = parser.parse_args()
+    try:
+        pattern = re.compile(args.regex) if args.regex is not None else None
+    except re.error as error:
+        parser.error(f"invalid --regex pattern: {error}")
     log_path = args.log_file
 
     try:
@@ -87,6 +101,7 @@ def main() -> int:
             counts = count_levels(
                 log_file,
                 contains=args.contains,
+                pattern=pattern,
                 output=sys.stdout if args.show_lines else None,
                 selected_level=args.level,
             )
