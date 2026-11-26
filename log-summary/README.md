@@ -85,6 +85,17 @@ events present in the input. Use `--sort span` (the default) or `--sort count`.
 Records without a usable ID or timestamp count as skipped. Use `-` for stdin
 and `python log_summary.py correlate -h` for all options.
 
+## Focus on an incident window
+
+Use `--since` and `--until` with `timeline` or `correlate`. Both bounds are
+optional and inclusive. Use ISO 8601 timestamps with an offset, or omit the
+offset to use UTC. Events outside the window are excluded from the report.
+Correlation spans are calculated from the events within the window.
+
+```powershell
+python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --until "2026-11-26T14:00:00.959Z"
+```
+
 ## Tests
 
 Run the unit tests:

@@ -171,6 +171,8 @@ def add_event_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--key", required=True, help="ID field or named regex capture")
     parser.add_argument("--time", required=True, help="timestamp field or named regex capture")
     parser.add_argument("--regex", help="text pattern capturing the ID and timestamp")
+    parser.add_argument("--since", metavar="TIME", help="include events at or after this ISO timestamp")
+    parser.add_argument("--until", metavar="TIME", help="include events at or before this ISO timestamp")
     parser.epilog = (
         "Timestamps use ISO 8601. Timestamps without an offset are treated as UTC. "
         "Use --format jsonl for top-level JSON fields, or --regex for text."
@@ -217,6 +219,20 @@ def event_time(value: object) -> datetime | None:
         return None
 
 
+def event_window(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> tuple[datetime, datetime]:
+    since = event_time(args.since) if args.since is not None else datetime.min.replace(tzinfo=timezone.utc)
+    until = event_time(args.until) if args.until is not None else datetime.max.replace(tzinfo=timezone.utc)
+    if since is None:
+        parser.error("invalid --since timestamp: expected ISO 8601")
+    if until is None:
+        parser.error("invalid --until timestamp: expected ISO 8601")
+    if since > until:
+        parser.error("--since must be at or before --until")
+    return since, until
+
+
 def timeline_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py timeline",
@@ -226,6 +242,7 @@ def timeline_log(argv: list[str]) -> int:
     parser.add_argument("--value", required=True, help="ID to match exactly")
     args = parser.parse_args(argv)
     pattern = event_pattern(parser, args)
+    since, until = event_window(parser, args)
 
     events: list[tuple[datetime, str]] = []
     scanned = 0
@@ -247,7 +264,8 @@ def timeline_log(argv: list[str]) -> int:
                 if utc_time is None:
                     skipped += 1
                     continue
-                events.append((utc_time, text))
+                if since <= utc_time <= until:
+                    events.append((utc_time, text))
     except FileNotFoundError:
         print(f"Log file not found: {args.log_file}", file=sys.stderr)
         return 1
@@ -278,6 +296,7 @@ def correlate_log(argv: list[str]) -> int:
                         help="rank IDs by observed span or event count (default: span)")
     args = parser.parse_args(argv)
     pattern = event_pattern(parser, args)
+    since, until = event_window(parser, args)
 
     groups: dict[str, EventStats] = {}
     scanned = 0
@@ -291,6 +310,9 @@ def correlate_log(argv: list[str]) -> int:
                 timestamp = event_time(fields.get(args.time))
                 if key is None or timestamp is None:
                     skipped += 1
+                    continue
+
+                if not since <= timestamp <= until:
                     continue
 
                 stats = groups.get(key)
