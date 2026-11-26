@@ -99,6 +99,8 @@ def add_multiline_option(parser: argparse.ArgumentParser) -> None:
 class SeverityCoverage:
     classified: int = 0
     unclassified: int = 0
+    scanned: int = 0
+    physical_lines: int = 0
 
 
 def normalize_level(value: str, levels: Iterable[str]) -> str:
@@ -119,6 +121,7 @@ def count_levels(
     levels: tuple[str, ...] = LOG_LEVELS,
     coverage: SeverityCoverage | None = None,
     multiline: bool = False,
+    source: str | None = None,
 ) -> dict[str, int]:
     """Count matching lines and optionally write them as they are read."""
     counts = dict.fromkeys(levels, 0)
@@ -127,6 +130,9 @@ def count_levels(
                if alias not in counts and level in counts}
     records = log_records(lines, multiline=multiline)
     for line_number, end_line, header, line in records:
+        if coverage is not None:
+            coverage.scanned += 1
+            coverage.physical_lines = end_line
         if contains not in line:
             continue
         if pattern is not None and pattern.search(line.rstrip("\r\n")) is None:
@@ -160,7 +166,8 @@ def count_levels(
             coverage.classified += 1
         if output is not None and selected_level in (None, level):
             text = line.rstrip("\r\n")
-            print(f"{line_range(line_number, end_line)}: {text}", file=output)
+            prefix = f"{source}:" if source is not None else ""
+            print(f"{prefix}{line_range(line_number, end_line)}: {text}", file=output)
     return counts
 
 
@@ -317,7 +324,8 @@ def group_log(argv: list[str]) -> int:
         description="Rank values extracted from text or JSON Lines logs by frequency.",
         epilog="Use a field from JSON Lines or logfmt, or a named regex capture for text.",
     )
-    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("log_file", nargs="?", help="log file path or - for stdin")
+    add_source_option(parser)
     parser.add_argument(
         "--format", choices=LOG_FORMATS,
         help="input format (default: text)",
@@ -332,51 +340,68 @@ def group_log(argv: list[str]) -> int:
     add_report_arguments(parser)
     args = parser.parse_args(argv)
 
-    apply_log_mapping(parser, args, required=("by",))
-    pattern = input_pattern(parser, args)
-    if pattern is not None and args.by not in pattern.groupindex:
-        parser.error(f"--regex must define a named capture group {args.by!r}")
+    mappings = source_mappings(parser, args, required=("by",))
+    patterns = []
+    for path, mapping in mappings:
+        pattern = input_pattern(parser, mapping)
+        if pattern is not None and mapping.by not in pattern.groupindex:
+            parser.error(f"{path!r}: --regex must define a named capture group {mapping.by!r}")
+        patterns.append(pattern)
 
     strings: Counter[str] = Counter()
     encoded_values: Counter[str] = Counter()
-    scanned = physical_lines = 0
-    multiline = args.multiline and args.format != "jsonl"
-    grouped = 0
-    try:
-        with open_log(args.log_file) as log_file:
-            for _, physical_lines, line, _ in log_records(log_file, multiline=multiline):
-                scanned += 1
-                if pattern is not None:
-                    match = pattern.search(line.rstrip("\r\n"))
-                    value = match.group(args.by) if match else None
-                else:
-                    value = log_field(event_fields(line, None, args.format), args.by)
-                if value is None or value == "" or not isinstance(value, (str, int, float, bool)):
-                    continue
-                if isinstance(value, float) and not isfinite(value):
-                    continue
-                if isinstance(value, str):
-                    strings[value] += 1
-                else:
-                    encoded_values[json.dumps(value)] += 1
-                grouped += 1
-    except (OSError, UnicodeError) as error:
-        return report_input_error(args.log_file, error)
+    scanned = grouped = physical_lines = 0
+    sources = []
+    for (path, mapping), pattern in zip(mappings, patterns):
+        source_scanned = source_grouped = source_lines = 0
+        try:
+            with open_log(path) as log_file:
+                records = log_records(log_file, multiline=args.multiline and mapping.format != "jsonl")
+                for _, source_lines, line, _ in records:
+                    source_scanned += 1
+                    if pattern is not None:
+                        match = pattern.search(line.rstrip("\r\n"))
+                        value = match.group(mapping.by) if match else None
+                    else:
+                        value = log_field(event_fields(line, None, mapping.format), mapping.by)
+                    if value is None or value == "" or not isinstance(value, (str, int, float, bool)):
+                        continue
+                    if isinstance(value, float) and not isfinite(value):
+                        continue
+                    if isinstance(value, str):
+                        strings[value] += 1
+                    else:
+                        encoded_values[json.dumps(value)] += 1
+                    source_grouped += 1
+        except (OSError, UnicodeError) as error:
+            return report_input_error(path, error)
+        scanned += source_scanned
+        grouped += source_grouped
+        physical_lines += source_lines
+        sources.append({
+            "source": source_name(path), "field": mapping.by,
+            "scanned": source_scanned, "grouped": source_grouped,
+            "skipped": source_scanned - source_grouped,
+            **({"physical_lines": source_lines} if args.multiline else {}),
+        })
 
     # Encode each distinct string once, preserving the report's ordering and escaping.
     encoded_strings = ((json.dumps(value), count) for value, count in strings.items())
     values = chain(encoded_values.items(), encoded_strings)
     ranked = sorted(values, key=lambda item: (-item[1], item[0]))
     displayed = ranked[:args.top]
-    coverage = {"scanned": scanned, "grouped": grouped, "skipped": scanned - grouped}
+    coverage: dict[str, object] = {"scanned": scanned, "grouped": grouped, "skipped": scanned - grouped}
+    if args.source:
+        coverage["sources"] = sources
+    fields = sorted({mapping.by for _, mapping in mappings})
     if args.multiline:
         coverage["physical_lines"] = physical_lines
     if args.json:
         print(json.dumps({
             "schema_version": 1,
             "command": "group",
-            "source": source_name(args.log_file),
-            "field": args.by,
+            "source": sources[0]["source"] if len(sources) == 1 else None,
+            "field": fields[0] if len(fields) == 1 else None,
             "total_rows": len(ranked),
             "coverage": coverage,
             "results": [{"value": json.loads(value), "count": count} for value, count in displayed],
@@ -387,10 +412,16 @@ def group_log(argv: list[str]) -> int:
             print(f"{count:5}  {value}")
         if args.top is not None:
             print(f"Showing {len(displayed)} of {len(ranked)} values")
+        if args.source:
+            for source in sources:
+                source_suffix = f", physical lines {source['physical_lines']}" if args.multiline else ""
+                print(f"{source['source']} ({source['field']}): scanned {source['scanned']}, "
+                      f"grouped {source['grouped']}, skipped {source['skipped']}{source_suffix}")
         suffix = f"  Physical lines: {physical_lines}" if args.multiline else ""
         print(f"Scanned: {scanned}  Grouped: {grouped}  Skipped: {scanned - grouped}{suffix}")
     if scanned and not grouped:
-        print(f"No usable values for {args.by!r}. Run inspect to check the field or capture.", file=sys.stderr)
+        names = ", ".join(map(repr, fields))
+        print(f"No usable values for {names}. Run inspect to check the field or capture.", file=sys.stderr)
     elif not scanned:
         print("The input is empty.", file=sys.stderr)
     return report_status(args, empty=not grouped)
@@ -474,7 +505,9 @@ def source_mappings(
     required: tuple[str, ...],
     optional: tuple[str, ...] = (),
 ) -> list[tuple[str, argparse.Namespace]]:
-    fields = ("profile", "format", "regex", "time_format", *required, *optional)
+    fields = ("profile", "format", "regex", *required, *optional)
+    if hasattr(args, "time_format"):
+        fields += ("time_format",)
     if args.source:
         if args.log_file is not None or any(getattr(args, name) is not None for name in fields):
             parser.error("--source replaces the positional file and global mapping options")
@@ -1234,7 +1267,8 @@ def bucket_log(argv: list[str]) -> int:
         description="Count observed events in aligned UTC time buckets.",
         epilog="Text requires --regex. Choose --value with a signature field from --signature or --profile. Omitted bounds use observed timestamps. Partial buckets have no rate.",
     )
-    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("log_file", nargs="?", help="log file path or - for stdin")
+    add_source_option(parser)
     add_mapping_arguments(parser)
     parser.add_argument("--interval", required=True, type=interval_seconds, help="bucket width, e.g. 30s or 5m")
     add_window_arguments(parser, exclusive_until=True)
@@ -1250,25 +1284,27 @@ def bucket_log(argv: list[str]) -> int:
         parser.error("--level cannot be combined with --signature or --value")
     if args.level_field is not None and args.level is None:
         parser.error("--level-field requires --level")
-    apply_log_mapping(
-        parser, args, required=("time",),
-        optional=("level_field",) if args.level is not None else (("signature",) if args.value is not None else ()),
-    )
-
-    if args.level is not None:
-        default_level = "severity" if args.format == "jsonl" else "level"
-        args.signature = args.level_field if args.level_field is not None else default_level
-        args.value = normalize_level(args.level, LOG_LEVELS)
-        args.ignore_case = True
-    if args.value is not None and args.signature is None:
-        parser.error("--value requires a signature field from --signature or --profile")
     if args.signature is not None and args.value is None:
         parser.error("--signature requires --value")
-    pattern = input_pattern(parser, args)
-    if pattern is not None:
-        required_fields = {args.time, args.signature} - {None}
-        if not required_fields <= pattern.groupindex.keys():
-            parser.error("--regex must capture --time and any --signature field")
+    optional = ("level_field",) if args.level is not None else (("signature",) if args.value is not None else ())
+    mappings = source_mappings(parser, args, required=("time",), optional=optional)
+    selected_value = normalize_level(args.level, LOG_LEVELS) if args.level is not None else args.value
+    ignore_case = args.ignore_case or args.level is not None
+    source_specs = []
+    for path, mapping in mappings:
+        signature = getattr(mapping, "signature", None)
+        if args.level is not None:
+            default_level = "severity" if mapping.format == "jsonl" else "level"
+            signature = mapping.level_field if mapping.level_field is not None else default_level
+        if selected_value is not None and signature is None:
+            parser.error(f"{path!r}: --value requires a signature field from --signature or --profile")
+        pattern = input_pattern(parser, mapping)
+        if pattern is not None:
+            required_fields = {mapping.time, signature} - {None}
+            if not required_fields <= pattern.groupindex.keys():
+                parser.error(f"{path!r}: --regex must capture --time and any filter field")
+        source_specs.append((path, mapping, signature, pattern))
+
     since, until, _ = event_window(parser, args, exclusive_until=True)
     start_bound = (since - EPOCH) // MICROSECOND if args.since is not None else None
     end_bound = (until - EPOCH) // MICROSECOND if args.before is not None or args.until is not None else None
@@ -1278,51 +1314,66 @@ def bucket_log(argv: list[str]) -> int:
     if start_bound is not None and end_bound is not None:
         if (end_bound - 1) // width - start_bound // width + 1 > MAX_BUCKETS:
             parser.error(limit_message)
-    if args.ignore_case and args.value is None:
+    if ignore_case and selected_value is None:
         parser.error("--ignore-case requires --value")
-    wanted = args.value.casefold() if args.ignore_case else args.value
+    wanted = selected_value.casefold() if ignore_case else selected_value
 
     first = last = None
     scanned = invalid = outside = filtered = physical_lines = 0
     counts: Counter[int] = Counter()
-    times = RecordTimeReader(source_name(args.log_file), args.time, args.time_format)
-    parse_time = event_time if times.time_format == "iso" else times.parse
-    try:
-        with open_log(args.log_file) as log_file:
-            records = log_records(log_file, multiline=args.multiline and args.format != "jsonl")
-            for _, physical_lines, header, _ in records:
-                scanned += 1
-                fields = event_fields(header.rstrip("\r\n"), pattern, args.format)
-                timestamp = parse_time(log_field(fields, args.time))
-                if timestamp is None:
-                    invalid += 1
-                    continue
-                if timestamp < since or (end_bound is not None and timestamp >= until):
-                    outside += 1
-                    continue
-
-                tick = (timestamp - EPOCH) // MICROSECOND
-                extends_range = first is None or last is None or tick < first or tick > last
-                first = tick if first is None else min(first, tick)
-                last = tick if last is None else max(last, tick)
-                if inferred_bounds and extends_range:
-                    start_tick = start_bound if start_bound is not None else first
-                    end_tick = end_bound - 1 if end_bound is not None else last
-                    if end_tick // width - start_tick // width + 1 > MAX_BUCKETS:
-                        parser.error(limit_message)
-                if args.signature is not None:
-                    value = event_id(log_field(fields, args.signature))
-                    if value is not None and args.level is not None:
-                        value = normalize_level(value, (args.value,))
-                    if value is not None and args.ignore_case:
-                        value = value.casefold()
-                    if value != wanted:
-                        filtered += 1
+    sources = []
+    for path, mapping, signature, pattern in source_specs:
+        source_lines = source_scanned = source_counted = source_invalid = source_outside = source_filtered = 0
+        times = RecordTimeReader(source_name(path), mapping.time, mapping.time_format)
+        parse_time = event_time if times.time_format == "iso" else times.parse
+        try:
+            with open_log(path) as log_file:
+                records = log_records(log_file, multiline=args.multiline and mapping.format != "jsonl")
+                for _, source_lines, header, _ in records:
+                    source_scanned += 1
+                    fields = event_fields(header.rstrip("\r\n"), pattern, mapping.format)
+                    timestamp = parse_time(log_field(fields, mapping.time))
+                    if timestamp is None:
+                        source_invalid += 1
                         continue
-                counts[tick // width] += 1
-    except (OSError, UnicodeError) as error:
-        return report_input_error(args.log_file, error)
-    times.warn_if_unit_suspect()
+                    if timestamp < since or (end_bound is not None and timestamp >= until):
+                        source_outside += 1
+                        continue
+
+                    tick = (timestamp - EPOCH) // MICROSECOND
+                    extends_range = first is None or last is None or tick < first or tick > last
+                    first = tick if first is None else min(first, tick)
+                    last = tick if last is None else max(last, tick)
+                    if inferred_bounds and extends_range:
+                        start_tick = start_bound if start_bound is not None else first
+                        end_tick = end_bound - 1 if end_bound is not None else last
+                        if end_tick // width - start_tick // width + 1 > MAX_BUCKETS:
+                            parser.error(limit_message)
+                    if signature is not None:
+                        value = event_id(log_field(fields, signature))
+                        if value is not None and args.level is not None:
+                            value = normalize_level(value, (selected_value,))
+                        if value is not None and ignore_case:
+                            value = value.casefold()
+                        if value != wanted:
+                            source_filtered += 1
+                            continue
+                    counts[tick // width] += 1
+                    source_counted += 1
+        except (OSError, UnicodeError) as error:
+            return report_input_error(path, error)
+        times.warn_if_unit_suspect()
+        scanned += source_scanned
+        invalid += source_invalid
+        outside += source_outside
+        filtered += source_filtered
+        physical_lines += source_lines
+        sources.append({
+            "source": source_name(path), "signature": signature, "scanned": source_scanned,
+            "counted": source_counted, "invalid_timestamp": source_invalid,
+            "outside_window": source_outside, "filtered": source_filtered,
+            **({"physical_lines": source_lines} if args.multiline else {}),
+        })
 
     start = start_bound if start_bound is not None else first
     end = end_bound if end_bound is not None else (last + 1 if last is not None else None)
@@ -1347,7 +1398,9 @@ def bucket_log(argv: list[str]) -> int:
         except OverflowError:
             parser.error("aligned bucket boundaries fall outside the supported timestamp range")
 
-    coverage = {
+    signatures = {signature for _, _, signature, _ in source_specs}
+    shared_signature = next(iter(signatures)) if len(signatures) == 1 else None
+    coverage: dict[str, object] = {
         "scanned": scanned,
         "counted": counts.total(),
         "invalid_timestamp": invalid,
@@ -1355,34 +1408,39 @@ def bucket_log(argv: list[str]) -> int:
         "filtered": filtered,
         **({"physical_lines": physical_lines} if args.multiline else {}),
     }
+    if args.source:
+        coverage["sources"] = sources
     if not scanned:
         print("The input is empty.", file=sys.stderr)
     elif invalid == scanned:
-        print(f"No usable timestamps in {args.time!r}. Run inspect to find timestamp fields.", file=sys.stderr)
+        time_fields = ", ".join(sorted({repr(mapping.time) for _, mapping in mappings}))
+        print(f"No usable timestamps in {time_fields}. Run inspect to find timestamp fields.", file=sys.stderr)
     elif invalid + outside == scanned:
         print("No usable events in the requested window. Check the time bounds.", file=sys.stderr)
     elif not counts:
-        print(f"No events match {args.signature!r}={args.value!r}. Check the signature field and value.", file=sys.stderr)
+        filter_fields = ", ".join(sorted({repr(signature) for signature in signatures}))
+        print(f"No events match {filter_fields}={selected_value!r}. Check the signature field and value.", file=sys.stderr)
 
     if args.json:
         print(json.dumps({
             "schema_version": 1,
             "command": "bucket",
-            "source": "<stdin>" if args.log_file == "-" else args.log_file,
+            "source": sources[0]["source"] if len(sources) == 1 else None,
             "interval_seconds": args.interval,
-            "signature": args.signature,
-            "value": args.value,
+            "signature": shared_signature,
+            "value": selected_value,
             "level": args.level,
-            "ignore_case": args.ignore_case,
+            "ignore_case": ignore_case,
             "matched": bool(counts),
             "coverage": coverage,
             "buckets": buckets,
         }))
     else:
         title = f"Interval: {args.interval}s"
-        if args.signature is not None:
-            title += f"  Filter: {args.signature}={args.value!r}"
-            if args.ignore_case:
+        if selected_value is not None:
+            field_label = shared_signature or "per-source fields"
+            title += f"  Filter: {field_label}={selected_value!r}"
+            if ignore_case:
                 title += " (case-insensitive)"
         print(title)
         print("START (UTC)                       COUNT  EVENTS/MIN")
@@ -1390,6 +1448,12 @@ def bucket_log(argv: list[str]) -> int:
             rate = bucket["events_per_minute"]
             rate_text = "partial" if rate is None else f"{rate:.3f}"
             print(f'{bucket["start"]:32}  {bucket["count"]:5}  {rate_text}')
+        if args.source:
+            for source in sources:
+                source_suffix = f", physical lines {source['physical_lines']}" if args.multiline else ""
+                print(f"{source['source']}: scanned {source['scanned']}, counted {source['counted']}, "
+                      f"invalid timestamp {source['invalid_timestamp']}, outside {source['outside_window']}, "
+                      f"filtered {source['filtered']}{source_suffix}")
         suffix = f"  Physical lines: {physical_lines}" if args.multiline else ""
         print(
             f"Scanned: {scanned}  Counted: {coverage['counted']}  "
@@ -1658,7 +1722,6 @@ def main() -> int:
     parser.add_argument(
         "log_file",
         nargs="?",
-        default=str(Path(__file__).with_name("app.log")),
         help="log file path or - for stdin (default: app.log beside this script)",
     )
     parser.add_argument(
@@ -1682,6 +1745,7 @@ def main() -> int:
         metavar="PATTERN",
         help="count only lines matching this Python regular expression",
     )
+    add_source_option(parser)
     parser.add_argument("--profile", metavar="FILE", help="JSON log mapping")
     parser.add_argument("--format", choices=LOG_FORMATS)
     parser.add_argument("--level-field", help="severity field (JSONL: severity; logfmt or text profile: level)")
@@ -1693,11 +1757,21 @@ def main() -> int:
         parser.error("--json cannot be combined with --show-lines")
     regex_flag = args.regex
     args.regex = None
-    apply_log_mapping(parser, args, required=(), optional=("level_field",))
-    # Keep the CLI search pattern separate from the profile's field-mapping pattern.
-    level_pattern = compile_pattern(parser, args.regex) if args.format == "text" else None
-    if args.level_field is not None and args.format == "text" and level_pattern is None:
-        parser.error("--level-field requires structured input or a text profile regex")
+    if not args.source and args.log_file is None:
+        args.log_file = str(Path(__file__).with_name("app.log"))
+    mappings = source_mappings(parser, args, required=(), optional=("level_field",))
+    severity_mappings = []
+    for path, mapping in mappings:
+        # The CLI regex searches whole records; a text profile regex maps severity.
+        level_pattern = compile_pattern(parser, mapping.regex) if mapping.format == "text" else None
+        if mapping.level_field is not None and mapping.format == "text" and level_pattern is None:
+            parser.error("--level-field requires structured input or a text profile regex")
+        level_field = mapping.level_field
+        if level_field is None and (mapping.format != "text" or level_pattern is not None):
+            level_field = "severity" if mapping.format == "jsonl" else "level"
+        if level_pattern is not None and level_field not in level_pattern.groupindex:
+            parser.error(f"profile regex must define a named severity capture {level_field!r}")
+        severity_mappings.append((path, mapping, level_field, level_pattern))
     vocabulary = tuple(dict.fromkeys(level.upper() for level in args.levels)) if args.levels else LOG_LEVELS
     if any(re.fullmatch(r"[A-Z][A-Z0-9_-]*", level) is None for level in vocabulary):
         parser.error("--levels expects names like INFO or CRITICAL")
@@ -1705,55 +1779,84 @@ def main() -> int:
         args.level = normalize_level(args.level, vocabulary)
         if args.level not in vocabulary:
             parser.error(f"argument --level: invalid choice: {args.level!r} (choose from {', '.join(vocabulary)})")
-    coverage = SeverityCoverage()
-    level_field = None
-    if args.format != "text" or level_pattern is not None:
-        default_level = "severity" if args.format == "jsonl" else "level"
-        level_field = args.level_field if args.level_field is not None else default_level
-    if level_pattern is not None and level_field not in level_pattern.groupindex:
-        parser.error(f"profile regex must define a named severity capture {level_field!r}")
     pattern = compile_pattern(parser, regex_flag)
-    log_path = args.log_file
-
-    try:
-        with open_log(log_path) as log_file:
-            counts = count_levels(
-                log_file,
-                contains=args.contains,
-                pattern=pattern,
-                output=sys.stdout if args.show_lines else None,
-                selected_level=args.level,
-                level_field=level_field,
-                level_pattern=level_pattern,
-                input_format=args.format,
-                levels=vocabulary,
-                coverage=coverage,
-                multiline=args.multiline and args.format != "jsonl",
-            )
-    except (OSError, UnicodeError) as error:
-        return report_input_error(log_path, error)
+    counts = dict.fromkeys(vocabulary, 0)
+    coverage = SeverityCoverage()
+    sources = []
+    for path, mapping, level_field, level_pattern in severity_mappings:
+        source_coverage = SeverityCoverage()
+        try:
+            with open_log(path) as log_file:
+                source_counts = count_levels(
+                    log_file,
+                    contains=args.contains,
+                    pattern=pattern,
+                    output=sys.stdout if args.show_lines else None,
+                    selected_level=args.level,
+                    level_field=level_field,
+                    level_pattern=level_pattern,
+                    input_format=mapping.format,
+                    levels=vocabulary,
+                    coverage=source_coverage,
+                    multiline=args.multiline and mapping.format != "jsonl",
+                    source=source_name(path) if args.source else None,
+                )
+        except (OSError, UnicodeError) as error:
+            return report_input_error(path, error)
+        for level, count in source_counts.items():
+            counts[level] += count
+        coverage.classified += source_coverage.classified
+        coverage.unclassified += source_coverage.unclassified
+        coverage.scanned += source_coverage.scanned
+        coverage.physical_lines += source_coverage.physical_lines
+        sources.append({
+            "source": source_name(path), "scanned": source_coverage.scanned,
+            "classified": source_coverage.classified, "unclassified": source_coverage.unclassified,
+            "filtered": source_coverage.scanned - source_coverage.classified - source_coverage.unclassified,
+            **({"physical_lines": source_coverage.physical_lines} if args.multiline else {}),
+        })
 
     levels = (args.level,) if args.level else vocabulary
+    report_coverage: dict[str, object] = {
+        "classified": coverage.classified, "unclassified": coverage.unclassified,
+    }
+    if args.source:
+        report_coverage.update({
+            "scanned": coverage.scanned,
+            "filtered": coverage.scanned - coverage.classified - coverage.unclassified,
+            "sources": sources,
+        })
+        if args.multiline:
+            report_coverage["physical_lines"] = coverage.physical_lines
     if args.json:
         print(json.dumps({
             "schema_version": 1,
             "command": "summary",
-            "source": "<stdin>" if log_path == "-" else log_path,
+            "source": sources[0]["source"] if len(sources) == 1 else None,
             "counts": {level: counts[level] for level in levels},
-            "coverage": {"classified": coverage.classified, "unclassified": coverage.unclassified},
+            "coverage": report_coverage,
         }))
     else:
         for level in levels:
             print(f"{level}: {counts[level]}")
+        if args.source:
+            for source in sources:
+                source_suffix = f", physical lines {source['physical_lines']}" if args.multiline else ""
+                print(f"{source['source']}: scanned {source['scanned']}, classified {source['classified']}, "
+                      f"unclassified {source['unclassified']}, filtered {source['filtered']}{source_suffix}")
     if not coverage.classified and coverage.unclassified:
         print("No severity levels recognized. Run inspect to check the input format and fields.", file=sys.stderr)
-        if args.format == "text" and Path(log_path).suffix.lower() in {".jsonl", ".ndjson"}:
+        path, mapping = mappings[0]
+        if not args.source and mapping.format == "text" and Path(path).suffix.lower() in {".jsonl", ".ndjson"}:
             print("For JSON Lines, try --format jsonl and, if needed, --level-field.", file=sys.stderr)
     elif not coverage.classified:
         print("No lines to classify. Check the input and text filters.", file=sys.stderr)
     elif args.level and not counts[args.level]:
         print(f"No {args.level} entries matched.", file=sys.stderr)
-    if args.format != "text" or level_pattern is not None or args.multiline or coverage.unclassified:
+    if args.source or args.multiline or coverage.unclassified or any(
+        mapping.format != "text" or level_pattern is not None
+        for _, mapping, _, level_pattern in severity_mappings
+    ):
         print(
             f"Classified: {coverage.classified}  Unclassified: {coverage.unclassified}",
             file=sys.stderr,

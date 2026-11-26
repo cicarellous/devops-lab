@@ -1,0 +1,7 @@
+{
+  "format": "jsonl",
+  "time": "timestamp",
+  "level_field": "severity",
+  "by": "code",
+  "signature": "code"
+}

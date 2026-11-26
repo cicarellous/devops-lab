@@ -1,0 +1,7 @@
+{
+  "format": "logfmt",
+  "time": "timestamp",
+  "level_field": "level",
+  "by": "code",
+  "signature": "code"
+}

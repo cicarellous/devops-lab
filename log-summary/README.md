@@ -253,6 +253,20 @@ line. Correlate lists the sources that observed each ID. IDs are matched by
 value across files. Each input record counts once per occurrence, so supplying
 overlapping copies can inflate event counts.
 
+For combined totals, severity summary uses each profile's `level_field`,
+`group` uses `by`, and `bucket` aligns every source on one UTC time axis.
+When you filter a bucket with `--value`, each profile supplies its own
+`signature` field. Use `--level` for a severity filter instead.
+
+```powershell
+python log_summary.py --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --multiline
+python log_summary.py group --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --multiline
+python log_summary.py bucket --source app.jsonl app-jsonl-profile.json --source stacktrace-example.txt stacktrace-profile.json --interval 1m --value E1042 --multiline --since 2026-11-26T14:00Z --before 2026-11-26T14:02Z
+```
+
+Reports show each source's contribution. Summary `--show-lines` includes the
+source and line range when you use `--source`.
+
 ## Limit or export reports
 
 Use `--top N` with `group`, `correlate`, or `compare` to show the first N

@@ -1351,5 +1351,77 @@ class MultilineParityTests(unittest.TestCase):
             self.assertIn("record starting at line 1 exceeds 1 MiB", result.stderr)
 
 
+class MultiSourceTotalsTests(unittest.TestCase):
+    sources = (
+        "--source", "app.jsonl", "app-jsonl-profile.json",
+        "--source", "stacktrace-example.txt", "stacktrace-profile.json",
+    )
+
+    def run_cli(self, *args, check=True):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, capture_output=True, text=True, check=check,
+        )
+
+    def test_summary_combines_severity_and_preserves_source_lines(self):
+        result = self.run_cli(*self.sources, "--multiline", "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["counts"], {"INFO": 13, "WARNING": 3, "ERROR": 7})
+        coverage = report["coverage"]
+        self.assertEqual((coverage["scanned"], coverage["classified"], coverage["physical_lines"]),
+                         (23, 23, 26))
+        self.assertEqual([source["classified"] for source in coverage["sources"]], [20, 3])
+        text = self.run_cli(*self.sources, "--multiline", "--regex", "TimeoutError", "--show-lines")
+        self.assertIn("stacktrace-example.txt:1-3", text.stdout)
+        self.assertIn("ERROR: 1", text.stdout)
+        self.assertIn("app.jsonl: scanned 20, classified 0, unclassified 0, filtered 20", text.stdout)
+
+    def test_group_merges_values_and_keeps_full_coverage_with_top(self):
+        result = self.run_cli("group", *self.sources, "--multiline", "--top", "1", "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["results"], [{"value": "E1042", "count": 6}])
+        self.assertEqual(report["total_rows"], 4)
+        coverage = report["coverage"]
+        self.assertEqual((coverage["scanned"], coverage["grouped"], coverage["skipped"]), (23, 11, 12))
+        self.assertEqual([source["grouped"] for source in coverage["sources"]], [8, 3])
+
+    def test_bucket_aligns_sources_to_one_window_and_keeps_contributions(self):
+        result = self.run_cli(
+            "bucket", *self.sources, "--interval", "1m", "--value", "E1042", "--multiline",
+            "--since", "2026-11-26T14:00Z", "--before", "2026-11-26T14:02Z", "--json",
+        )
+        report = json.loads(result.stdout)
+        self.assertEqual([bucket["count"] for bucket in report["buckets"]], [4, 2])
+        self.assertEqual([bucket["events_per_minute"] for bucket in report["buckets"]], [4, 2])
+        coverage = report["coverage"]
+        self.assertEqual((coverage["scanned"], coverage["counted"], coverage["filtered"]), (23, 6, 17))
+        self.assertEqual([source["counted"] for source in coverage["sources"]], [4, 2])
+
+    def test_per_source_mappings_can_select_different_fields(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = root / "first.jsonl"
+            secondary = root / "second.log"
+            primary.write_text('{"ts":"2026-11-26T14:00:01Z","error":"E1"}\n', encoding="utf-8")
+            secondary.write_text("2026-11-26T14:00:02Z ERROR code=E1\n", encoding="utf-8")
+            first = root / "first.json"
+            second = root / "second.json"
+            first.write_text('{"format":"jsonl","time":"ts","by":"error","signature":"error"}',
+                             encoding="utf-8")
+            second.write_text('{"format":"logfmt","time":"timestamp","by":"code","signature":"code"}',
+                              encoding="utf-8")
+            specs = ("--source", str(primary), str(first), "--source", str(secondary), str(second))
+            result = self.run_cli("group", *specs, "--json")
+            report = json.loads(result.stdout)
+            self.assertEqual(report["results"], [{"value": "E1", "count": 2}])
+            self.assertIsNone(report["field"])
+            self.assertEqual([source["field"] for source in report["coverage"]["sources"]], ["error", "code"])
+            result = self.run_cli("bucket", *specs, "--interval", "1m", "--value", "E1", "--json")
+            report = json.loads(result.stdout)
+            self.assertEqual(report["coverage"]["counted"], 2)
+            self.assertIsNone(report["signature"])
+            self.assertEqual([source["signature"] for source in report["coverage"]["sources"]], ["error", "code"])
+
+
 if __name__ == "__main__":
     unittest.main()
