@@ -7,7 +7,7 @@ import sys
 from collections import Counter, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 from glob import glob
@@ -19,6 +19,7 @@ from random import Random
 from statistics import median
 from tempfile import SpooledTemporaryFile
 from typing import Iterable, Iterator, NotRequired, TextIO, TypedDict
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 VERSION = "0.1.0"
@@ -507,6 +508,44 @@ def apply_log_mapping(
         parser.error(f"missing {', '.join(missing)}; supply flags or a --profile")
 
 
+def display_timezone(value: str) -> tzinfo:
+    if value.upper() == "UTC":
+        return timezone.utc
+    offset = re.fullmatch(r"(?:UTC)?([+-])([01][0-9]|2[0-3]):([0-5][0-9])", value, re.IGNORECASE)
+    if offset is not None:
+        minutes = int(offset[2]) * 60 + int(offset[3])
+        return timezone(timedelta(minutes=minutes if offset[1] == "+" else -minutes))
+    if value.startswith(("+", "-")) or re.match(r"UTC[+-]", value, re.IGNORECASE):
+        raise argparse.ArgumentTypeError("use UTC or an offset from -23:59 to +23:59, such as UTC-03:00")
+    try:
+        return ZoneInfo(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("use UTC, a fixed offset, or an IANA name such as America/Sao_Paulo") from None
+    except ZoneInfoNotFoundError:
+        raise argparse.ArgumentTypeError(
+            f"unknown or unavailable timezone {value!r}. Check the IANA name or install tzdata"
+        ) from None
+
+
+def add_display_timezone(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--display-timezone", type=display_timezone, metavar="ZONE",
+        help="text output timezone (default UTC). Use an IANA name or a fixed offset such as UTC-03:00",
+    )
+
+
+def display_timestamp(
+    timestamp: datetime, zone: tzinfo | None, *, sep: str = "T", timespec: str = "auto",
+) -> str:
+    if zone is not None:
+        try:
+            timestamp = timestamp.astimezone(zone)
+        except OverflowError:
+            # The original offset remains visible when conversion exceeds datetime's range.
+            pass
+    return timestamp.isoformat(sep=sep, timespec=timespec)
+
+
 def add_window_arguments(
     parser: argparse.ArgumentParser, *, exclusive_until: bool = False
 ) -> None:
@@ -795,6 +834,7 @@ def timeline_log(argv: list[str]) -> int:
     add_source_option(parser)
     parser.add_argument("--value", required=True, help="ID to match exactly")
     add_multiline_option(parser)
+    add_display_timezone(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     since, until, exclusive_end = event_window(parser, args)
@@ -874,7 +914,7 @@ def timeline_log(argv: list[str]) -> int:
         }))
     else:
         for event in events:
-            print(f"{event.timestamp.isoformat(sep=' ', timespec='microseconds')}  "
+            print(f"{display_timestamp(event.timestamp, args.display_timezone, sep=' ', timespec='microseconds')}  "
                   f"{event.source}:{line_range(event.line, event.end_line)}  {event.text}")
         if len(sources) > 1:
             for source in sources:
@@ -913,6 +953,7 @@ def correlate_log(argv: list[str]) -> int:
                         help="rank IDs by observed span or event count (default: span)")
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     add_multiline_option(parser)
+    add_display_timezone(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     mappings = source_mappings(parser, args, required=("key", "time"))
@@ -1003,7 +1044,8 @@ def correlate_log(argv: list[str]) -> int:
             ],
         }))
     else:
-        heading = "EVENTS  OBSERVED SPAN   FIRST (UTC)                       LAST (UTC)                        ID"
+        zone_label = str(args.display_timezone or timezone.utc)
+        heading = f"EVENTS  OBSERVED SPAN   FIRST ({zone_label})                       LAST ({zone_label})                        ID"
         print(heading + ("  SOURCES" if len(mappings) > 1 else ""))
         for key in ranked[:args.top]:
             stats = groups[key]
@@ -1011,8 +1053,8 @@ def correlate_log(argv: list[str]) -> int:
             source_list = json.dumps(sorted(sources_by_id[key])) if len(mappings) > 1 else ""
             print(
                 f"{stats.count:6}  {str(span):14}  "
-                f"{stats.first.isoformat(timespec='microseconds')}  "
-                f"{stats.last.isoformat(timespec='microseconds')}  {json.dumps(key)}"
+                f"{display_timestamp(stats.first, args.display_timezone, timespec='microseconds')}  "
+                f"{display_timestamp(stats.last, args.display_timezone, timespec='microseconds')}  {json.dumps(key)}"
                 + (f"  {source_list}" if source_list else "")
             )
         if args.top is not None:
@@ -1113,6 +1155,7 @@ def compare_log(argv: list[str]) -> int:
         "--min-increase-percent", type=positive_threshold, metavar="N",
         help="minimum percentage increase for --fail-on increase (new signatures use only the rate threshold)",
     )
+    add_display_timezone(parser)
     add_report_arguments(parser, gate="increase")
     args = parser.parse_args(argv)
     gate_enabled = args.fail_on == "increase"
@@ -1304,7 +1347,12 @@ def compare_log(argv: list[str]) -> int:
         if args.top is not None:
             print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} signatures")
         for name, window in (("Baseline", baseline), ("Incident", incident)):
-            print(f"{name}: {window.used}/{window.scanned} records used")
+            bounds = ""
+            if args.display_timezone is not None:
+                start_text = display_timestamp(window.start, args.display_timezone)
+                end_text = display_timestamp(window.end, args.display_timezone)
+                bounds = f" [{start_text}, {end_text})"
+            print(f"{name}{bounds}: {window.used}/{window.scanned} records used")
         if len(coverage) > 1 or args.multiline:
             for item in coverage:
                 source_suffix = f", physical lines {item['physical_lines']}" if args.multiline else ""
@@ -1419,6 +1467,7 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("--value", help="exact value to count in the signature field")
     parser.add_argument("--ignore-case", action="store_true", help="match signature values case-insensitively")
     add_multiline_option(parser)
+    add_display_timezone(parser)
     add_report_arguments(parser, gate="spike")
     args = parser.parse_args(argv)
     example_limit = args.spike_examples or 0
@@ -1635,13 +1684,17 @@ def bucket_log(argv: list[str]) -> int:
             if ignore_case:
                 title += " (case-insensitive)"
         print(title)
-        print("START (UTC)                       COUNT  EVENTS/MIN")
+        zone = args.display_timezone
+        print(f"START ({zone or timezone.utc})                       COUNT  EVENTS/MIN")
         for bucket in buckets:
             rate = bucket["events_per_minute"]
             rate_text = "partial" if rate is None else f"{rate:.3f}"
             baseline = bucket.get("baseline_count")
             spike_label = f"  SPIKE (baseline {baseline:g})" if bucket.get("spike") and baseline is not None else ""
-            print(f'{bucket["start"]:32}  {bucket["count"]:5}  {rate_text}{spike_label}')
+            start_text = bucket["start"]
+            if zone is not None:
+                start_text = display_timestamp(datetime.fromisoformat(start_text), zone)
+            print(f'{start_text:32}  {bucket["count"]:5}  {rate_text}{spike_label}')
             for example in bucket.get("examples", []):
                 location = line_range(example["line"], example["end_line"])
                 event_key = example["id"]

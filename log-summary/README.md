@@ -308,6 +308,22 @@ Summary shows the severity counts for each source. `--level` limits the
 displayed counts, and coverage still includes all classified severities.
 With `--source`, summary `--show-lines` includes the source and line range.
 
+## Display timestamps in another timezone
+
+Use `--display-timezone` with `timeline`, `correlate`, `compare`, or
+`bucket` to show local clock times in text reports.
+
+```powershell
+python log_summary.py timeline app.jsonl --profile app-jsonl-profile.json --key request_id --value r-100 --display-timezone UTC-03:00
+```
+
+Use a fixed offset such as `UTC-03:00` or an IANA name such as
+`America/Sao_Paulo`. Named zones follow their historical offset and
+daylight-saving rules. If Python cannot find named-zone data, install
+`tzdata` in your environment or use a fixed offset. JSON stays in UTC,
+filters without an offset are interpreted as UTC, and buckets stay aligned
+to UTC.
+
 ## Limit or export reports
 
 Use `--top N` with `group`, `correlate`, or `compare` to show the first N

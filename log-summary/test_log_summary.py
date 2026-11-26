@@ -1341,6 +1341,39 @@ class ReportCorrectnessTests(unittest.TestCase):
         self.assertIn(b"Cannot read log", invalid.stderr)
 
 
+class DisplayTimezoneTests(unittest.TestCase):
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, text=True, capture_output=True,
+        )
+
+    def test_fixed_offset_applies_to_text_only_on_timed_commands(self):
+        profile = ("app.jsonl", "--profile", "app-jsonl-profile.json")
+        zone = ("--display-timezone", "UTC-03:00")
+        for command, flags in (
+            ("timeline", ("--key", "request_id", "--value", "r-100", "--since", "2026-11-26T14:00:00Z")),
+            ("correlate", ("--key", "request_id")),
+            ("bucket", ("--interval", "1m")),
+            ("compare", ("--baseline", "2026-11-26T14:00:00Z", "2026-11-26T14:00:01Z",
+                         "--incident", "2026-11-26T14:00:01Z", "2026-11-26T14:01:00Z")),
+        ):
+            with self.subTest(command=command):
+                args = (command, *profile, *flags)
+                result = self.run_cli(*args, *zone)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertRegex(result.stdout, r"2026-11-26[T ]11:[0-9:.]+-03:00")
+                default_json = self.run_cli(*args, "--json")
+                shifted_json = self.run_cli(*args, *zone, "--json")
+                self.assertEqual(shifted_json.returncode, 0, shifted_json.stderr)
+                self.assertEqual(shifted_json.stdout, default_json.stdout)
+
+    def test_invalid_offset_is_a_usage_error(self):
+        result = self.run_cli("timeline", "--value", "r-100", "--display-timezone", "UTC+24:00")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("use UTC or an offset", result.stderr)
+
+
 class EpochTimestampTests(unittest.TestCase):
     def run_cli(self, *args, data=None):
         return subprocess.run(
