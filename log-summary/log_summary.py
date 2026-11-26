@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from itertools import chain
 from pathlib import Path
-from typing import ContextManager, Iterable, TextIO
+from typing import ContextManager, Iterable, TextIO, TypedDict
 
 
 LOG_LEVELS = ("INFO", "WARNING", "ERROR")
@@ -19,6 +19,12 @@ TIMESTAMP_PREFIX = re.compile(
 )
 
 
+@dataclass
+class SeverityCoverage:
+    classified: int = 0
+    unclassified: int = 0
+
+
 def count_levels(
     lines: Iterable[str],
     *,
@@ -26,6 +32,8 @@ def count_levels(
     pattern: re.Pattern[str] | None = None,
     output: TextIO | None = None,
     selected_level: str | None = None,
+    level_field: str | None = None,
+    coverage: SeverityCoverage | None = None,
 ) -> dict[str, int]:
     """Count matching lines and optionally write them as they are read."""
     counts = dict.fromkeys(LOG_LEVELS, 0)
@@ -34,15 +42,29 @@ def count_levels(
             continue
         if pattern is not None and pattern.search(line.rstrip("\r\n")) is None:
             continue
-        timestamp = TIMESTAMP_PREFIX.match(line)
-        level_start = timestamp.end() if timestamp else 0
-        for level in LOG_LEVELS:
-            if line.startswith(level, level_start):
-                counts[level] += 1
-                if output is not None and selected_level in (None, level):
-                    text = line.rstrip("\r\n")
-                    print(f"{line_number}: {text}", file=output)
-                break
+        if level_field is None:
+            timestamp = TIMESTAMP_PREFIX.match(line)
+            level_start = timestamp.end() if timestamp else 0
+            level = None
+            for name in LOG_LEVELS:
+                if line.startswith(name, level_start):
+                    level = name
+                    break
+        else:
+            value = event_fields(line, None).get(level_field)
+            level = value.strip().upper() if isinstance(value, str) else None
+
+        if level is None or level not in counts:
+            if coverage is not None:
+                coverage.unclassified += 1
+            continue
+
+        counts[level] += 1
+        if coverage is not None:
+            coverage.classified += 1
+        if output is not None and selected_level in (None, level):
+            text = line.rstrip("\r\n")
+            print(f"{line_number}: {text}", file=output)
     return counts
 
 
@@ -509,6 +531,140 @@ def compare_log(argv: list[str]) -> int:
     return 0
 
 
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+MICROSECOND = timedelta(microseconds=1)
+MAX_BUCKETS = 10_000
+
+
+class TimeBucket(TypedDict):
+    start: str
+    end: str
+    count: int
+    events_per_minute: float | None
+    partial: bool
+
+
+def interval_seconds(value: str) -> int:
+    match = re.fullmatch(r"([0-9]{1,9})([smhd])", value)
+    if match is None or int(match[1]) == 0:
+        raise argparse.ArgumentTypeError("use a positive interval such as 30s, 5m, 1h, or 1d")
+    return int(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match[2]]
+
+
+def bucket_log(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="log_summary.py bucket",
+        description="Count observed events in aligned UTC time buckets.",
+        epilog="Use --signature and --value together. Partial buckets have no rate.",
+    )
+    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
+    parser.add_argument("--regex", help="named captures for text input")
+    parser.add_argument("--time", required=True, help="timestamp field")
+    parser.add_argument("--interval", required=True, type=interval_seconds, help="bucket width, e.g. 30s or 5m")
+    parser.add_argument("--since", help="inclusive start of the report (ISO 8601)")
+    parser.add_argument("--until", help="exclusive end of the report (ISO 8601)")
+    parser.add_argument("--signature", help="field used to select events")
+    parser.add_argument("--value", help="exact value to count in the signature field")
+    parser.add_argument("--json", action="store_true", help="emit versioned JSON")
+    args = parser.parse_args(argv)
+
+    if (args.signature is None) != (args.value is None):
+        parser.error("--signature and --value must be used together")
+    pattern = input_pattern(parser, args)
+    if pattern is not None:
+        required_fields = {args.time, args.signature} - {None}
+        if not required_fields <= pattern.groupindex.keys():
+            parser.error("--regex must capture --time and any --signature field")
+    since, until = event_window(parser, args)
+    if since >= until:
+        parser.error("--since must be before --until")
+    start_bound = (since - EPOCH) // MICROSECOND if args.since is not None else None
+    end_bound = (until - EPOCH) // MICROSECOND if args.until is not None else None
+    width = args.interval * 1_000_000
+
+    first = last = None
+    scanned = invalid = outside = filtered = 0
+    counts: Counter[int] = Counter()
+    try:
+        with open_log(args.log_file) as log_file:
+            for line in log_file:
+                scanned += 1
+                fields = event_fields(line.rstrip("\r\n"), pattern)
+                timestamp = event_time(fields.get(args.time))
+                if timestamp is None:
+                    invalid += 1
+                    continue
+                if timestamp < since or (end_bound is not None and timestamp >= until):
+                    outside += 1
+                    continue
+
+                tick = (timestamp - EPOCH) // MICROSECOND
+                first = tick if first is None else min(first, tick)
+                last = tick if last is None else max(last, tick)
+                if args.signature is not None and event_id(fields.get(args.signature)) != args.value:
+                    filtered += 1
+                    continue
+                counts[tick // width] += 1
+    except FileNotFoundError:
+        print(f"Log file not found: {args.log_file}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"Cannot read log: {error}", file=sys.stderr)
+        return 1
+
+    start = start_bound if start_bound is not None else first
+    end = end_bound if end_bound is not None else (last + 1 if last is not None else None)
+    buckets: list[TimeBucket] = []
+    if start is not None and end is not None:
+        first_bucket, last_bucket = start // width, (end - 1) // width
+        if last_bucket - first_bucket + 1 > MAX_BUCKETS:
+            parser.error(f"report exceeds {MAX_BUCKETS} buckets; narrow the window or use a larger interval")
+        try:
+            for index in range(first_bucket, last_bucket + 1):
+                bucket_start = index * width
+                bucket_end = bucket_start + width
+                partial = bucket_start < start or bucket_end > end
+                count = counts[index]
+                buckets.append({
+                    "start": (EPOCH + timedelta(microseconds=bucket_start)).isoformat(),
+                    "end": (EPOCH + timedelta(microseconds=bucket_end)).isoformat(),
+                    "count": count,
+                    "events_per_minute": None if partial else count * 60 / args.interval,
+                    "partial": partial,
+                })
+        except OverflowError:
+            parser.error("aligned bucket boundaries fall outside the supported timestamp range")
+
+    coverage = {
+        "scanned": scanned,
+        "counted": counts.total(),
+        "invalid_timestamp": invalid,
+        "outside_window": outside,
+        "filtered": filtered,
+    }
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "interval_seconds": args.interval,
+            "signature": args.signature,
+            "value": args.value,
+            "coverage": coverage,
+            "buckets": buckets,
+        }))
+    else:
+        print("START (UTC)                       COUNT  EVENTS/MIN")
+        for bucket in buckets:
+            rate = bucket["events_per_minute"]
+            rate_text = "partial" if rate is None else f"{rate:.3f}"
+            print(f'{bucket["start"]:32}  {bucket["count"]:5}  {rate_text}')
+        print(
+            f"Scanned: {scanned}  Counted: {coverage['counted']}  "
+            f"Invalid timestamp: {invalid}  Outside window: {outside}  Filtered: {filtered}"
+        )
+    return 0
+
+
 def main() -> int:
     if sys.argv[1:2] == ["search"]:
         return search_log(sys.argv[2:])
@@ -520,9 +676,11 @@ def main() -> int:
         return correlate_log(sys.argv[2:])
     if sys.argv[1:2] == ["compare"]:
         return compare_log(sys.argv[2:])
+    if sys.argv[1:2] == ["bucket"]:
+        return bucket_log(sys.argv[2:])
 
     parser = argparse.ArgumentParser(
-        description="Count INFO, WARNING, and ERROR entries, with optional ISO timestamps.",
+        description="Count INFO, WARNING, and ERROR entries in text or JSON Lines.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Commands (add -h after a command for its options):\n"
@@ -530,7 +688,8 @@ def main() -> int:
             "  group       Rank extracted values by frequency\n"
             "  timeline    Reconstruct events for one ID\n"
             "  correlate   Rank IDs by event count or observed span\n"
-            "  compare     Compare incident and baseline event rates\n\n"
+            "  compare     Compare incident and baseline event rates\n"
+            "  bucket      Show observed event rates over time\n\n"
             "Examples:\n"
             "  python log_summary.py                 Count levels in app.log\n"
             "  python log_summary.py app.log --level ERROR\n"
@@ -571,7 +730,15 @@ def main() -> int:
         metavar="PATTERN",
         help="count only lines matching this Python regular expression",
     )
+    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
+    parser.add_argument("--level-field", help="JSONL severity field (default: severity)")
     args = parser.parse_args()
+    if args.level_field is not None and args.format != "jsonl":
+        parser.error("--level-field requires --format jsonl")
+    coverage = SeverityCoverage()
+    level_field = None
+    if args.format == "jsonl":
+        level_field = args.level_field if args.level_field is not None else "severity"
     pattern = compile_pattern(parser, args.regex)
     log_path = args.log_file
 
@@ -583,6 +750,8 @@ def main() -> int:
                 pattern=pattern,
                 output=sys.stdout if args.show_lines else None,
                 selected_level=args.level,
+                level_field=level_field,
+                coverage=coverage,
             )
     except FileNotFoundError:
         print(f"Log file not found: {log_path}", file=sys.stderr)
@@ -594,6 +763,11 @@ def main() -> int:
     levels = (args.level,) if args.level else LOG_LEVELS
     for level in levels:
         print(f"{level}: {counts[level]}")
+    if args.format == "jsonl" or coverage.unclassified:
+        print(
+            f"Classified: {coverage.classified}  Unclassified: {coverage.unclassified}",
+            file=sys.stderr,
+        )
     return 0
 
 

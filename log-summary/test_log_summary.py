@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import unittest
@@ -365,6 +366,79 @@ class CompareTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
+
+
+class StructuredSummaryTests(unittest.TestCase):
+    def test_jsonl_maps_configurable_severity_and_reports_unclassified(self):
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "-", "--format", "jsonl",
+             "--level-field", "priority", "--level", "ERROR", "--show-lines"],
+            cwd=Path(__file__).resolve().parent,
+            input='{"priority":"info"}\ninvalid\n{"priority":" error "}\n{"priority":"DEBUG"}\n{}\n',
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout.splitlines(), ['3: {"priority":" error "}', "ERROR: 1"])
+        self.assertEqual(result.stderr.strip(), "Classified: 2  Unclassified: 3")
+
+    def test_text_summary_reports_unclassified_records(self):
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "-"], cwd=Path(__file__).resolve().parent,
+            input='{"severity":"ERROR"}\n', capture_output=True, text=True, check=True,
+        )
+        self.assertIn("ERROR: 0", result.stdout)
+        self.assertEqual(result.stderr.strip(), "Classified: 0  Unclassified: 1")
+
+
+class BucketTests(unittest.TestCase):
+    def run_bucket(self, log_file, *options, input_text=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", "bucket", log_file, "--time", "ts",
+             "--interval", "30s", "--json", *options],
+            cwd=Path(__file__).resolve().parent, input=input_text,
+            capture_output=True, text=True, check=True,
+        )
+
+    def test_reveals_timeout_cluster_and_flat_warnings(self):
+        for signature, expected in [
+            ("TIMEOUT", [1, 1, 30, 30, 20, 0]),
+            ("QUEUE_WARNING", [1, 1, 1, 1, 1, 1]),
+        ]:
+            with self.subTest(signature=signature):
+                result = self.run_bucket(
+                    "incident.jsonl", "--format", "jsonl", "--signature", "code",
+                    "--value", signature, "--since", "2026-11-26T14:00Z",
+                    "--until", "2026-11-26T14:03Z",
+                )
+                report = json.loads(result.stdout)
+                self.assertEqual(report["schema_version"], 1)
+                self.assertEqual([bucket["count"] for bucket in report["buckets"]], expected)
+                self.assertEqual(
+                    [bucket["events_per_minute"] for bucket in report["buckets"]],
+                    [2 * n for n in expected],
+                )
+                coverage = report["coverage"]
+                self.assertEqual(coverage["invalid_timestamp"], 1)
+                self.assertEqual(coverage["outside_window"], 1)
+                self.assertEqual(coverage["counted"], sum(expected))
+                self.assertEqual(
+                    coverage["scanned"],
+                    sum(value for name, value in coverage.items() if name != "scanned"),
+                )
+
+    def test_text_and_jsonl_match_with_reordered_input_and_partial_edges(self):
+        text = self.run_bucket(
+            "-", "--regex", r"(?P<ts>\S+)",
+            input_text="2026-11-26T14:01:35Z\n2026-11-26T14:00:05Z\n",
+        )
+        structured = self.run_bucket(
+            "-", "--format", "jsonl",
+            input_text='{"ts":"2026-11-26T09:00:05-05:00"}\n{"ts":"2026-11-26T14:01:35Z"}\n',
+        )
+        self.assertEqual(text.stdout, structured.stdout)
+        rows = json.loads(text.stdout)["buckets"]
+        self.assertEqual([row["count"] for row in rows], [1, 0, 0, 1])
+        self.assertEqual([row["partial"] for row in rows], [True, False, False, True])
+        self.assertEqual([row["events_per_minute"] for row in rows], [None, 0, 0, None])
 
 
 if __name__ == "__main__":
