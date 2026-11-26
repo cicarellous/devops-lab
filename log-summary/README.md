@@ -6,6 +6,7 @@ and observed spans across IDs. It reads files or standard input.
 
 | Task | Command |
 | --- | --- |
+| Discover a log's format and fields | `python log_summary.py inspect -h` |
 | Count entries by severity | `python log_summary.py [FILE]` |
 | Find matching lines and nearby context | `python log_summary.py search -h` |
 | Rank values by frequency | `python log_summary.py group -h` |
@@ -28,6 +29,21 @@ Run the remaining examples from `log-summary/`. The included `app.log` and
 `app.jsonl` represent the same 20 synthetic events, with interleaved requests,
 retries, and recurring error codes. Pass a UTF-8 file path or use `-` to read
 from standard input.
+
+## Inspect an unfamiliar log
+
+```powershell
+python log_summary.py inspect incident.jsonl
+```
+
+Inspect samples the first 100 lines by default. It shows top-level field
+types, presence, and timestamp candidates. On `incident.jsonl`, look for
+`ts`, `code`, and `request`. Run the suggested `bucket` command, then add
+`--signature code --value TIMEOUT` to isolate the jump at 14:01 UTC.
+For text logs, inspect reports recognized timestamp prefixes.
+
+Empty results still exit with status 0. Guidance goes to stderr and
+distinguishes no matches, an empty window, and unusable input fields.
 
 ## Summarize severity
 

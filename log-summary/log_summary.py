@@ -7,7 +7,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
-from itertools import chain
+from itertools import chain, islice
 from pathlib import Path
 from typing import ContextManager, Iterable, TextIO, TypedDict
 
@@ -126,6 +126,8 @@ def search_log(argv: list[str]) -> int:
     except (OSError, UnicodeError) as error:
         print(f"Cannot read log: {error}", file=sys.stderr)
         return 1
+    if not context_end:
+        print("No matching lines. Check --contains or --regex.", file=sys.stderr)
     return 0
 
 
@@ -192,6 +194,10 @@ def group_log(argv: list[str]) -> int:
     for value, count in sorted(values, key=lambda item: (-item[1], item[0])):
         print(f"{count:5}  {value}")
     print(f"Scanned: {scanned}  Grouped: {grouped}  Skipped: {scanned - grouped}")
+    if scanned and not grouped:
+        print(f"No usable values for {args.by!r}. Run inspect to check the field or capture.", file=sys.stderr)
+    elif not scanned:
+        print("The input is empty.", file=sys.stderr)
     return 0
 
 
@@ -285,6 +291,7 @@ def timeline_log(argv: list[str]) -> int:
     events: list[tuple[datetime, str]] = []
     scanned = 0
     skipped = 0
+    matching_ids = valid_times = 0
     try:
         with open_log(args.log_file) as log_file:
             for line in log_file:
@@ -298,10 +305,12 @@ def timeline_log(argv: list[str]) -> int:
                 if key != args.value:
                     continue
 
+                matching_ids += 1
                 utc_time = event_time(fields.get(args.time))
                 if utc_time is None:
                     skipped += 1
                     continue
+                valid_times += 1
                 if since <= utc_time <= until:
                     events.append((utc_time, text))
     except FileNotFoundError:
@@ -314,6 +323,12 @@ def timeline_log(argv: list[str]) -> int:
     for timestamp, text in sorted(events, key=lambda event: event[0]):
         print(f"{timestamp.isoformat(sep=' ', timespec='microseconds')}  {text}")
     print(f"Scanned: {scanned}  Matched: {len(events)}  Skipped: {skipped}")
+    if not matching_ids:
+        print(f"No events match {args.key!r}={args.value!r}. Check --key and --value.", file=sys.stderr)
+    elif not valid_times:
+        print(f"No usable timestamps in {args.time!r} for this ID. Run inspect to find timestamp fields.", file=sys.stderr)
+    elif not events:
+        print("No matching events in the requested window. Check --since or --until.", file=sys.stderr)
     return 0
 
 
@@ -384,6 +399,12 @@ def correlate_log(argv: list[str]) -> int:
             f"{stats.last.isoformat(timespec='microseconds')}  {json.dumps(key)}"
         )
     print(f"Scanned: {scanned}  IDs: {len(groups)}  Skipped: {skipped}")
+    if scanned and scanned == skipped:
+        print(f"No usable events. Run inspect to check the {args.key!r} and {args.time!r} mappings.", file=sys.stderr)
+    elif scanned and not groups:
+        print("No usable events in the requested window. Check --since or --until.", file=sys.stderr)
+    elif not scanned:
+        print("The input is empty.", file=sys.stderr)
     return 0
 
 
@@ -528,6 +549,16 @@ def compare_log(argv: list[str]) -> int:
     for name, window in (("Baseline", baseline), ("Incident", incident)):
         print(f"{name}: {window.used}/{window.scanned} records used")
     print(f"Unassigned (invalid or missing timestamp): {unknown_time}  Outside windows: {outside}")
+    if not (unknown_time or baseline.scanned or incident.scanned or outside):
+        print("The input is empty.", file=sys.stderr)
+    elif unknown_time and not (baseline.scanned or incident.scanned or outside):
+        print(f"No usable timestamps in {args.time!r}. Run inspect to find timestamp fields.", file=sys.stderr)
+    else:
+        for name, window in (("Baseline", baseline), ("Incident", incident)):
+            if not window.scanned:
+                print(f"{name}: no events in the requested window. Check the time bounds.", file=sys.stderr)
+            elif not window.used:
+                print(f"{name}: no usable signatures in {args.signature!r}. Check --signature.", file=sys.stderr)
     return 0
 
 
@@ -643,6 +674,15 @@ def bucket_log(argv: list[str]) -> int:
         "outside_window": outside,
         "filtered": filtered,
     }
+    if not scanned:
+        print("The input is empty.", file=sys.stderr)
+    elif invalid == scanned:
+        print(f"No usable timestamps in {args.time!r}. Run inspect to find timestamp fields.", file=sys.stderr)
+    elif invalid + outside == scanned:
+        print("No usable events in the requested window. Check --since or --until.", file=sys.stderr)
+    elif not counts:
+        print(f"No events match {args.signature!r}={args.value!r}. Check the signature field and value.", file=sys.stderr)
+
     if args.json:
         print(json.dumps({
             "schema_version": 1,
@@ -665,6 +705,107 @@ def bucket_log(argv: list[str]) -> int:
     return 0
 
 
+@dataclass
+class FieldSample:
+    present: int = 0
+    timestamps: int = 0
+    types: set[str] = field(default_factory=set)
+
+
+def inspect_log(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="log_summary.py inspect",
+        description="Sample a log and suggest field mappings.",
+    )
+    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines (1-1000)")
+    args = parser.parse_args(argv)
+    if not 1 <= args.lines <= 1000:
+        parser.error("--lines must be between 1 and 1000")
+
+    sampled = objects = timestamp_prefixes = 0
+    fields: dict[str, FieldSample] = {}
+    try:
+        with open_log(args.log_file) as log_file:
+            for line in islice(log_file, args.lines):
+                sampled += 1
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    record = None
+                if not isinstance(record, dict):
+                    if TIMESTAMP_PREFIX.match(line):
+                        timestamp_prefixes += 1
+                    continue
+                objects += 1
+                for name, value in record.items():
+                    if name not in fields:
+                        fields[name] = FieldSample()
+                    sample = fields[name]
+                    sample.present += 1
+                    sample.types.add(type(value).__name__)
+                    if isinstance(value, str) and event_time(value) is not None:
+                        sample.timestamps += 1
+    except FileNotFoundError:
+        print(f"Log file not found: {args.log_file}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"Cannot read log: {error}", file=sys.stderr)
+        return 1
+
+    print(f"Sampled: {sampled}  JSON objects: {objects}  Text timestamp prefixes: {timestamp_prefixes}")
+    if not sampled:
+        print("The input is empty.", file=sys.stderr)
+        return 0
+    if not objects:
+        print("No JSON objects sampled. For timed text commands, pass --regex with named captures.")
+        return 0
+
+    print("Top-level fields (presence across sampled lines):")
+    for name, sample in sorted(fields.items()):
+        types = ", ".join(sorted(sample.types))
+        timestamp_hint = f" | ISO timestamps: {sample.timestamps}" if sample.timestamps else ""
+        print(f"  {json.dumps(name)}: {sample.present}/{sampled} | {types}{timestamp_hint}")
+
+    for label, candidates in (
+        ("Signature", ("code", "error_code", "signature", "event", "event_name")),
+        ("ID", ("request_id", "request", "trace_id", "job_id", "transaction_id", "id")),
+        ("Service", ("service", "service_name", "component")),
+        ("Severity", ("severity", "level", "log_level", "severity_text")),
+    ):
+        choices = [
+            name for name in sorted(fields)
+            if name.lower() in candidates and fields[name].types & {"str", "int", "float"}
+        ]
+        if choices:
+            print(f"{label} candidates (by name): {', '.join(map(json.dumps, choices))}")
+
+    timestamp_fields = sorted(
+        (name for name in fields if fields[name].timestamps),
+        key=lambda name: (-fields[name].timestamps, name),
+    )
+    if not timestamp_fields:
+        print("No ISO timestamp fields found in the sample. Try --lines with a larger sample.", file=sys.stderr)
+        return 0
+
+    print(f"Timestamp candidates: {', '.join(map(json.dumps, timestamp_fields))}")
+    if any(re.search(r"[\x00-\x1f\x7f\u2018\u2019]", value)
+           for value in (timestamp_fields[0], args.log_file)):
+        print("Use bucket -h to pass the selected timestamp field and file manually.")
+        return 0
+    timestamp = timestamp_fields[0].replace("'", "''")
+    source = args.log_file.replace("'", "''")
+    print("Try in PowerShell:")
+    options = f"--format jsonl --time='{timestamp}' --interval 30s"
+    if args.log_file.startswith("-") and args.log_file != "-":
+        print(f"  python log_summary.py bucket {options} -- '{source}'")
+    else:
+        print(f"  python log_summary.py bucket '{source}' {options}")
+    if args.log_file == "-":
+        print("Pipe the input into the suggested command again.")
+    return 0
+
+
 def main() -> int:
     if sys.argv[1:2] == ["search"]:
         return search_log(sys.argv[2:])
@@ -678,6 +819,8 @@ def main() -> int:
         return compare_log(sys.argv[2:])
     if sys.argv[1:2] == ["bucket"]:
         return bucket_log(sys.argv[2:])
+    if sys.argv[1:2] == ["inspect"]:
+        return inspect_log(sys.argv[2:])
 
     parser = argparse.ArgumentParser(
         description="Count INFO, WARNING, and ERROR entries in text or JSON Lines.",
@@ -689,7 +832,8 @@ def main() -> int:
             "  timeline    Reconstruct events for one ID\n"
             "  correlate   Rank IDs by event count or observed span\n"
             "  compare     Compare incident and baseline event rates\n"
-            "  bucket      Show observed event rates over time\n\n"
+            "  bucket      Show observed event rates over time\n"
+            "  inspect     Sample input and suggest field mappings\n\n"
             "Examples:\n"
             "  python log_summary.py                 Count levels in app.log\n"
             "  python log_summary.py app.jsonl --format jsonl\n"
@@ -764,6 +908,14 @@ def main() -> int:
     levels = (args.level,) if args.level else LOG_LEVELS
     for level in levels:
         print(f"{level}: {counts[level]}")
+    if not coverage.classified and coverage.unclassified:
+        print("No severity levels recognized. Run inspect to check the input format and fields.", file=sys.stderr)
+        if args.format == "text" and Path(log_path).suffix.lower() in {".jsonl", ".ndjson"}:
+            print("For JSON Lines, try --format jsonl and, if needed, --level-field.", file=sys.stderr)
+    elif not coverage.classified:
+        print("No lines to classify. Check the input and text filters.", file=sys.stderr)
+    elif args.level and not counts[args.level]:
+        print(f"No {args.level} entries matched.", file=sys.stderr)
     if args.format == "jsonl" or coverage.unclassified:
         print(
             f"Classified: {coverage.classified}  Unclassified: {coverage.unclassified}",

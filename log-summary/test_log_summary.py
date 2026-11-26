@@ -386,7 +386,8 @@ class StructuredSummaryTests(unittest.TestCase):
             input='{"severity":"ERROR"}\n', capture_output=True, text=True, check=True,
         )
         self.assertIn("ERROR: 0", result.stdout)
-        self.assertEqual(result.stderr.strip(), "Classified: 0  Unclassified: 1")
+        self.assertIn("No severity levels recognized", result.stderr)
+        self.assertIn("Classified: 0  Unclassified: 1", result.stderr)
 
 
 class BucketTests(unittest.TestCase):
@@ -439,6 +440,45 @@ class BucketTests(unittest.TestCase):
         self.assertEqual([row["count"] for row in rows], [1, 0, 0, 1])
         self.assertEqual([row["partial"] for row in rows], [True, False, False, True])
         self.assertEqual([row["events_per_minute"] for row in rows], [None, 0, 0, None])
+
+
+class InspectTests(unittest.TestCase):
+    def run_cli(self, *args, input_text=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=input_text,
+            capture_output=True, text=True, check=True,
+        )
+
+    def test_inspects_incident_with_usable_bucket_suggestion(self):
+        result = self.run_cli("inspect", "incident.jsonl")
+        self.assertIn('Timestamp candidates: "ts"', result.stdout)
+        self.assertIn('Signature candidates (by name): "code"', result.stdout)
+        self.assertIn('ID candidates (by name): "request"', result.stdout)
+        self.assertIn('"request": 83/93 | str', result.stdout)
+        self.assertIn("bucket 'incident.jsonl' --format jsonl --time='ts' --interval 30s", result.stdout)
+
+    def test_inspect_limits_stdin_sample_and_recognizes_text(self):
+        result = self.run_cli(
+            "inspect", "-", "--lines", "1",
+            input_text='2026-11-26T14:00:00Z INFO Hello\n{"ts":"2026-11-26T14:00Z"}\n',
+        )
+        self.assertIn("Sampled: 1  JSON objects: 0  Text timestamp prefixes: 1", result.stdout)
+
+    def test_bucket_distinguishes_empty_results_and_keeps_json_parseable(self):
+        cases = [
+            (["--time", "wrong"], "No usable timestamps in 'wrong'"),
+            (["--time", "ts", "--since", "2026-11-27T00:00Z"], "requested window"),
+            (["--time", "ts", "--signature", "code", "--value", "MISSING"], "No events match"),
+        ]
+        for options, message in cases:
+            with self.subTest(options=options):
+                result = self.run_cli(
+                    "bucket", "incident.jsonl", "--format", "jsonl",
+                    "--interval", "30s", "--json", *options,
+                )
+                self.assertEqual(json.loads(result.stdout)["coverage"]["counted"], 0)
+                self.assertIn(message, result.stderr)
 
 
 if __name__ == "__main__":
