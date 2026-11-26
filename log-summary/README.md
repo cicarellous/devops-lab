@@ -100,11 +100,20 @@ python log_summary.py timeline app.log --regex '^(?P<ts>\S+).*request_id=(?P<id>
 ```
 
 Both commands reconstruct the same six events for `r-100`. The tool sorts by
-ISO 8601 timestamp, prints times in UTC beside each original record, and keeps
-input order for equal timestamps. Timestamps without an offset are treated as
+ISO 8601 timestamp and prints each record with its UTC time and source line.
+Ties retain source and line order. Timestamps without an offset are treated as
 UTC. The footer reports records that cannot yield an ID or matching events with
 an invalid or missing timestamp. Use `-` in place of the file path for stdin
 and `python log_summary.py timeline -h` for all options.
+
+### Follow an ID across sources
+
+```powershell
+python log_summary.py timeline --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --value incident-00 --json
+```
+
+Each `--source` pairs a file with its own profile. This example follows the
+same ID across JSON Lines and text. The report includes per-source coverage.
 
 ## Compare event groups
 
@@ -164,6 +173,12 @@ shows coverage. `NEW` means the signature was unseen in the supplied baseline.
 Windows include their start and exclude their end. Use `--regex` with named
 captures for text logs. `--service` and `--id` are optional. Observed ID counts
 reflect only records with usable IDs. Rates use the full requested windows.
+
+## Limit or export reports
+
+Use `--top N` with `group`, `correlate`, or `compare` to show the first N
+ranked rows. Coverage still describes the entire input. Add `--json` to
+`compare`, `timeline`, or `bucket` for versioned output on stdout.
 
 ## Reuse field mappings
 

@@ -217,7 +217,14 @@ class TimelineTests(unittest.TestCase):
                     [*command, "-", *options], cwd=repo, input=reversed_input,
                     capture_output=True, text=True, check=True,
                 )
-                self.assertEqual(stdin_result.stdout, file_result.stdout)
+                file_rows = file_result.stdout.splitlines()[:-1]
+                stdin_rows = stdin_result.stdout.splitlines()[:-1]
+                self.assertEqual(
+                    [row.split("  ", 2)[2] for row in stdin_rows],
+                    [row.split("  ", 2)[2] for row in file_rows],
+                )
+                self.assertIn(f"  {filename}:1  ", file_rows[0])
+                self.assertIn("  <stdin>:20  ", stdin_rows[0])
                 rows = stdin_result.stdout.splitlines()
                 self.assertEqual(rows[-1], "Scanned: 20  Matched: 6  Skipped: 0")
                 self.assertEqual(
@@ -534,6 +541,68 @@ class ProfileTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("unknown profile field 'timestamp'", result.stderr)
+
+
+class InvestigationOutputTests(unittest.TestCase):
+    def run_cli(self, *args, check=True):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, capture_output=True,
+            text=True, check=check,
+        )
+
+    def test_multisource_timeline_orders_events_and_preserves_provenance(self):
+        args = (
+            "timeline", "--source", "incident.jsonl", "incident-profile.json",
+            "--source", "worker-example.txt", "worker-profile.json",
+            "--value", "incident-00",
+        )
+        text = self.run_cli(*args).stdout
+        report = json.loads(self.run_cli(*args, "--json").stdout)
+        self.assertEqual(report["schema_version"], 1)
+        events = report["events"]
+        self.assertEqual(len(events), 9)
+        self.assertEqual([event["timestamp"] for event in events],
+                         sorted(event["timestamp"] for event in events))
+        self.assertEqual([(event["source"], event["line"]) for event in events[:3]], [
+            ("incident.jsonl", 8), ("worker-example.txt", 2), ("worker-example.txt", 1),
+        ])
+        self.assertIn("worker-example.txt:2", text)
+        self.assertEqual(report["coverage"]["sources"][1], {
+            "source": "worker-example.txt", "scanned": 3, "matched": 2, "skipped": 0,
+        })
+
+    def test_compare_json_preserves_rank_and_coverage_when_limited(self):
+        args = ("compare", "incident.jsonl", "--profile", "incident-profile.json",
+                "--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
+                "--incident", "2026-11-26T14:01Z", "2026-11-26T14:03Z")
+        complete = json.loads(self.run_cli(*args, "--json").stdout)
+        limited = json.loads(self.run_cli(*args, "--json", "--top", "1").stdout)
+        self.assertEqual(complete["schema_version"], 1)
+        self.assertEqual(limited["total_rows"], 3)
+        self.assertEqual(limited["coverage"], complete["coverage"])
+        self.assertEqual(limited["results"], complete["results"][:1])
+        top = limited["results"][0]
+        self.assertEqual((top["signature"], top["change"]), ("TIMEOUT", "RISING"))
+        self.assertEqual(top["incident"], {
+            "events": 80, "events_per_minute": 40.0, "observed_ids": 12,
+        })
+        self.assertIn('RISING "TIMEOUT"', self.run_cli(*args, "--top", "1").stdout)
+
+    def test_ranked_text_reports_show_the_limit_and_keep_totals(self):
+        cases = [
+            (("group", "app.jsonl", "--format", "jsonl", "--by", "service"),
+             "Showing 1 of 4 values", "Grouped: 20"),
+            (("correlate", "incident.jsonl", "--profile", "incident-profile.json"),
+             "Showing 1 of 14 IDs", "IDs: 14"),
+        ]
+        for args, shown, totals in cases:
+            with self.subTest(command=args[0]):
+                result = self.run_cli(*args, "--top", "1")
+                self.assertIn(shown, result.stdout)
+                self.assertIn(totals, result.stdout)
+                invalid = self.run_cli(*args, "--top", "0", check=False)
+                self.assertEqual(invalid.returncode, 2)
 
 
 if __name__ == "__main__":

@@ -131,6 +131,13 @@ def search_log(argv: list[str]) -> int:
     return 0
 
 
+def positive_count(value: str) -> int:
+    count = int(value)
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return count
+
+
 def group_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py group",
@@ -146,6 +153,7 @@ def group_log(argv: list[str]) -> int:
                         help="named regex group or top-level JSON field")
     parser.add_argument("--regex", metavar="PATTERN",
                         help="Python regex with a named capture for text input")
+    parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     args = parser.parse_args(argv)
 
     if args.format == "text" and args.regex is None:
@@ -191,8 +199,11 @@ def group_log(argv: list[str]) -> int:
     encoded_strings = ((json.dumps(value), count) for value, count in strings.items())
     values = chain(encoded_values.items(), encoded_strings)
     print("COUNT  VALUE")
-    for value, count in sorted(values, key=lambda item: (-item[1], item[0])):
+    ranked = sorted(values, key=lambda item: (-item[1], item[0]))
+    for value, count in ranked[:args.top]:
         print(f"{count:5}  {value}")
+    if args.top is not None:
+        print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} values")
     print(f"Scanned: {scanned}  Grouped: {grouped}  Skipped: {scanned - grouped}")
     if scanned and not grouped:
         print(f"No usable values for {args.by!r}. Run inspect to check the field or capture.", file=sys.stderr)
@@ -245,8 +256,9 @@ def apply_log_mapping(
         parser.error(f"missing {', '.join(missing)}; supply flags or a --profile")
 
 
-def add_event_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("log_file", help="log file path or - for stdin")
+def add_event_arguments(parser: argparse.ArgumentParser, *, optional_file: bool = False) -> None:
+    parser.add_argument("log_file", nargs="?" if optional_file else None,
+                        help="log file path or - for stdin")
     add_mapping_arguments(parser)
     parser.add_argument("--key", help="ID field or named regex capture (profile: id)")
     parser.add_argument("--since", metavar="TIME", help="include events at or after this ISO timestamp")
@@ -316,57 +328,131 @@ def event_window(
     return since, until
 
 
+@dataclass
+class TimelineSource:
+    path: str
+    key: str
+    time: str
+    pattern: re.Pattern[str] | None
+    scanned: int = 0
+    skipped: int = 0
+    matching_ids: int = 0
+    valid_times: int = 0
+    matched: int = 0
+
+    @property
+    def name(self) -> str:
+        return "<stdin>" if self.path == "-" else self.path
+
+
+@dataclass
+class TimelineEvent:
+    timestamp: datetime
+    source: str
+    line: int
+    text: str
+
+
 def timeline_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py timeline",
         description="Show events for one ID in chronological order.",
     )
-    add_event_arguments(parser)
+    add_event_arguments(parser, optional_file=True)
+    parser.add_argument("--source", action="append", nargs=2, metavar=("FILE", "PROFILE"),
+                        help="source and its JSON profile; repeat for multiple sources")
     parser.add_argument("--value", required=True, help="ID to match exactly")
+    parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     args = parser.parse_args(argv)
-    apply_log_mapping(parser, args, required=("key", "time"))
-    pattern = event_pattern(parser, args)
     since, until = event_window(parser, args)
 
-    events: list[tuple[datetime, str]] = []
-    scanned = 0
-    skipped = 0
-    matching_ids = valid_times = 0
-    try:
-        with open_log(args.log_file) as log_file:
-            for line in log_file:
-                scanned += 1
-                text = line.rstrip("\r\n")
-                fields = event_fields(text, pattern)
-                key = event_id(fields.get(args.key))
-                if key is None:
-                    skipped += 1
-                    continue
-                if key != args.value:
-                    continue
+    if args.source:
+        if args.log_file is not None or any(
+            value is not None for value in (args.profile, args.format, args.key, args.time, args.regex)
+        ):
+            parser.error("--source replaces the positional file and global mapping options")
+        if sum(path == "-" for path, _ in args.source) > 1:
+            parser.error("stdin can only be used as one source")
+        mappings = [
+            (path, argparse.Namespace(profile=profile, format=None, key=None, time=None, regex=None))
+            for path, profile in args.source
+        ]
+    elif args.log_file is not None:
+        mappings = [(args.log_file, args)]
+    else:
+        parser.error("supply a log file or --source FILE PROFILE")
 
-                matching_ids += 1
-                utc_time = event_time(fields.get(args.time))
-                if utc_time is None:
-                    skipped += 1
-                    continue
-                valid_times += 1
-                if since <= utc_time <= until:
-                    events.append((utc_time, text))
-    except FileNotFoundError:
-        print(f"Log file not found: {args.log_file}", file=sys.stderr)
-        return 1
-    except (OSError, UnicodeError) as error:
-        print(f"Cannot read log: {error}", file=sys.stderr)
-        return 1
+    sources: list[TimelineSource] = []
+    for path, mapping in mappings:
+        apply_log_mapping(parser, mapping, required=("key", "time"))
+        pattern = event_pattern(parser, mapping)
+        sources.append(TimelineSource(path, mapping.key, mapping.time, pattern))
 
-    for timestamp, text in sorted(events, key=lambda event: event[0]):
-        print(f"{timestamp.isoformat(sep=' ', timespec='microseconds')}  {text}")
-    print(f"Scanned: {scanned}  Matched: {len(events)}  Skipped: {skipped}")
-    if not matching_ids:
-        print(f"No events match {args.key!r}={args.value!r}. Check --key and --value.", file=sys.stderr)
-    elif not valid_times:
-        print(f"No usable timestamps in {args.time!r} for this ID. Run inspect to find timestamp fields.", file=sys.stderr)
+    events: list[TimelineEvent] = []
+    for source in sources:
+        try:
+            with open_log(source.path) as log_file:
+                for line_number, line in enumerate(log_file, start=1):
+                    source.scanned += 1
+                    text = line.rstrip("\r\n")
+                    fields = event_fields(text, source.pattern)
+                    key = event_id(fields.get(source.key))
+                    if key is None:
+                        source.skipped += 1
+                        continue
+                    if key != args.value:
+                        continue
+
+                    source.matching_ids += 1
+                    utc_time = event_time(fields.get(source.time))
+                    if utc_time is None:
+                        source.skipped += 1
+                        continue
+                    source.valid_times += 1
+                    if since <= utc_time <= until:
+                        events.append(TimelineEvent(utc_time, source.name, line_number, text))
+                        source.matched += 1
+        except FileNotFoundError:
+            print(f"Log file not found: {source.path}", file=sys.stderr)
+            return 1
+        except (OSError, UnicodeError) as error:
+            print(f"Cannot read log {source.path!r}: {error}", file=sys.stderr)
+            return 1
+
+    events.sort(key=lambda event: event.timestamp)
+    scanned = sum(source.scanned for source in sources)
+    skipped = sum(source.skipped for source in sources)
+    source_coverage = [
+        {"source": source.name, "scanned": source.scanned,
+         "matched": source.matched, "skipped": source.skipped}
+        for source in sources
+    ]
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "value": args.value,
+            "coverage": {"scanned": scanned, "matched": len(events), "skipped": skipped,
+                         "sources": source_coverage},
+            "events": [
+                {"timestamp": event.timestamp.isoformat(timespec="microseconds"),
+                 "source": event.source, "line": event.line, "text": event.text}
+                for event in events
+            ],
+        }))
+    else:
+        for event in events:
+            print(f"{event.timestamp.isoformat(sep=' ', timespec='microseconds')}  "
+                  f"{event.source}:{event.line}  {event.text}")
+        if len(sources) > 1:
+            for source in sources:
+                print(f"{source.name}: scanned {source.scanned}, matched {source.matched}, skipped {source.skipped}")
+        print(f"Scanned: {scanned}  Matched: {len(events)}  Skipped: {skipped}")
+
+    if not any(source.matching_ids for source in sources):
+        print(f"No events match ID {args.value!r}. Check the ID field and --value.", file=sys.stderr)
+    elif not any(source.valid_times for source in sources):
+        fields = ", ".join(sorted({repr(source.time) for source in sources}))
+        print(f"No usable timestamps in {fields} for this ID. Run inspect to find timestamp fields.", file=sys.stderr)
     elif not events:
         print("No matching events in the requested window. Check --since or --until.", file=sys.stderr)
     return 0
@@ -387,6 +473,7 @@ def correlate_log(argv: list[str]) -> int:
     add_event_arguments(parser)
     parser.add_argument("--sort", choices=("span", "count"), default="span",
                         help="rank IDs by observed span or event count (default: span)")
+    parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     args = parser.parse_args(argv)
     apply_log_mapping(parser, args, required=("key", "time"))
     pattern = event_pattern(parser, args)
@@ -431,7 +518,7 @@ def correlate_log(argv: list[str]) -> int:
         ranked.sort(key=lambda key: groups[key].count, reverse=True)
 
     print("EVENTS  OBSERVED SPAN   FIRST (UTC)                       LAST (UTC)                        ID")
-    for key in ranked:
+    for key in ranked[:args.top]:
         stats = groups[key]
         span = stats.last - stats.first
         print(
@@ -439,6 +526,8 @@ def correlate_log(argv: list[str]) -> int:
             f"{stats.first.isoformat(timespec='microseconds')}  "
             f"{stats.last.isoformat(timespec='microseconds')}  {json.dumps(key)}"
         )
+    if args.top is not None:
+        print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} IDs")
     print(f"Scanned: {scanned}  IDs: {len(groups)}  Skipped: {skipped}")
     if scanned and scanned == skipped:
         print(f"No usable events. Run inspect to check the {args.key!r} and {args.time!r} mappings.", file=sys.stderr)
@@ -500,6 +589,8 @@ def compare_log(argv: list[str]) -> int:
     parser.add_argument("--id", help="optional request or transaction ID field")
     parser.add_argument("--baseline", nargs=2, metavar=("START", "END"), required=True)
     parser.add_argument("--incident", nargs=2, metavar=("START", "END"), required=True)
+    parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
+    parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     args = parser.parse_args(argv)
     apply_log_mapping(parser, args, required=("time", "signature"), optional=("service", "id"))
 
@@ -560,9 +651,9 @@ def compare_log(argv: list[str]) -> int:
         rows.append((after_rate - before_rate, service, signature, before, after, before_rate, after_rate))
 
     source = "<stdin>" if args.log_file == "-" else args.log_file
-    for delta, service, signature, before, after, before_rate, after_rate in sorted(
-        rows, key=lambda row: (-row[0], row[1] is not None, row[1] or "", row[2])
-    ):
+    ranked = sorted(rows, key=lambda row: (-row[0], row[1] is not None, row[1] or "", row[2]))
+    results = []
+    for delta, service, signature, before, after, before_rate, after_rate in ranked[:args.top]:
         if not before.count:
             label = "NEW"
         elif delta > 0:
@@ -571,24 +662,54 @@ def compare_log(argv: list[str]) -> int:
             label = "FALLING"
         else:
             label = "FLAT"
-        details = f"{label} {json.dumps(signature)}"
-        if args.service:
-            details += f" service={json.dumps(service)}"
-        details += (
-            f" | events {before.count} -> {after.count}"
-            f" | events/min {float(before_rate):.3f} -> {float(after_rate):.3f}"
-        )
-        if args.id:
-            details += f" | observed IDs {len(before.ids)} -> {len(after.ids)}"
         example = after if after.count else before
-        details += f" | example {source}:{example.example_line}"
-        if example.example_id is not None:
-            details += f" id={json.dumps(example.example_id)}"
-        print(details)
+        if args.json:
+            results.append({
+                "change": label,
+                "signature": signature,
+                "service": service,
+                "baseline": {"events": before.count, "events_per_minute": float(before_rate),
+                             "observed_ids": len(before.ids) if args.id else None},
+                "incident": {"events": after.count, "events_per_minute": float(after_rate),
+                             "observed_ids": len(after.ids) if args.id else None},
+                "delta_events_per_minute": float(delta),
+                "example": {"source": source, "line": example.example_line, "id": example.example_id},
+            })
+        else:
+            details = f"{label} {json.dumps(signature)}"
+            if args.service:
+                details += f" service={json.dumps(service)}"
+            details += (
+                f" | events {before.count} -> {after.count}"
+                f" | events/min {float(before_rate):.3f} -> {float(after_rate):.3f}"
+            )
+            if args.id:
+                details += f" | observed IDs {len(before.ids)} -> {len(after.ids)}"
+            details += f" | example {source}:{example.example_line}"
+            if example.example_id is not None:
+                details += f" id={json.dumps(example.example_id)}"
+            print(details)
 
-    for name, window in (("Baseline", baseline), ("Incident", incident)):
-        print(f"{name}: {window.used}/{window.scanned} records used")
-    print(f"Unassigned (invalid or missing timestamp): {unknown_time}  Outside windows: {outside}")
+    if args.json:
+        print(json.dumps({
+            "schema_version": 1,
+            "total_rows": len(ranked),
+            "coverage": {
+                "baseline": {"start": baseline.start.isoformat(), "end": baseline.end.isoformat(),
+                             "scanned": baseline.scanned, "used": baseline.used},
+                "incident": {"start": incident.start.isoformat(), "end": incident.end.isoformat(),
+                             "scanned": incident.scanned, "used": incident.used},
+                "invalid_timestamp": unknown_time,
+                "outside_windows": outside,
+            },
+            "results": results,
+        }))
+    else:
+        if args.top is not None:
+            print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} signatures")
+        for name, window in (("Baseline", baseline), ("Incident", incident)):
+            print(f"{name}: {window.used}/{window.scanned} records used")
+        print(f"Unassigned (invalid or missing timestamp): {unknown_time}  Outside windows: {outside}")
     if not (unknown_time or baseline.scanned or incident.scanned or outside):
         print("The input is empty.", file=sys.stderr)
     elif unknown_time and not (baseline.scanned or incident.scanned or outside):
