@@ -12,7 +12,20 @@ and observed spans across IDs. It reads files or standard input.
 | Reconstruct one ID's events | `python log_summary.py timeline -h` |
 | Rank IDs by event count or observed span | `python log_summary.py correlate -h` |
 
-Run the examples below from the `log-summary/` directory.
+## Quick start
+
+Use Python 3.12 or later. Log Summary uses the Python standard library.
+
+```powershell
+# From the devops-lab repository root
+cd log-summary
+python log_summary.py
+```
+
+Run the remaining examples from `log-summary/`. The included `app.log` and
+`app.jsonl` represent the same 20 synthetic events, with interleaved requests,
+retries, and recurring error codes. Pass a UTF-8 file path or use `-` to read
+from standard input.
 
 ## Summarize severity
 
@@ -20,7 +33,6 @@ Run the log summary with the included `app.log` as the default. The summary
 recognizes severity at the start of a line or after an ISO timestamp.
 
 ```powershell
-python log_summary.py
 python log_summary.py app.log --level ERROR --contains "timed out" --show-lines
 ```
 
@@ -33,13 +45,13 @@ python log_summary.py search app.log --regex "timed out|lookup failed" --context
 Get-Content app.log | python log_summary.py search - --contains "timed out"
 ```
 
-Use `python log_summary.py search -h` for search options. When both filters
-are supplied, lines must match both. Overlapping context is printed once.
+Use `--contains` for case-sensitive literal text or `--regex` for a Python regular
+expression. When both are supplied, lines must match both. Overlapping context
+is printed once.
 
 ## Group log entries
 
-The synthetic `app.log` and `app.jsonl` contain the same 20 events. They
-include interleaved requests across services, retries, and recurring error codes.
+Use a named regex capture for plain text or a top-level field for JSON Lines.
 
 ```powershell
 python log_summary.py group app.log --regex 'code=(?P<code>E\d{4})' --by code
@@ -47,7 +59,7 @@ python log_summary.py group app.jsonl --format jsonl --by code
 Get-Content app.jsonl | python log_summary.py group - --format jsonl --by service
 ```
 
-Both code reports rank `E1042` (4), `E2007` (3), and `E3001` (1).
+Both error-code reports rank `E1042` (4), `E2007` (3), and `E3001` (1).
 Results are ordered by count, with ties sorted by displayed value.
 Each line contributes at most one value. Text uses the first regex match.
 JSON Lines uses a top-level scalar field. Missing, empty, unmatched, and
@@ -83,7 +95,8 @@ The report shows each ID's event count, first and last UTC timestamps, and
 observed span. The span is the difference between the first and last valid
 events present in the input. Use `--sort span` (the default) or `--sort count`.
 Records without a usable ID or timestamp count as skipped. Use `-` for stdin
-and `python log_summary.py correlate -h` for all options.
+and `python log_summary.py correlate -h` for all options. Use `timeline` with
+an ID from the report to inspect its individual events.
 
 ## Focus on an incident window
 
@@ -98,7 +111,7 @@ python log_summary.py correlate app.jsonl --format jsonl --key request_id --time
 
 ## Tests
 
-Run the unit tests:
+From `log-summary/`, run the unit tests:
 
 ```powershell
 python -m unittest -v

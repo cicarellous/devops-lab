@@ -1,9 +1,9 @@
 # DevOps Lab
 
-A collection of small tools for DevOps and site reliability engineering.
+A collection of command-line tools for DevOps and site reliability engineering (SRE).
 
 | Project | Purpose |
 | --- | --- |
-| [Log Summary](log-summary/) | Analyze logs, rank recurring values, and reconstruct event timelines. |
+| [Log Summary](log-summary/) | Search logs, rank recurring values, and reconstruct timelines across services. |
 
-Each project includes its own usage instructions and sample data.
+See each project README for usage examples and test commands.
