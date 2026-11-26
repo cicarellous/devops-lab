@@ -49,7 +49,8 @@ review the new profile before using it. Existing files are kept intact.
 Empty results exit with status 0 by default. Add `--fail-on empty` to return
 3 instead. Guidance goes to stderr and distinguishes no matches, an empty
 window, and unusable input fields. For `inspect`, empty means there is no
-usable mapping to suggest. An empty result leaves `--profile-out` untouched.
+usable mapping to suggest. An empty result leaves `--profile-out` untouched. A partial profile can still
+be saved, with a warning if timed commands need an explicit `--time`.
 
 ## Summarize severity
 
@@ -118,7 +119,9 @@ ISO 8601 timestamp and prints each record with its UTC time and source line.
 Ties retain source and line order. Timestamps without an offset are treated as
 UTC. The footer reports records that cannot yield an ID or matching events with
 an invalid or missing timestamp. Use `-` in place of the file path for stdin
-and `python log_summary.py timeline -h` for all options.
+and `python log_summary.py timeline -h` for all options. Coverage separates
+matched events, events for the same ID outside the window, other IDs, and
+skipped records (missing ID or unusable timestamp for the requested ID).
 
 ### Follow an ID across sources
 
@@ -173,6 +176,8 @@ per source. Window bounds still use ISO 8601.
 Use integer or decimal-string timestamps when exact precision matters. Values
 finer than a microsecond are skipped. `inspect` suggests a unit for plausible
 modern epoch values in timestamp-named fields. Review it before using it.
+Timed commands warn on stderr if a source sample looks like the other epoch
+unit. The selected unit still governs the results.
 
 ## Find when event activity changed
 
@@ -207,6 +212,8 @@ shows coverage. `NEW` means the signature was unseen in the supplied baseline.
 Windows include their start and exclude their end. Use `--regex` with named
 captures for text logs. `--service` and `--id` are optional. Observed ID counts
 reflect only records with usable IDs. Rates use the full requested windows.
+In per-source coverage, `skipped` includes `invalid_timestamp` and in-window
+records without a usable signature. `outside_windows` is separate.
 
 ## Analyze multiple sources
 
@@ -243,15 +250,23 @@ python log_summary.py bucket incident.jsonl --profile incident-profile.json --in
 python log_summary.py timeline incident.jsonl --profile incident-profile.json --value incident-00
 ```
 
-Profile keys are `format`, `time`, `regex`, `signature`, `service`, `id`,
-`by` (group), and `level_field` (summary).
+Profile keys are `format`, `time`, `time_format`, `regex`, `signature`,
+`service`, `id` (alias `key`), `by`, and `level_field`.
 Use `regex` for named captures in text logs. For severity summary, the text
 profile regex captures `level` (or the configured `level_field`), while the
 CLI's `--regex` still filters whole lines. The `id` field supplies `--key`
-for timeline and correlation (`key` is an alias in the profile). Explicit
-flags override the profile. Bucket uses its signature mapping when you pass
+for timeline and correlation. Explicit flags override the profile. Bucket uses its signature mapping when you pass
 `--value`. Time
 windows, requested values, and output options stay on the command line.
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Completed, including empty results by default |
+| `1` | Input or output error |
+| `2` | Invalid arguments or profile |
+| `3` | Empty result with `--fail-on empty` |
 
 ## Tests
 

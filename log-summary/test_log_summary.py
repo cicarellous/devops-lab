@@ -228,7 +228,7 @@ class TimelineTests(unittest.TestCase):
                 self.assertIn(f"  {filename}:1  ", file_rows[0])
                 self.assertIn("  <stdin>:20  ", stdin_rows[0])
                 rows = stdin_result.stdout.splitlines()
-                self.assertEqual(rows[-1], "Scanned: 20  Matched: 6  Skipped: 0")
+                self.assertEqual(rows[-1], "Scanned: 20  Matched: 6  Skipped: 0  Outside window: 0  Other IDs: 14")
                 self.assertEqual(
                     [row.split("  ", 1)[0] for row in rows[:-1]],
                     [f"2026-11-26 14:00:{time}000+00:00" for time in expected_times],
@@ -247,7 +247,7 @@ class TimelineTests(unittest.TestCase):
         rows = result.stdout.splitlines()
         self.assertTrue(rows[0].startswith("2026-11-26 14:00:00.000000+00:00"))
         self.assertTrue(rows[1].startswith("2026-11-26 15:00:00.000000+00:00"))
-        self.assertEqual(rows[2], "Scanned: 5  Matched: 2  Skipped: 2")
+        self.assertEqual(rows[2], "Scanned: 5  Matched: 2  Skipped: 2  Outside window: 0  Other IDs: 1")
 
 
 class CorrelateTests(unittest.TestCase):
@@ -572,6 +572,7 @@ class InvestigationOutputTests(unittest.TestCase):
         self.assertIn("worker-example.txt:2", text)
         self.assertEqual(report["coverage"]["sources"][1], {
             "source": "worker-example.txt", "scanned": 3, "matched": 2, "skipped": 0,
+            "outside_window": 0, "other_ids": 1,
         })
 
     def test_compare_json_preserves_rank_and_coverage_when_limited(self):
@@ -1141,6 +1142,79 @@ class EpochTimestampTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["events"][0]["timestamp"],
                              "2026-11-26T14:01:00.000000+00:00")
+
+
+class ReportTrustTests(unittest.TestCase):
+    def run_cli(self, *args, data=None):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=data,
+            text=True, capture_output=True,
+        )
+
+    def test_partial_profile_is_saved_with_a_clear_warning(self):
+        with TemporaryDirectory() as directory:
+            profile = Path(directory) / "partial.json"
+            data = '{"code":"E1","severity":"warn","request_id":"r1"}\n'
+            result = self.run_cli("inspect", "-", "--json", "--fail-on", "empty",
+                                  "--profile-out", str(profile), data=data)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            saved = json.loads(profile.read_text(encoding="utf-8"))
+            self.assertNotIn("time", saved)
+            self.assertEqual(saved, json.loads(result.stdout)["profile"])
+            self.assertIn("Profile has no timestamp mapping. Timed commands need --time", result.stderr)
+            summary = self.run_cli("-", "--profile", str(profile), "--json", data=data)
+            self.assertEqual(summary.returncode, 0, summary.stderr)
+            self.assertEqual(json.loads(summary.stdout)["counts"]["WARNING"], 1)
+
+    def test_epoch_warnings_explain_empty_windows_without_changing_output(self):
+        start, boundary, end = "2026-11-26T14:00Z", "2026-11-26T14:01Z", "2026-11-26T14:02Z"
+        cases = [
+            ("timeline", ("--key", "id", "--value", "r1", "--since", boundary)),
+            ("correlate", ("--key", "id", "--since", boundary)),
+            ("bucket", ("--interval", "1m", "--since", boundary)),
+            ("compare", ("--signature", "code", "--baseline", start, boundary,
+                         "--incident", boundary, end)),
+        ]
+        for command, options in cases:
+            with self.subTest(command=command):
+                result = self.run_cli(
+                    command, "-", "--format", "jsonl", "--time", "ts",
+                    "--time-format", "epoch_ms", "--json", *options,
+                    data='{"ts":1795701660,"id":"r1","code":"E1"}\n',
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["command"], command)
+                self.assertIn("field 'ts': sampled values look like epoch_s; using epoch_ms", result.stderr)
+
+        for mode, timestamp, expected in [
+            ("epoch_s", 1795701660000, "look like epoch_ms"),
+            ("epoch_s", 1795701660, None),
+            ("epoch_s", 86_400, None),
+        ]:
+            with self.subTest(mode=mode, timestamp=timestamp):
+                result = self.run_cli(
+                    "correlate", "-", "--format", "jsonl", "--time", "ts",
+                    "--time-format", mode, "--key", "id", "--json",
+                    data=json.dumps({"ts": timestamp, "id": "r1"}) + "\n",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if expected:
+                    self.assertIn(expected, result.stderr)
+                    self.assertEqual(json.loads(result.stdout)["coverage"]["skipped"], 1)
+                else:
+                    self.assertNotIn("epoch unit mismatch", result.stderr)
+
+    def test_timeline_coverage_reconciles_filtered_and_unrelated_events(self):
+        args = ("timeline", "app.jsonl", "--format", "jsonl", "--key", "request_id",
+                "--time", "timestamp", "--value", "r-100", "--since", "2026-11-26T14:00:01Z")
+        result = self.run_cli(*args, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        coverage = json.loads(result.stdout)["coverage"]
+        expected = {"scanned": 20, "matched": 2, "outside_window": 4, "other_ids": 14, "skipped": 0}
+        self.assertEqual(coverage, {**expected, "sources": [{"source": "app.jsonl", **expected}]})
+        text = self.run_cli(*args)
+        self.assertIn("Outside window: 4  Other IDs: 14", text.stdout)
 
 
 if __name__ == "__main__":

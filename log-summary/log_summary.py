@@ -559,6 +559,44 @@ def event_time(value: object, time_format: str = "iso") -> datetime | None:
         return None
 
 
+@dataclass
+class RecordTimeReader:
+    source: str
+    field: str
+    time_format: str
+    checked: int = 0
+    alternate_matches: int = 0
+    inconsistent: bool = False
+
+    @property
+    def alternate_format(self) -> str:
+        return "epoch_ms" if self.time_format == "epoch_s" else "epoch_s"
+
+    def parse(self, value: object) -> datetime | None:
+        timestamp = event_time(value, self.time_format)
+        if self.time_format == "iso" or self.inconsistent or self.checked >= 100 or value is None:
+            return timestamp
+        self.checked += 1
+        if timestamp is not None and INSPECT_EPOCH_START <= timestamp < INSPECT_EPOCH_END:
+            self.inconsistent = True
+            return timestamp
+        alternate = epoch_time(value, self.alternate_format)
+        if alternate is not None and INSPECT_EPOCH_START <= alternate < INSPECT_EPOCH_END:
+            self.alternate_matches += 1
+        elif timestamp is not None or alternate is not None:
+            self.inconsistent = True
+        return timestamp
+
+    def warn_if_unit_suspect(self) -> None:
+        if self.alternate_matches and not self.inconsistent:
+            print(
+                f"Possible epoch unit mismatch in {self.source!r}, field {self.field!r}: "
+                f"sampled values look like {self.alternate_format}; using {self.time_format}. "
+                "Check --time-format or the profile.",
+                file=sys.stderr,
+            )
+
+
 def event_window(
     parser: argparse.ArgumentParser, args: argparse.Namespace, *, exclusive_until: bool = False
 ) -> tuple[datetime, datetime, bool]:
@@ -591,6 +629,8 @@ class TimelineSource:
     matching_ids: int = 0
     valid_times: int = 0
     matched: int = 0
+    outside_window: int = 0
+    other_ids: int = 0
 
     @property
     def name(self) -> str:
@@ -626,6 +666,8 @@ def timeline_log(argv: list[str]) -> int:
 
     events: list[TimelineEvent] = []
     for source in sources:
+        times = RecordTimeReader(source.name, source.time, source.time_format)
+        parse_time = event_time if times.time_format == "iso" else times.parse
         try:
             with open_log(source.path) as log_file:
                 for line_number, line in enumerate(log_file, start=1):
@@ -637,10 +679,11 @@ def timeline_log(argv: list[str]) -> int:
                         source.skipped += 1
                         continue
                     if key != args.value:
+                        source.other_ids += 1
                         continue
 
                     source.matching_ids += 1
-                    utc_time = event_time(log_field(fields, source.time), source.time_format)
+                    utc_time = parse_time(log_field(fields, source.time))
                     if utc_time is None:
                         source.skipped += 1
                         continue
@@ -648,6 +691,8 @@ def timeline_log(argv: list[str]) -> int:
                     if since <= utc_time <= until and (not exclusive_end or utc_time != until):
                         events.append(TimelineEvent(utc_time, source.name, line_number, text))
                         source.matched += 1
+                    else:
+                        source.outside_window += 1
         except FileNotFoundError:
             print(f"Log file not found: {source.path}", file=sys.stderr)
             return 1
@@ -655,12 +700,17 @@ def timeline_log(argv: list[str]) -> int:
             print(f"Cannot read log {source.path!r}: {error}", file=sys.stderr)
             return 1
 
+        times.warn_if_unit_suspect()
+
     events.sort(key=lambda event: event.timestamp)
     scanned = sum(source.scanned for source in sources)
     skipped = sum(source.skipped for source in sources)
+    outside = sum(source.outside_window for source in sources)
+    other_ids = sum(source.other_ids for source in sources)
     source_coverage = [
         {"source": source.name, "scanned": source.scanned,
-         "matched": source.matched, "skipped": source.skipped}
+         "matched": source.matched, "skipped": source.skipped,
+         "outside_window": source.outside_window, "other_ids": source.other_ids}
         for source in sources
     ]
     if args.json:
@@ -669,6 +719,7 @@ def timeline_log(argv: list[str]) -> int:
             "command": "timeline",
             "value": args.value,
             "coverage": {"scanned": scanned, "matched": len(events), "skipped": skipped,
+                         "outside_window": outside, "other_ids": other_ids,
                          "sources": source_coverage},
             "events": [
                 {"timestamp": event.timestamp.isoformat(timespec="microseconds"),
@@ -682,8 +733,10 @@ def timeline_log(argv: list[str]) -> int:
                   f"{event.source}:{event.line}  {event.text}")
         if len(sources) > 1:
             for source in sources:
-                print(f"{source.name}: scanned {source.scanned}, matched {source.matched}, skipped {source.skipped}")
-        print(f"Scanned: {scanned}  Matched: {len(events)}  Skipped: {skipped}")
+                print(f"{source.name}: scanned {source.scanned}, matched {source.matched}, "
+                      f"skipped {source.skipped}, outside {source.outside_window}, other IDs {source.other_ids}")
+        print(f"Scanned: {scanned}  Matched: {len(events)}  Skipped: {skipped}  "
+              f"Outside window: {outside}  Other IDs: {other_ids}")
 
     if not any(source.matching_ids for source in sources):
         print(f"No events match ID {args.value!r}. Check the ID field and --value.", file=sys.stderr)
@@ -725,6 +778,8 @@ def correlate_log(argv: list[str]) -> int:
     scanned = used = skipped = outside = 0
     for (path, mapping), pattern in zip(mappings, patterns):
         name = source_name(path)
+        times = RecordTimeReader(name, mapping.time, mapping.time_format)
+        parse_time = event_time if times.time_format == "iso" else times.parse
         source_scanned = source_skipped = source_used = source_outside = 0
         try:
             with open_log(path) as log_file:
@@ -732,7 +787,7 @@ def correlate_log(argv: list[str]) -> int:
                     source_scanned += 1
                     fields = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
                     key = event_id(log_field(fields, mapping.key))
-                    timestamp = event_time(log_field(fields, mapping.time), mapping.time_format)
+                    timestamp = parse_time(log_field(fields, mapping.time))
                     if key is None or timestamp is None:
                         source_skipped += 1
                         continue
@@ -753,6 +808,7 @@ def correlate_log(argv: list[str]) -> int:
                         stats.count += 1
         except (OSError, UnicodeError) as error:
             return report_input_error(path, error)
+        times.warn_if_unit_suspect()
         coverage.append({
             "source": name, "scanned": source_scanned, "used": source_used,
             "skipped": source_skipped, "outside_window": source_outside,
@@ -908,6 +964,8 @@ def compare_log(argv: list[str]) -> int:
     unknown_time = outside = 0
     for (path, mapping), pattern in zip(mappings, patterns):
         name = source_name(path)
+        times = RecordTimeReader(name, mapping.time, mapping.time_format)
+        parse_time = event_time if times.time_format == "iso" else times.parse
         source_counts = dict.fromkeys(
             ("scanned", "used", "baseline_scanned", "baseline_used", "incident_scanned",
              "incident_used", "invalid_timestamp", "outside_windows"), 0
@@ -917,7 +975,7 @@ def compare_log(argv: list[str]) -> int:
                 for line_number, line in enumerate(log_file, start=1):
                     source_counts["scanned"] += 1
                     record = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
-                    timestamp = event_time(log_field(record, mapping.time), mapping.time_format)
+                    timestamp = parse_time(log_field(record, mapping.time))
                     if timestamp is None:
                         source_counts['invalid_timestamp'] += 1
                         continue
@@ -947,6 +1005,7 @@ def compare_log(argv: list[str]) -> int:
                     window.groups[group].record(name, line_number, event_key)
         except (OSError, UnicodeError) as error:
             return report_input_error(path, error)
+        times.warn_if_unit_suspect()
         unknown_time += source_counts["invalid_timestamp"]
         outside += source_counts["outside_windows"]
         coverage.append({
@@ -1122,12 +1181,14 @@ def bucket_log(argv: list[str]) -> int:
     first = last = None
     scanned = invalid = outside = filtered = 0
     counts: Counter[int] = Counter()
+    times = RecordTimeReader(source_name(args.log_file), args.time, args.time_format)
+    parse_time = event_time if times.time_format == "iso" else times.parse
     try:
         with open_log(args.log_file) as log_file:
             for line in log_file:
                 scanned += 1
                 fields = event_fields(line.rstrip("\r\n"), pattern, args.format)
-                timestamp = event_time(log_field(fields, args.time), args.time_format)
+                timestamp = parse_time(log_field(fields, args.time))
                 if timestamp is None:
                     invalid += 1
                     continue
@@ -1156,6 +1217,7 @@ def bucket_log(argv: list[str]) -> int:
                 counts[tick // width] += 1
     except (OSError, UnicodeError) as error:
         return report_input_error(args.log_file, error)
+    times.warn_if_unit_suspect()
 
     start = start_bound if start_bound is not None else first
     end = end_bound if end_bound is not None else (last + 1 if last is not None else None)
@@ -1257,7 +1319,7 @@ def inspect_log(argv: list[str]) -> int:
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
     parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines (1-1000)")
-    parser.add_argument("--profile-out", metavar="FILE", help="save a suggested profile to a new file; empty means no suggested mapping")
+    parser.add_argument("--profile-out", metavar="FILE", help="write a new profile when a usable mapping is found")
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     if not 1 <= args.lines <= 1000:
@@ -1357,6 +1419,9 @@ def inspect_log(argv: list[str]) -> int:
             print(f"Cannot save profile {args.profile_out!r}: {error}", file=sys.stderr)
             return 1
         print(f"Saved suggested profile: {args.profile_out!r}", file=sys.stderr)
+        if "time" not in profile:
+            print("Profile has no timestamp mapping. Timed commands need --time and, for epoch values, --time-format.",
+                  file=sys.stderr)
 
     if args.json:
         print(json.dumps({
@@ -1464,6 +1529,7 @@ def main() -> int:
             "  compare     Compare incident and baseline event rates\n"
             "  bucket      Show observed event rates over time\n"
             "  inspect     Sample input and suggest field mappings\n\n"
+            "Exit codes: 0 success, 1 I/O error, 2 usage error, 3 empty with --fail-on empty.\n\n"
             "Examples:\n"
             "  python log_summary.py                 Count levels in app.log\n"
             "  python log_summary.py app.jsonl --format jsonl\n"
