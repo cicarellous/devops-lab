@@ -18,5 +18,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run unit tests
+      - name: Run Log Summary tests
+        working-directory: log-summary
         run: python -m unittest -v
