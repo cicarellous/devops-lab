@@ -1,0 +1,20 @@
+{"timestamp":"2026-11-26T14:00:00.000Z","severity":"INFO","service":"gateway","request_id":"r-100","status":200,"message":"Request accepted"}
+{"timestamp":"2026-11-26T14:00:00.137Z","severity":"INFO","service":"gateway","request_id":"r-101","status":200,"message":"Request accepted"}
+{"timestamp":"2026-11-26T14:00:00.274Z","severity":"INFO","service":"orders","request_id":"r-100","status":200,"message":"Order lookup started"}
+{"timestamp":"2026-11-26T14:00:00.411Z","severity":"INFO","service":"payments","request_id":"r-101","status":200,"message":"Authorization started"}
+{"timestamp":"2026-11-26T14:00:00.548Z","severity":"WARNING","service":"database","request_id":"r-100","status":503,"message":"Connection pool nearly exhausted","code":"E1042"}
+{"timestamp":"2026-11-26T14:00:00.685Z","severity":"WARNING","service":"payments","request_id":"r-101","status":504,"message":"Upstream call timed out, retry scheduled","code":"E2007"}
+{"timestamp":"2026-11-26T14:00:00.822Z","severity":"INFO","service":"gateway","request_id":"r-102","status":200,"message":"Request accepted"}
+{"timestamp":"2026-11-26T14:00:00.959Z","severity":"ERROR","service":"database","request_id":"r-100","status":503,"message":"Connection acquisition timed out","code":"E1042"}
+{"timestamp":"2026-11-26T14:00:01.096Z","severity":"ERROR","service":"orders","request_id":"r-100","status":503,"message":"Order lookup failed","code":"E1042"}
+{"timestamp":"2026-11-26T14:00:01.233Z","severity":"INFO","service":"orders","request_id":"r-102","status":200,"message":"Order lookup started"}
+{"timestamp":"2026-11-26T14:00:01.370Z","severity":"INFO","service":"database","request_id":"r-102","status":200,"message":"Query completed"}
+{"timestamp":"2026-11-26T14:00:01.507Z","severity":"INFO","service":"orders","request_id":"r-102","status":200,"message":"Order lookup completed"}
+{"timestamp":"2026-11-26T14:00:01.644Z","severity":"ERROR","service":"payments","request_id":"r-101","status":504,"message":"Authorization retry timed out","code":"E2007"}
+{"timestamp":"2026-11-26T14:00:01.781Z","severity":"ERROR","service":"gateway","request_id":"r-100","status":503,"message":"Request failed","code":"E1042"}
+{"timestamp":"2026-11-26T14:00:01.918Z","severity":"ERROR","service":"gateway","request_id":"r-101","status":504,"message":"Request failed","code":"E2007"}
+{"timestamp":"2026-11-26T14:00:02.055Z","severity":"INFO","service":"gateway","request_id":"r-102","status":200,"message":"Request completed"}
+{"timestamp":"2026-11-26T14:00:02.192Z","severity":"INFO","service":"gateway","request_id":"r-103","status":200,"message":"Request accepted"}
+{"timestamp":"2026-11-26T14:00:02.329Z","severity":"WARNING","service":"orders","request_id":"r-103","status":422,"message":"Order rejected by validation","code":"E3001"}
+{"timestamp":"2026-11-26T14:00:02.466Z","severity":"INFO","service":"gateway","request_id":"r-103","status":422,"message":"Request completed"}
+{"timestamp":"2026-11-26T14:00:02.603Z","severity":"INFO","service":"database","request_id":"r-104","status":200,"message":"Connection pool recovered"}

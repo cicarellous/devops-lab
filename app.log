@@ -1,0 +1,20 @@
+2026-11-26T14:00:00.000Z INFO service=gateway request_id=r-100 status=200 Request accepted
+2026-11-26T14:00:00.137Z INFO service=gateway request_id=r-101 status=200 Request accepted
+2026-11-26T14:00:00.274Z INFO service=orders request_id=r-100 status=200 Order lookup started
+2026-11-26T14:00:00.411Z INFO service=payments request_id=r-101 status=200 Authorization started
+2026-11-26T14:00:00.548Z WARNING service=database request_id=r-100 status=503 code=E1042 Connection pool nearly exhausted
+2026-11-26T14:00:00.685Z WARNING service=payments request_id=r-101 status=504 code=E2007 Upstream call timed out, retry scheduled
+2026-11-26T14:00:00.822Z INFO service=gateway request_id=r-102 status=200 Request accepted
+2026-11-26T14:00:00.959Z ERROR service=database request_id=r-100 status=503 code=E1042 Connection acquisition timed out
+2026-11-26T14:00:01.096Z ERROR service=orders request_id=r-100 status=503 code=E1042 Order lookup failed
+2026-11-26T14:00:01.233Z INFO service=orders request_id=r-102 status=200 Order lookup started
+2026-11-26T14:00:01.370Z INFO service=database request_id=r-102 status=200 Query completed
+2026-11-26T14:00:01.507Z INFO service=orders request_id=r-102 status=200 Order lookup completed
+2026-11-26T14:00:01.644Z ERROR service=payments request_id=r-101 status=504 code=E2007 Authorization retry timed out
+2026-11-26T14:00:01.781Z ERROR service=gateway request_id=r-100 status=503 code=E1042 Request failed
+2026-11-26T14:00:01.918Z ERROR service=gateway request_id=r-101 status=504 code=E2007 Request failed
+2026-11-26T14:00:02.055Z INFO service=gateway request_id=r-102 status=200 Request completed
+2026-11-26T14:00:02.192Z INFO service=gateway request_id=r-103 status=200 Request accepted
+2026-11-26T14:00:02.329Z WARNING service=orders request_id=r-103 status=422 code=E3001 Order rejected by validation
+2026-11-26T14:00:02.466Z INFO service=gateway request_id=r-103 status=422 Request completed
+2026-11-26T14:00:02.603Z INFO service=database request_id=r-104 status=200 Connection pool recovered

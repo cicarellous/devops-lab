@@ -111,5 +111,79 @@ class RegexTests(unittest.TestCase):
         self.assertIn("invalid --regex pattern", result.stderr)
 
 
+class SearchTests(unittest.TestCase):
+    def test_searches_arbitrary_text_and_merges_overlapping_context(self):
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "search", "-", "--regex",
+             "timeout|refused", "--context", "1"],
+            cwd=Path(__file__).resolve().parent,
+            input="before\n2026-11-26 timeout\n  stack frame\nconnection refused\nafter\nskipped\n",
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(result.stdout.splitlines(), [
+            "1: before",
+            "2: 2026-11-26 timeout",
+            "3:   stack frame",
+            "4: connection refused",
+            "5: after",
+        ])
+
+
+class GroupTests(unittest.TestCase):
+    def test_groups_equivalent_text_and_jsonl_examples(self):
+        repo = Path(__file__).resolve().parent
+        cases = [
+            ["app.log", "--regex", r"code=(?P<code>E\d{4})"],
+            ["app.jsonl", "--format", "jsonl"],
+        ]
+        for options in cases:
+            with self.subTest(options=options):
+                result = subprocess.run(
+                    [sys.executable, "log_summary.py", "group", *options, "--by", "code"],
+                    cwd=repo,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertEqual(
+                    result.stdout.splitlines(),
+                    [
+                        "COUNT  VALUE",
+                        '    4  "E1042"',
+                        '    3  "E2007"',
+                        '    1  "E3001"',
+                        "Scanned: 20  Grouped: 8  Skipped: 12",
+                    ],
+                )
+
+    def test_jsonl_stdin_skips_invalid_and_missing_values(self):
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "group", "-", "--format", "jsonl",
+             "--by", "service"],
+            cwd=Path(__file__).resolve().parent,
+            input='{"service":"gateway"}\ninvalid\n{}\n{"service":null}\n{"service":[]}\n',
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["COUNT  VALUE", '    1  "gateway"', "Scanned: 5  Grouped: 1  Skipped: 4"],
+        )
+
+    def test_text_group_requires_the_named_capture(self):
+        result = subprocess.run(
+            [sys.executable, "log_summary.py", "group", "app.log",
+             "--regex", "(?P<other>ERROR)", "--by", "code"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("named capture group 'code'", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
