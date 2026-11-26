@@ -1,8 +1,8 @@
 # Log Summary
 
 A Python CLI for incident triage. Summarize severity counts, search with context,
-rank recurring values, reconstruct a request timeline, or compare event counts
-and observed spans across IDs. It reads files or standard input.
+rank field values, reconstruct timelines across services, and investigate spikes
+or changes in event rates. Run it interactively or use JSON and exit codes in automation.
 
 | Task | Command |
 | --- | --- |
@@ -26,21 +26,21 @@ sudo dnf install python3.12
 python3.12 --version
 ```
 
-See [Red Hat's Python installation guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_basic_system_settings/installing-and-using-dynamic-programming-languages_configuring-basic-system-settings).
+[Red Hat's Python installation guide](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/8/html/configuring_basic_system_settings/installing-and-using-dynamic-programming-languages_configuring-basic-system-settings)
+
 On Windows, use Python 3.12 or later and substitute `python` for
 `python3.12` in an activated virtual environment. Run the following
 from the repository root:
 
 ```bash
-# From the devops-lab repository root
 cd log-summary
 python3.12 log_summary.py
 ```
 
 Run the remaining examples from `log-summary/`. The included `app.log` and
 `app.jsonl` represent the same 20 synthetic events, with interleaved requests,
-retries, and recurring error codes. Pass a UTF-8 file path (plain or `.gz`, with or without a BOM) or use `-` to read
-from standard input. Redirected stdin must be UTF-8. In Windows PowerShell,
+retries, and recurring error codes. Use UTF-8 input, with or without a BOM.
+Read plain or `.gz` files by path, or pass `-` for stdin. In Windows PowerShell,
 set `$OutputEncoding = [System.Text.UTF8Encoding]::new($false)` if an upstream
 PowerShell command needs to send non-ASCII text. Use a PowerShell
 pipeline in place of Bash's input redirection:
@@ -55,12 +55,12 @@ Get-Content app.log | python log_summary.py - --level ERROR
 python3.12 log_summary.py inspect incident.jsonl
 ```
 
-Inspect samples the first 100 lines by default. Add `--sample spread` to
+Inspect samples the first 100 lines by default. Set `--lines` to 1?1000. Add `--sample spread` to
 scan the full input once, including gzip or stdin, while retaining at most
 `--lines` sampled records. Spread keeps the first and last records when
 `--lines` is at least 2 and samples the interior reproducibly. With
-`--lines 1` it keeps the first record. It shows top-level field
-types, presence, and timestamp candidates. On `incident.jsonl`, look for
+`--lines 1` it keeps the first record. The report shows field types, presence, and timestamp
+candidates, including nested JSON fields. On `incident.jsonl`, look for
 `ts`, `code`, and `request`. Run the suggested `bucket` command, then add
 `--signature code --value TIMEOUT` to isolate the jump at 14:01 UTC.
 For key-value logs, inspect suggests `logfmt`. Save a suggested mapping with
@@ -70,11 +70,10 @@ the default grouping field (`by`). Its bucket suggestion preserves
 `--multiline` and chooses an interval for the sampled time span. Longer logs
 may need a wider interval. Existing files are kept intact.
 
-Empty results exit with status 0 by default. Add `--fail-on empty` to return
-3 instead. Guidance goes to stderr and distinguishes no matches, an empty
-window, and unusable input fields. For `inspect`, empty means there is no
-usable mapping to suggest. An empty result leaves `--profile-out` untouched. A partial profile can still
-be saved, with a warning if timed commands need an explicit `--time`.
+For `inspect --fail-on empty`, an empty result means no usable mapping was
+found. Without that gate, saving a profile with no usable mapping returns
+exit 2. A profile can still be saved without a timestamp mapping. Inspect
+warns when timed commands will need an explicit `--time`.
 
 ## Summarize severity
 
@@ -93,7 +92,8 @@ matched case-insensitively against INFO, WARNING, and ERROR. Coverage goes
 to stderr for JSON Lines and for text with unclassified lines. It counts
 lines after text filters, across all levels. Use `--levels INFO WARNING ERROR CRITICAL`
 to choose the severity vocabulary. `WARN` counts as `WARNING` unless you
-include `WARN` as its own level.
+include `WARN` as its own level. Use `--contains` or `--regex` to filter text
+and `--show-lines` to print the evidence before the counts in text output.
 
 Key-value logs can use `--format logfmt`. The parser reads consecutive
 `key=value` fields, including double-quoted values, after an optional ISO
@@ -115,7 +115,6 @@ including `.gz` files. Context stays within each file. When several inputs
 are searched, text prefixes each result with its source and JSON includes
 `source` on each result. JSON always lists the inputs under `sources`.
 Use `-` once to include stdin.
-
 
 Use `--contains` for case-sensitive literal text or `--regex` for a Python regular
 expression. When both are supplied, lines must match both. Overlapping context
@@ -140,9 +139,7 @@ python3.12 log_summary.py bucket stacktrace-example.txt --format logfmt --time t
 ```
 
 Search context counts records in multiline mode. Search and timeline JSON
-include the inclusive `line` and `end_line` of each displayed record. Coverage
-in search, group, timed commands, and inspect reports physical lines
-separately from logical records.
+include the inclusive `line` and `end_line` of each displayed record. Coverage reports physical lines separately from logical records.
 
 ## Group log entries
 
@@ -157,14 +154,14 @@ python3.12 log_summary.py group - --format jsonl --by service < app.jsonl
 
 Both error-code reports rank `E1042` (4), `E2007` (3), and `E3001` (1).
 Results are ordered by count, with ties sorted by displayed value.
-Each line contributes at most one value. Text uses the first regex match.
-JSON Lines uses a scalar field. Missing, empty, unmatched, and
+Each record contributes at most one value. Text uses the first regex match.
+JSON Lines uses a string, number, or Boolean field. Missing, empty, unmatched, and
 malformed records count as skipped. The footer shows how much of the input
 contributed to the report.
 
 ## Reconstruct an event timeline
 
-Select an ID and timestamp from JSON Lines fields or named regex captures in text.
+Select an ID and timestamp from JSON Lines, logfmt, or named regex captures.
 
 ```bash
 python3.12 log_summary.py timeline app.jsonl --format jsonl --key request_id --value r-100 --time timestamp
@@ -172,7 +169,7 @@ python3.12 log_summary.py timeline app.log --format logfmt --key request_id --va
 ```
 
 Both commands reconstruct the same six events for `r-100`. The tool sorts by
-ISO 8601 timestamp and prints each record with its UTC time and source line.
+resolved timestamp and prints each record with its time and source line.
 Ties retain source and line order. Timestamps without an offset are treated as
 UTC. The footer reports records that cannot yield an ID or matching events with
 an invalid or missing timestamp. Use `-` in place of the file path for stdin
@@ -189,7 +186,7 @@ python3.12 log_summary.py timeline --source incident.jsonl incident-profile.json
 Each `--source` pairs a file with its own profile. This example follows the
 same ID across JSON Lines and logfmt. The report includes per-source coverage.
 
-## Compare event groups
+## Rank and correlate IDs
 
 Use the same field mappings as `timeline` to compare every ID in a log:
 
@@ -267,12 +264,10 @@ line range, and a header preview of up to 240 characters. Use `--id FIELD`
 or an `id` mapping in the source profile to include a correlation ID.
 JSON includes an `examples` array on each flagged bucket when requested.
 
-
-
 Buckets align to UTC epoch intervals. Omitted bounds use observed timestamps before signature
 filtering. Empty buckets inside the reported range show zero observed
 events. Partial edge buckets show counts with no rate (`null` in JSON).
-Reports are limited to 10,000 buckets. Signature matching is exact unless
+Use positive intervals with `s`, `m`, `h`, or `d` units. Reports are limited to 10,000 buckets. Signature matching is exact unless
 you pass `--ignore-case`. Use `--level ERROR` to bucket by severity directly.
 JSON includes the severity selection, case rule, and `matched: false` when
 no events counted, even if the report contains zero-count buckets.
@@ -297,7 +292,8 @@ records without a usable signature. `outside_windows` is separate.
 ## Analyze multiple sources
 
 Use the same `--source FILE PROFILE` pairs with `compare`, `correlate`, and
-`timeline`. Each profile maps the fields in its own file. Quote a glob such
+`timeline`. Each profile maps the fields in its own file. Use these pairs in place of a
+positional file and global field mappings. Quote a glob such
 as `'logs/*.jsonl.gz'` to apply one profile to all matching files.
 
 ```bash
@@ -368,9 +364,9 @@ Profile keys are `format`, `time`, `time_format`, `regex`, `signature`,
 Use `regex` for named captures in text logs. For severity summary, the text
 profile regex captures `level` (or the configured `level_field`), while the
 CLI's `--regex` still filters whole lines. The `id` field supplies `--key`
-for timeline and correlation. Explicit flags override the profile. Bucket uses its signature mapping when you pass
-`--value`. Time
-windows, requested values, and output options stay on the command line.
+for timeline and correlation. Explicit flags override a single `--profile`.
+Bucket uses its signature mapping when you pass `--value`. Set time windows,
+requested values, and output options on the command line.
 
 ## Gate a comparison
 
@@ -388,7 +384,7 @@ hidden breach and how many were hidden.
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Completed, including empty results by default |
+| `0` | Completed, including empty reports by default |
 | `1` | Input or output error |
 | `2` | Invalid arguments or profile |
 | `3` | Empty result with `--fail-on empty`, or a gate could not evaluate |
@@ -404,7 +400,7 @@ python3.12 -m unittest -v
 
 In GitHub Actions, **Log Summary CI** runs the suite in Red Hat UBI 8
 with Python 3.12. It also shows Python 3.12 tests on Ubuntu and Windows,
-Python 3.13 tests on Ubuntu, Python 3.14 tests on Ubuntu and Windows, and a Ruff and mypy job. You can see each run in the repository's **Actions** tab.
+Python 3.13 tests on Ubuntu, Python 3.14 tests on Ubuntu and Windows, and a Ruff and mypy job. View the runs in the repository?s **Actions** tab.
 
 The Ubuntu Python 3.14 job also publishes line and branch coverage for
 `log_summary.py` in the run summary, including CLI subprocesses launched by

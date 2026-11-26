@@ -38,19 +38,21 @@ EPOCH_FIELD_NAME = re.compile(
     r"|^(?:created|updated|logged|observed|received)_at$",
     re.IGNORECASE,
 )
+JSON_DECODER = json.JSONDecoder()
 TIMESTAMP_PREFIX = re.compile(
     r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?"
     r"(?:Z|[+-]\d{2}:?\d{2})?[ \t]+"
 )
 
 
-def is_json_object_line(line: str) -> bool:
-    if not line.lstrip().startswith("{"):
-        return False
+def json_object(line: str) -> dict[str, object] | None:
+    if not (line.startswith("{") or line.lstrip(" \t\r\n").startswith("{")):
+        return None
     try:
-        return isinstance(json.loads(line), dict)
+        record = JSON_DECODER.decode(line)
     except (ValueError, RecursionError):
-        return False
+        return None
+    return record if isinstance(record, dict) else None
 
 
 def log_records(
@@ -66,7 +68,7 @@ def log_records(
     start = last = size = 0
     for number, line in enumerate(lines, start=1):
         continuation = line.startswith((" ", "\t"))
-        if continuation and preserve_jsonl and is_json_object_line(line):
+        if continuation and preserve_jsonl and json_object(line) is not None:
             continuation = False
         if pending and not continuation:
             yield start, last, pending[0], "".join(pending)
@@ -96,7 +98,7 @@ def line_range(start: int, end: int) -> str:
 
 def add_multiline_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--multiline", action="store_true",
-                        help="attach indented continuation lines to the preceding record")
+                        help="attach indented text lines to the previous record")
 
 
 @dataclass
@@ -229,7 +231,7 @@ def compile_pattern(parser: argparse.ArgumentParser, value: str | None) -> re.Pa
 
 
 def add_report_arguments(parser: argparse.ArgumentParser, *, gate: str = "") -> None:
-    parser.add_argument("--json", action="store_true", help="emit versioned JSON")
+    parser.add_argument("--json", action="store_true", help="write a versioned JSON report to stdout")
     choices = ("empty", gate) if gate else ("empty",)
     help_text = "exit 3 when the result is empty"
     if gate == "increase":
@@ -347,7 +349,7 @@ def positive_count(value: str) -> int:
 def group_log(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="log_summary.py group",
-        description="Rank values extracted from text or JSON Lines logs by frequency.",
+        description="Rank extracted field values by frequency.",
         epilog="Use a field from JSON Lines or logfmt, or a named regex capture for text.",
     )
     parser.add_argument("log_file", nargs="?", help="log file path or - for stdin")
@@ -358,7 +360,7 @@ def group_log(argv: list[str]) -> int:
     )
     parser.add_argument("--profile", metavar="FILE", help="JSON log mapping")
     parser.add_argument("--by", metavar="FIELD",
-                        help="named regex group or top-level JSON field")
+                        help="field, dotted JSON path, or named regex capture")
     parser.add_argument("--regex", metavar="PATTERN",
                         help="Python regex with a named capture for text input")
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
@@ -390,14 +392,14 @@ def group_log(argv: list[str]) -> int:
                         value = match.group(mapping.by) if match else None
                     else:
                         value = log_field(event_fields(line, None, mapping.format), mapping.by)
-                    if value is None or value == "" or not isinstance(value, (str, int, float, bool)):
-                        continue
-                    if isinstance(value, float) and not isfinite(value):
-                        continue
                     if isinstance(value, str):
+                        if not value:
+                            continue
                         strings[value] += 1
-                    else:
+                    elif isinstance(value, int) or (isinstance(value, float) and isfinite(value)):
                         encoded_values[json.dumps(value)] += 1
+                    else:
+                        continue
                     source_grouped += 1
         except (OSError, UnicodeError) as error:
             return report_input_error(path, error)
@@ -558,7 +560,7 @@ def add_window_arguments(
 
 def add_source_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source", action="append", nargs=2, metavar=("FILE", "PROFILE"),
-                        help="file or glob and its JSON profile; repeat for multiple sources")
+                        help="file or quoted glob and its JSON profile. Repeat for multiple inputs instead of a positional file")
 
 
 def expand_log_paths(parser: argparse.ArgumentParser, path: str) -> list[str]:
@@ -605,8 +607,8 @@ def source_name(path: str) -> str:
     return "<stdin>" if path == "-" else path
 
 
-def add_event_arguments(parser: argparse.ArgumentParser, *, optional_file: bool = False) -> None:
-    parser.add_argument("log_file", nargs="?" if optional_file else None,
+def add_event_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("log_file", nargs="?",
                         help="log file path or - for stdin")
     add_mapping_arguments(parser)
     parser.add_argument("--key", help="ID field or named regex capture (profile: id)")
@@ -669,17 +671,15 @@ def event_fields(
     if pattern is not None:
         match = pattern.search(text)
         return match.groupdict() if match else {}
-    try:
-        record = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
-    return record if isinstance(record, dict) else {}
+    record = json_object(text)
+    return record if record is not None else {}
 
 
 def log_field(record: dict[str, object], name: str) -> object:
-    if name in record or "." not in name:
-        return record.get(name)
-    value: object = record
+    value = record.get(name)
+    if value is not None or "." not in name or name in record:
+        return value
+    value = record
     for part in name.split("."):
         if not isinstance(value, dict):
             return None
@@ -688,7 +688,9 @@ def log_field(record: dict[str, object], name: str) -> object:
 
 
 def event_id(value: object) -> str | None:
-    if isinstance(value, (str, int, float)) and not isinstance(value, bool) and value != "":
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         return str(value)
     return None
 
@@ -732,7 +734,7 @@ def event_time(value: object, time_format: str = "iso") -> datetime | None:
         timestamp = datetime.fromisoformat(value)
         if timestamp.tzinfo is None:
             return timestamp.replace(tzinfo=timezone.utc)
-        return timestamp.astimezone(timezone.utc)
+        return timestamp if timestamp.tzinfo is timezone.utc else timestamp.astimezone(timezone.utc)
     except (ValueError, OverflowError):
         return None
 
@@ -830,7 +832,7 @@ def timeline_log(argv: list[str]) -> int:
         prog="log_summary.py timeline",
         description="Show events for one ID in chronological order.",
     )
-    add_event_arguments(parser, optional_file=True)
+    add_event_arguments(parser)
     add_source_option(parser)
     parser.add_argument("--value", required=True, help="ID to match exactly")
     add_multiline_option(parser)
@@ -947,7 +949,7 @@ def correlate_log(argv: list[str]) -> int:
         prog="log_summary.py correlate",
         description="Summarize event counts and observed time spans by ID.",
     )
-    add_event_arguments(parser, optional_file=True)
+    add_event_arguments(parser)
     add_source_option(parser)
     parser.add_argument("--sort", choices=("span", "count"), default="span",
                         help="rank IDs by observed span or event count (default: span)")
@@ -1145,8 +1147,8 @@ def compare_log(argv: list[str]) -> int:
     parser.add_argument("--signature", help="error code or other stable event field")
     parser.add_argument("--service", help="optional service field")
     parser.add_argument("--id", help="optional request or transaction ID field")
-    parser.add_argument("--baseline", nargs=2, metavar=("START", "END"), required=True)
-    parser.add_argument("--incident", nargs=2, metavar=("START", "END"), required=True)
+    parser.add_argument("--baseline", nargs=2, metavar=("START", "END"), required=True, help="baseline window (ISO 8601)")
+    parser.add_argument("--incident", nargs=2, metavar=("START", "END"), required=True, help="incident window (ISO 8601)")
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     add_multiline_option(parser)
     parser.add_argument(
@@ -1191,56 +1193,60 @@ def compare_log(argv: list[str]) -> int:
         name = source_name(path)
         times = RecordTimeReader(name, mapping.time, mapping.time_format)
         parse_time = event_time if times.time_format == "iso" else times.parse
-        source_counts = dict.fromkeys(
-            ("scanned", "used", "baseline_scanned", "baseline_used", "incident_scanned",
-             "incident_used", "invalid_timestamp", "outside_windows"), 0
-        )
-        source_lines = 0
+        baseline_scanned, baseline_used = baseline.scanned, baseline.used
+        incident_scanned, incident_used = incident.scanned, incident.used
+        source_lines = source_scanned = source_invalid = source_outside = 0
         try:
             with open_log(path) as log_file:
                 records = log_records(log_file, multiline=args.multiline and mapping.format != "jsonl")
                 for line_number, source_lines, header, _ in records:
-                    source_counts["scanned"] += 1
+                    source_scanned += 1
                     record = event_fields(header.rstrip("\r\n"), pattern, mapping.format)
                     timestamp = parse_time(log_field(record, mapping.time))
                     if timestamp is None:
-                        source_counts['invalid_timestamp'] += 1
+                        source_invalid += 1
                         continue
                     if baseline.start <= timestamp < baseline.end:
                         window = baseline
-                        window_name = "baseline"
                     elif incident.start <= timestamp < incident.end:
                         window = incident
-                        window_name = "incident"
                     else:
-                        source_counts['outside_windows'] += 1
+                        source_outside += 1
                         continue
 
                     window.scanned += 1
-                    source_counts[f"{window_name}_scanned"] += 1
                     signature = event_id(log_field(record, mapping.signature))
                     if signature is None:
                         continue
                     service = event_id(log_field(record, mapping.service)) if mapping.service else None
                     event_key = event_id(log_field(record, mapping.id)) if mapping.id else None
                     window.used += 1
-                    source_counts["used"] += 1
-                    source_counts[f"{window_name}_used"] += 1
                     group = (service, signature)
-                    if group not in window.groups:
-                        window.groups[group] = SignatureStats()
-                    window.groups[group].record(name, line_number, event_key)
+                    stats = window.groups.get(group)
+                    if stats is None:
+                        stats = window.groups[group] = SignatureStats()
+                    stats.record(name, line_number, event_key)
         except (OSError, UnicodeError) as error:
             return report_input_error(path, error)
         times.warn_if_unit_suspect()
         physical_lines += source_lines
-        unknown_time += source_counts["invalid_timestamp"]
-        outside += source_counts["outside_windows"]
+        unknown_time += source_invalid
+        outside += source_outside
+        used_baseline = baseline.used - baseline_used
+        used_incident = incident.used - incident_used
+        source_used = used_baseline + used_incident
         coverage.append({
             "source": name,
-            **source_counts,
+            "scanned": source_scanned,
+            "used": source_used,
+            "baseline_scanned": baseline.scanned - baseline_scanned,
+            "baseline_used": used_baseline,
+            "incident_scanned": incident.scanned - incident_scanned,
+            "incident_used": used_incident,
+            "invalid_timestamp": source_invalid,
+            "outside_windows": source_outside,
             "physical_lines": source_lines,
-            "skipped": source_counts["scanned"] - source_counts["used"] - source_counts["outside_windows"],
+            "skipped": source_scanned - source_used - source_outside,
         })
 
     empty = SignatureStats()
@@ -1448,7 +1454,7 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("log_file", nargs="?", help="log file path or - for stdin")
     add_source_option(parser)
     add_mapping_arguments(parser)
-    parser.add_argument("--interval", required=True, type=interval_seconds, help="bucket width, e.g. 30s or 5m")
+    parser.add_argument("--interval", required=True, type=interval_seconds, help="positive bucket width in s, m, h, or d (e.g. 30s)")
     parser.add_argument(
         "--spike-factor", type=spike_factor, metavar="N",
         help="flag counts above N times the median of the previous 5 full buckets (N > 1, median > 0)",
@@ -1461,13 +1467,13 @@ def bucket_log(argv: list[str]) -> int:
         "--spike-examples", type=positive_count, metavar="N",
         help="show the first N counted events per spike (1-10, requires --spike-factor)",
     )
-    parser.add_argument("--id", help="optional correlation ID field for spike examples")
+    parser.add_argument("--id", help="correlation ID field for --spike-examples (profile: id)")
     add_window_arguments(parser, exclusive_until=True)
     parser.add_argument("--signature", help="field used to select events")
     parser.add_argument("--level", help="filter severity, case-insensitively (WARN aliases WARNING)")
     parser.add_argument("--level-field", help="severity field (JSONL: severity; text or logfmt: level)")
     parser.add_argument("--value", help="exact value to count in the signature field")
-    parser.add_argument("--ignore-case", action="store_true", help="match signature values case-insensitively")
+    parser.add_argument("--ignore-case", action="store_true", help="match --value case-insensitively")
     add_multiline_option(parser)
     add_display_timezone(parser)
     add_report_arguments(parser, gate="spike")
@@ -1548,10 +1554,9 @@ def bucket_log(argv: list[str]) -> int:
                         continue
 
                     tick = (timestamp - EPOCH) // MICROSECOND
-                    extends_range = first is None or last is None or tick < first or tick > last
-                    first = tick if first is None else min(first, tick)
-                    last = tick if last is None else max(last, tick)
-                    if inferred_bounds and extends_range:
+                    if inferred_bounds and (first is None or last is None or tick < first or tick > last):
+                        first = tick if first is None or tick < first else first
+                        last = tick if last is None or tick > last else last
                         start_tick = start_bound if start_bound is not None else first
                         end_tick = end_bound - 1 if end_bound is not None else last
                         if end_tick // width - start_tick // width + 1 > MAX_BUCKETS:
@@ -1567,7 +1572,7 @@ def bucket_log(argv: list[str]) -> int:
                             continue
                     bucket_index = tick // width
                     counts[bucket_index] += 1
-                    if counts[bucket_index] <= example_limit:
+                    if example_limit and counts[bucket_index] <= example_limit:
                         preview = header.rstrip("\r\n")
                         examples.setdefault(bucket_index, []).append({
                             "source": name, "line": line_number, "end_line": source_lines,
@@ -1791,9 +1796,9 @@ def inspect_log(argv: list[str]) -> int:
     parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines or multiline records (1-1000)")
     parser.add_argument(
         "--sample", choices=("head", "spread"), default="head",
-        help="head stops at --lines (default). Spread scans all input and samples across it",
+        help="head stops at --lines (default). Spread scans all input and retains up to --lines records",
     )
-    parser.add_argument("--profile-out", metavar="FILE", help="write a new profile when a usable mapping is found")
+    parser.add_argument("--profile-out", metavar="FILE", help="save a usable mapping to a new file without overwriting")
     add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
@@ -1814,11 +1819,8 @@ def inspect_log(argv: list[str]) -> int:
             for start, end, line in sample_records:
                 sampled += 1
                 physical_lines += end - start + 1
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    record = None
-                if isinstance(record, dict):
+                record = json_object(line)
+                if record is not None:
                     objects += 1
                     record = inspect_json_fields(record)
                     sample_fields = json_fields
@@ -2015,7 +2017,7 @@ def main() -> int:
         return commands[argv[0]](argv[1:])
 
     parser = argparse.ArgumentParser(
-        description="Count INFO, WARNING, and ERROR entries in text, JSON Lines, or logfmt.",
+        description="Summarize severity and investigate UTF-8 logs (plain files, gzip, or stdin).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Commands (add -h after a command for its options):\n"
@@ -2027,20 +2029,11 @@ def main() -> int:
             "  bucket      Show observed event rates over time\n"
             "  inspect     Sample input and suggest field mappings\n\n"
             "Exit codes: 0 success, 1 I/O error, 2 usage error, 3 empty or missing gate data, 4 gate breached.\n\n"
-            "Examples:\n"
-            "  python3.12 log_summary.py                 Count levels in app.log\n"
-            "  python3.12 log_summary.py app.jsonl --format jsonl\n"
-            "  python3.12 log_summary.py app.log --level ERROR\n"
-            "                                        Show only the ERROR count\n"
+            "Examples (use python in an activated Windows environment):\n"
             '  python3.12 log_summary.py app.log --level ERROR --contains "timed out"\n'
-            "                                        Count ERROR lines containing timed out\n"
-            '  python3.12 log_summary.py app.log --level ERROR --contains "timed out" --show-lines\n'
-            "                                        Print matching lines with line numbers\n"
-            "  python3.12 log_summary.py - --level ERROR < app.log\n"
-            "                                        Read UTF-8 stdin on Linux\n"
-            "  Get-Content app.log | python log_summary.py - --level ERROR\n"
-            "                                        Read from a PowerShell pipeline\n"
-            '  python3.12 log_summary.py app.log --regex "timed out|lookup failed"'
+            "  python3.12 log_summary.py app.jsonl --format jsonl --json\n"
+            "  python3.12 log_summary.py - --level ERROR < app.log  # Bash\n"
+            "  Get-Content app.log | python log_summary.py - --level ERROR  # PowerShell"
         ),
     )
     parser.add_argument("--version", action="version", version=f"Log Summary {VERSION}")
@@ -2063,7 +2056,7 @@ def main() -> int:
     parser.add_argument(
         "--show-lines",
         action="store_true",
-        help="print matching lines with original line numbers before the counts",
+        help="print matching lines and line numbers before the counts (text output only)",
     )
     parser.add_argument(
         "--regex",
@@ -2072,7 +2065,7 @@ def main() -> int:
     )
     add_source_option(parser)
     parser.add_argument("--profile", metavar="FILE", help="JSON log mapping")
-    parser.add_argument("--format", choices=LOG_FORMATS)
+    parser.add_argument("--format", choices=LOG_FORMATS, help="input format (default: text)")
     parser.add_argument("--level-field", help="severity field (JSONL: severity; logfmt or text profile: level)")
     parser.add_argument("--levels", nargs="+", metavar="LEVEL", help="severity vocabulary (default: INFO WARNING ERROR; WARN aliases WARNING)")
     add_multiline_option(parser)

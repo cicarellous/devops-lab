@@ -1179,11 +1179,11 @@ class MultiSourceAnalysisTests(unittest.TestCase):
 
 
 class AutomationContractTests(unittest.TestCase):
-    def run_cli(self, *args, data=None):
+    def run_cli(self, *args, data=None, env=None):
         return subprocess.run(
             [sys.executable, "log_summary.py", *args],
             cwd=Path(__file__).resolve().parent, input=data,
-            text=True, capture_output=True,
+            text=True, capture_output=True, env=env,
         )
 
     def test_correlate_json_hands_ranked_id_to_timeline(self):
@@ -1199,6 +1199,21 @@ class AutomationContractTests(unittest.TestCase):
         timeline = self.run_cli("timeline", *sources, "--value", row["id"], "--json")
         self.assertEqual(timeline.returncode, 0, timeline.stderr)
         self.assertEqual(len(json.loads(timeline.stdout)["events"]), row["events"])
+
+    def test_structured_commands_skip_json_that_exceeds_decoder_limits(self):
+        malformed = '{"value":' + "9" * 5000 + '}\n'
+        valid = '{"severity":"ERROR","code":"E1","timestamp":"2026-11-26T14:00Z"}\n'
+        cases = [
+            (("-", "--format", "jsonl"), "unclassified"),
+            (("group", "-", "--format", "jsonl", "--by", "code"), "skipped"),
+            (("inspect", "-"), "json_objects"),
+        ]
+        for args, metric in cases:
+            with self.subTest(args=args):
+                result = self.run_cli(*args, "--json", data=malformed + valid,
+                                      env={**environ, "PYTHONINTMAXSTRDIGITS": "4300"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout)["coverage"][metric], 1)
 
     def test_inspect_and_group_use_nested_fields_with_clean_json(self):
         data = '{"event":{"ts":"2026-11-26T14:00Z","code":"E1"}}\n'
