@@ -371,3 +371,7 @@ python -m unittest -v
 
 In GitHub Actions, **Log Summary CI** shows Python 3.12 tests on Ubuntu and Windows,
 Python 3.13 tests on Ubuntu, Python 3.14 tests on Ubuntu and Windows, and a Ruff and mypy job. You can see each run in the repository's **Actions** tab.
+
+The Ubuntu Python 3.14 job also publishes line and branch coverage for
+`log_summary.py` in the run summary, including CLI subprocesses launched by
+the tests. Coverage reporting has no minimum percentage.

@@ -38,11 +38,50 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - name: Install coverage.py
+        if: matrix.platform == 'Ubuntu' && matrix.python == '3.14'
+        run: python -m pip install coverage==7.13.5
+
       - name: Run Log Summary unit tests
         id: unittest
         working-directory: log-summary
         shell: bash
-        run: python -m unittest -v 2>&1 | tee "$RUNNER_TEMP/log-summary-unittest.log"
+        env:
+          MEASURE_COVERAGE: ${{ matrix.platform == 'Ubuntu' && matrix.python == '3.14' }}
+          COVERAGE_FILE: ${{ runner.temp }}/log-summary.coverage
+        run: |
+          if [[ "$MEASURE_COVERAGE" == "true" ]]; then
+            python -m coverage run -m unittest -v 2>&1 | tee "$RUNNER_TEMP/log-summary-unittest.log"
+          else
+            python -m unittest -v 2>&1 | tee "$RUNNER_TEMP/log-summary-unittest.log"
+          fi
+
+      - name: Publish line and branch coverage
+        if: ${{ !cancelled() && matrix.platform == 'Ubuntu' && matrix.python == '3.14' && steps.unittest.outcome == 'success' }}
+        working-directory: log-summary
+        shell: bash
+        env:
+          COVERAGE_FILE: ${{ runner.temp }}/log-summary.coverage
+        run: |
+          python -m coverage combine
+          python -m coverage json -o "$RUNNER_TEMP/log-summary-coverage.json"
+          python - "$RUNNER_TEMP/log-summary-coverage.json" <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import sys
+          from pathlib import Path
+
+          totals = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["totals"]
+          print("### Log Summary coverage (Ubuntu, Python 3.14)\n")
+          print("| Metric | Covered / Total | Coverage |")
+          print("| --- | ---: | ---: |")
+          for label, covered_key, total_key in (
+              ("Lines", "covered_lines", "num_statements"),
+              ("Branches", "covered_branches", "num_branches"),
+          ):
+              covered, total = totals[covered_key], totals[total_key]
+              percentage = f"{covered / total:.1%}" if total else "N/A"
+              print(f"| {label} | {covered} / {total} | {percentage} |")
+          PY
 
       - name: Summarize unit tests
         if: always()
