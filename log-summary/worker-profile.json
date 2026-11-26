@@ -1,5 +1,7 @@
 {
   "format": "logfmt",
   "time": "timestamp",
-  "id": "job"
+  "id": "job",
+  "service": "service",
+  "signature": "code"
 }

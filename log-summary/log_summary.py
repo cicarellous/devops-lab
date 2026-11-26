@@ -275,6 +275,42 @@ def add_window_arguments(
     end.add_argument("--until", metavar="TIME", help=until_help)
 
 
+def add_source_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--source", action="append", nargs=2, metavar=("FILE", "PROFILE"),
+                        help="source and its JSON profile; repeat for multiple sources")
+
+
+def source_mappings(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    required: tuple[str, ...],
+    optional: tuple[str, ...] = (),
+) -> list[tuple[str, argparse.Namespace]]:
+    fields = ("profile", "format", "regex", *required, *optional)
+    if args.source:
+        if args.log_file is not None or any(getattr(args, name) is not None for name in fields):
+            parser.error("--source replaces the positional file and global mapping options")
+        if sum(path == "-" for path, _ in args.source) > 1:
+            parser.error("stdin can only be used as one source")
+        mappings = [
+            (path, argparse.Namespace(profile=profile, **dict.fromkeys(fields[1:])))
+            for path, profile in args.source
+        ]
+    elif args.log_file is not None:
+        mappings = [(args.log_file, args)]
+    else:
+        parser.error("supply a log file or --source FILE PROFILE")
+
+    for _, mapping in mappings:
+        apply_log_mapping(parser, mapping, required=required, optional=optional)
+    return mappings
+
+
+def source_name(path: str) -> str:
+    return "<stdin>" if path == "-" else path
+
+
 def add_event_arguments(parser: argparse.ArgumentParser, *, optional_file: bool = False) -> None:
     parser.add_argument("log_file", nargs="?" if optional_file else None,
                         help="log file path or - for stdin")
@@ -398,7 +434,7 @@ class TimelineSource:
 
     @property
     def name(self) -> str:
-        return "<stdin>" if self.path == "-" else self.path
+        return source_name(self.path)
 
 
 @dataclass
@@ -415,32 +451,16 @@ def timeline_log(argv: list[str]) -> int:
         description="Show events for one ID in chronological order.",
     )
     add_event_arguments(parser, optional_file=True)
-    parser.add_argument("--source", action="append", nargs=2, metavar=("FILE", "PROFILE"),
-                        help="source and its JSON profile; repeat for multiple sources")
+    add_source_option(parser)
     parser.add_argument("--value", required=True, help="ID to match exactly")
     parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     args = parser.parse_args(argv)
     since, until, exclusive_end = event_window(parser, args)
 
-    if args.source:
-        if args.log_file is not None or any(
-            value is not None for value in (args.profile, args.format, args.key, args.time, args.regex)
-        ):
-            parser.error("--source replaces the positional file and global mapping options")
-        if sum(path == "-" for path, _ in args.source) > 1:
-            parser.error("stdin can only be used as one source")
-        mappings = [
-            (path, argparse.Namespace(profile=profile, format=None, key=None, time=None, regex=None))
-            for path, profile in args.source
-        ]
-    elif args.log_file is not None:
-        mappings = [(args.log_file, args)]
-    else:
-        parser.error("supply a log file or --source FILE PROFILE")
+    mappings = source_mappings(parser, args, required=("key", "time"))
 
     sources: list[TimelineSource] = []
     for path, mapping in mappings:
-        apply_log_mapping(parser, mapping, required=("key", "time"))
         pattern = event_pattern(parser, mapping)
         sources.append(TimelineSource(path, mapping.key, mapping.time, pattern, mapping.format))
 
@@ -527,42 +547,52 @@ def correlate_log(argv: list[str]) -> int:
         prog="log_summary.py correlate",
         description="Summarize event counts and observed time spans by ID.",
     )
-    add_event_arguments(parser)
+    add_event_arguments(parser, optional_file=True)
+    add_source_option(parser)
     parser.add_argument("--sort", choices=("span", "count"), default="span",
                         help="rank IDs by observed span or event count (default: span)")
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     args = parser.parse_args(argv)
-    apply_log_mapping(parser, args, required=("key", "time"))
-    pattern = event_pattern(parser, args)
+    mappings = source_mappings(parser, args, required=("key", "time"))
+    patterns = [event_pattern(parser, mapping) for _, mapping in mappings]
     since, until, exclusive_end = event_window(parser, args)
 
     groups: dict[str, EventStats] = {}
-    scanned = 0
-    skipped = 0
-    try:
-        with open_log(args.log_file) as log_file:
-            for line in log_file:
-                scanned += 1
-                fields = event_fields(line.rstrip("\r\n"), pattern, args.format)
-                key = event_id(fields.get(args.key))
-                timestamp = event_time(fields.get(args.time))
-                if key is None or timestamp is None:
-                    skipped += 1
-                    continue
+    sources_by_id: dict[str, set[str]] = {}
+    coverage: list[tuple[str, int, int, int]] = []
+    for (path, mapping), pattern in zip(mappings, patterns):
+        name = source_name(path)
+        source_scanned = source_skipped = source_used = 0
+        try:
+            with open_log(path) as log_file:
+                for line in log_file:
+                    source_scanned += 1
+                    fields = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
+                    key = event_id(fields.get(mapping.key))
+                    timestamp = event_time(fields.get(mapping.time))
+                    if key is None or timestamp is None:
+                        source_skipped += 1
+                        continue
 
-                if not since <= timestamp <= until or (exclusive_end and timestamp == until):
-                    continue
+                    if not since <= timestamp <= until or (exclusive_end and timestamp == until):
+                        continue
 
-                stats = groups.get(key)
-                if stats is None:
-                    groups[key] = EventStats(timestamp, timestamp)
-                else:
-                    stats.first = min(stats.first, timestamp)
-                    stats.last = max(stats.last, timestamp)
-                    stats.count += 1
-    except (OSError, UnicodeError) as error:
-        return report_input_error(args.log_file, error)
+                    source_used += 1
+                    if len(mappings) > 1:
+                        sources_by_id.setdefault(key, set()).add(name)
+                    stats = groups.get(key)
+                    if stats is None:
+                        groups[key] = EventStats(timestamp, timestamp)
+                    else:
+                        stats.first = min(stats.first, timestamp)
+                        stats.last = max(stats.last, timestamp)
+                        stats.count += 1
+        except (OSError, UnicodeError) as error:
+            return report_input_error(path, error)
+        coverage.append((name, source_scanned, source_used, source_skipped))
 
+    scanned = sum(row[1] for row in coverage)
+    skipped = sum(row[3] for row in coverage)
     # Sort the IDs first to break ties consistently even when input is reordered.
     ranked = sorted(groups)
     if args.sort == "span":
@@ -570,20 +600,30 @@ def correlate_log(argv: list[str]) -> int:
     else:
         ranked.sort(key=lambda key: groups[key].count, reverse=True)
 
-    print("EVENTS  OBSERVED SPAN   FIRST (UTC)                       LAST (UTC)                        ID")
+    heading = "EVENTS  OBSERVED SPAN   FIRST (UTC)                       LAST (UTC)                        ID"
+    print(heading + ("  SOURCES" if len(mappings) > 1 else ""))
     for key in ranked[:args.top]:
         stats = groups[key]
         span = stats.last - stats.first
+        source_list = json.dumps(sorted(sources_by_id[key])) if key in sources_by_id else ""
         print(
             f"{stats.count:6}  {str(span):14}  "
             f"{stats.first.isoformat(timespec='microseconds')}  "
             f"{stats.last.isoformat(timespec='microseconds')}  {json.dumps(key)}"
+            + (f"  {source_list}" if source_list else "")
         )
     if args.top is not None:
         print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} IDs")
+    if len(coverage) > 1:
+        for name, seen, used, invalid in coverage:
+            print(f"{name}: scanned {seen}, used {used}, skipped {invalid}")
     print(f"Scanned: {scanned}  IDs: {len(groups)}  Skipped: {skipped}")
     if scanned and scanned == skipped:
-        print(f"No usable events. Run inspect to check the {args.key!r} and {args.time!r} mappings.", file=sys.stderr)
+        if len(mappings) == 1:
+            mapping = mappings[0][1]
+            print(f"No usable events. Run inspect to check the {mapping.key!r} and {mapping.time!r} mappings.", file=sys.stderr)
+        else:
+            print("No usable events. Run inspect to check each source's ID and timestamp mappings.", file=sys.stderr)
     elif scanned and not groups:
         print("No usable events in the requested window. Check the time bounds.", file=sys.stderr)
     elif not scanned:
@@ -595,14 +635,16 @@ def correlate_log(argv: list[str]) -> int:
 class SignatureStats:
     count: int = 0
     ids: set[str] = field(default_factory=set)
+    example_source: str | None = None
     example_line: int = 0
     example_id: str | None = None
 
-    def record(self, line_number: int, event_key: str | None) -> None:
+    def record(self, source: str, line_number: int, event_key: str | None) -> None:
         self.count += 1
         if event_key is not None:
             self.ids.add(event_key)
         if not self.example_line or (self.example_id is None and event_key is not None):
+            self.example_source = source
             self.example_line = line_number
             self.example_id = event_key
 
@@ -635,7 +677,8 @@ def compare_log(argv: list[str]) -> int:
         description="Rank signature changes between baseline and incident windows.",
         epilog="Windows include START and exclude END. The baseline must end by the incident start. Times without offsets use UTC.",
     )
-    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("log_file", nargs="?", help="log file path or - for stdin")
+    add_source_option(parser)
     add_mapping_arguments(parser)
     parser.add_argument("--signature", help="error code or other stable event field")
     parser.add_argument("--service", help="optional service field")
@@ -645,49 +688,75 @@ def compare_log(argv: list[str]) -> int:
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
     parser.add_argument("--json", action="store_true", help="emit versioned JSON")
     args = parser.parse_args(argv)
-    apply_log_mapping(parser, args, required=("time", "signature"), optional=("service", "id"))
-
-    pattern = input_pattern(parser, args)
-    if pattern is not None:
-        fields = {args.time, args.signature, args.service, args.id} - {None}
-        missing = fields - pattern.groupindex.keys()
-        if missing:
-            parser.error(f"--regex is missing named captures: {', '.join(sorted(missing))}")
+    mappings = source_mappings(
+        parser, args, required=("time", "signature"), optional=("service", "id")
+    )
+    patterns = []
+    for _, mapping in mappings:
+        pattern = input_pattern(parser, mapping)
+        if pattern is not None:
+            fields = {mapping.time, mapping.signature, mapping.service, mapping.id} - {None}
+            missing = fields - pattern.groupindex.keys()
+            if missing:
+                parser.error(f"--regex is missing named captures: {', '.join(sorted(missing))}")
+        patterns.append(pattern)
+    has_service = any(mapping.service is not None for _, mapping in mappings)
+    has_id = any(mapping.id is not None for _, mapping in mappings)
     baseline = comparison_window(parser, "baseline", args.baseline)
     incident = comparison_window(parser, "incident", args.incident)
     if baseline.end > incident.start:
         parser.error("the baseline must end at or before the incident starts")
 
+    coverage: list[dict[str, str | int]] = []
     unknown_time = outside = 0
-    try:
-        with open_log(args.log_file) as log_file:
-            for line_number, line in enumerate(log_file, start=1):
-                record = event_fields(line.rstrip("\r\n"), pattern, args.format)
-                timestamp = event_time(record.get(args.time))
-                if timestamp is None:
-                    unknown_time += 1
-                    continue
-                if baseline.start <= timestamp < baseline.end:
-                    window = baseline
-                elif incident.start <= timestamp < incident.end:
-                    window = incident
-                else:
-                    outside += 1
-                    continue
+    for (path, mapping), pattern in zip(mappings, patterns):
+        name = source_name(path)
+        source_counts = dict.fromkeys(
+            ("scanned", "used", "baseline_scanned", "baseline_used", "incident_scanned",
+             "incident_used", "invalid_timestamp", "outside_windows"), 0
+        )
+        try:
+            with open_log(path) as log_file:
+                for line_number, line in enumerate(log_file, start=1):
+                    source_counts["scanned"] += 1
+                    record = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
+                    timestamp = event_time(record.get(mapping.time))
+                    if timestamp is None:
+                        source_counts['invalid_timestamp'] += 1
+                        continue
+                    if baseline.start <= timestamp < baseline.end:
+                        window = baseline
+                        window_name = "baseline"
+                    elif incident.start <= timestamp < incident.end:
+                        window = incident
+                        window_name = "incident"
+                    else:
+                        source_counts['outside_windows'] += 1
+                        continue
 
-                window.scanned += 1
-                signature = event_id(record.get(args.signature))
-                if signature is None:
-                    continue
-                service = event_id(record.get(args.service)) if args.service else None
-                event_key = event_id(record.get(args.id)) if args.id else None
-                window.used += 1
-                group = (service, signature)
-                if group not in window.groups:
-                    window.groups[group] = SignatureStats()
-                window.groups[group].record(line_number, event_key)
-    except (OSError, UnicodeError) as error:
-        return report_input_error(args.log_file, error)
+                    window.scanned += 1
+                    source_counts[f"{window_name}_scanned"] += 1
+                    signature = event_id(record.get(mapping.signature))
+                    if signature is None:
+                        continue
+                    service = event_id(record.get(mapping.service)) if mapping.service else None
+                    event_key = event_id(record.get(mapping.id)) if mapping.id else None
+                    window.used += 1
+                    source_counts["used"] += 1
+                    source_counts[f"{window_name}_used"] += 1
+                    group = (service, signature)
+                    if group not in window.groups:
+                        window.groups[group] = SignatureStats()
+                    window.groups[group].record(name, line_number, event_key)
+        except (OSError, UnicodeError) as error:
+            return report_input_error(path, error)
+        unknown_time += source_counts["invalid_timestamp"]
+        outside += source_counts["outside_windows"]
+        coverage.append({
+            "source": name,
+            **source_counts,
+            "skipped": source_counts["scanned"] - source_counts["used"] - source_counts["outside_windows"],
+        })
 
     empty = SignatureStats()
     rows = []
@@ -699,7 +768,6 @@ def compare_log(argv: list[str]) -> int:
         after_rate = incident.rate(after.count)
         rows.append((after_rate - before_rate, service, signature, before, after, before_rate, after_rate))
 
-    source = "<stdin>" if args.log_file == "-" else args.log_file
     ranked = sorted(rows, key=lambda row: (-row[0], row[1] is not None, row[1] or "", row[2]))
     results = []
     for delta, service, signature, before, after, before_rate, after_rate in ranked[:args.top]:
@@ -718,23 +786,23 @@ def compare_log(argv: list[str]) -> int:
                 "signature": signature,
                 "service": service,
                 "baseline": {"events": before.count, "events_per_minute": float(before_rate),
-                             "observed_ids": len(before.ids) if args.id else None},
+                             "observed_ids": len(before.ids) if has_id else None},
                 "incident": {"events": after.count, "events_per_minute": float(after_rate),
-                             "observed_ids": len(after.ids) if args.id else None},
+                             "observed_ids": len(after.ids) if has_id else None},
                 "delta_events_per_minute": float(delta),
-                "example": {"source": source, "line": example.example_line, "id": example.example_id},
+                "example": {"source": example.example_source, "line": example.example_line, "id": example.example_id},
             })
         else:
             details = f"{label} {json.dumps(signature)}"
-            if args.service:
+            if has_service:
                 details += f" service={json.dumps(service)}"
             details += (
                 f" | events {before.count} -> {after.count}"
                 f" | events/min {float(before_rate):.3f} -> {float(after_rate):.3f}"
             )
-            if args.id:
+            if has_id:
                 details += f" | observed IDs {len(before.ids)} -> {len(after.ids)}"
-            details += f" | example {source}:{example.example_line}"
+            details += f" | example {example.example_source}:{example.example_line}"
             if example.example_id is not None:
                 details += f" id={json.dumps(example.example_id)}"
             print(details)
@@ -743,7 +811,7 @@ def compare_log(argv: list[str]) -> int:
         print(json.dumps({
             "schema_version": 1,
             "command": "compare",
-            "source": "<stdin>" if args.log_file == "-" else args.log_file,
+            "source": coverage[0]["source"] if len(coverage) == 1 else None,
             "total_rows": len(ranked),
             "coverage": {
                 "baseline": {"start": baseline.start.isoformat(), "end": baseline.end.isoformat(),
@@ -752,6 +820,7 @@ def compare_log(argv: list[str]) -> int:
                              "scanned": incident.scanned, "used": incident.used},
                 "invalid_timestamp": unknown_time,
                 "outside_windows": outside,
+                "sources": coverage,
             },
             "results": results,
         }))
@@ -760,17 +829,25 @@ def compare_log(argv: list[str]) -> int:
             print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} signatures")
         for name, window in (("Baseline", baseline), ("Incident", incident)):
             print(f"{name}: {window.used}/{window.scanned} records used")
+        if len(coverage) > 1:
+            for item in coverage:
+                print(f"{item['source']}: scanned {item['scanned']}, used {item['used']}, "
+                      f"skipped {item['skipped']}, outside windows {item['outside_windows']}; "
+                      f"baseline {item['baseline_used']}/{item['baseline_scanned']} used, "
+                      f"incident {item['incident_used']}/{item['incident_scanned']} used")
         print(f"Unassigned (invalid or missing timestamp): {unknown_time}  Outside windows: {outside}")
     if not (unknown_time or baseline.scanned or incident.scanned or outside):
         print("The input is empty.", file=sys.stderr)
     elif unknown_time and not (baseline.scanned or incident.scanned or outside):
-        print(f"No usable timestamps in {args.time!r}. Run inspect to find timestamp fields.", file=sys.stderr)
+        fields = ", ".join(sorted({repr(mapping.time) for _, mapping in mappings}))
+        print(f"No usable timestamps in {fields}. Run inspect to find timestamp fields.", file=sys.stderr)
     else:
         for name, window in (("Baseline", baseline), ("Incident", incident)):
             if not window.scanned:
                 print(f"{name}: no events in the requested window. Check the time bounds.", file=sys.stderr)
             elif not window.used:
-                print(f"{name}: no usable signatures in {args.signature!r}. Check --signature.", file=sys.stderr)
+                fields = ", ".join(sorted({repr(mapping.signature) for _, mapping in mappings}))
+                print(f"{name}: no usable signatures in {fields}. Check --signature or the per-source profiles.", file=sys.stderr)
     return 0
 
 

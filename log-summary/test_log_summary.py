@@ -641,6 +641,7 @@ class InputCompatibilityTests(unittest.TestCase):
             self.assertIn("Suggested format: logfmt", result.stdout)
             self.assertEqual(json.loads(profile.read_text()), {
                 "format": "logfmt", "id": "job", "time": "timestamp",
+                "service": "service", "signature": "code",
             })
             existing = self.run_cli("inspect", "worker-example.txt", "--profile-out", str(profile), check=False)
             self.assertEqual(existing.returncode, 1)
@@ -792,6 +793,58 @@ class WindowContractTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(message, result.stderr)
                 self.assertNotIn(message, result.stdout)
+
+
+class MultiSourceAnalysisTests(unittest.TestCase):
+    sources = (
+        "--source", "incident.jsonl", "incident-profile.json",
+        "--source", "worker-example.txt", "worker-profile.json",
+    )
+
+    def run_cli(self, *args, check=True):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, check=check,
+        )
+
+    def test_compare_preserves_source_evidence_and_window_coverage(self):
+        result = self.run_cli(
+            "compare", *self.sources,
+            "--baseline", "2026-11-26T14:00Z", "2026-11-26T14:01Z",
+            "--incident", "2026-11-26T14:01Z", "2026-11-26T14:03Z", "--json",
+        )
+        report = json.loads(result.stdout)
+        worker = next(row for row in report["results"] if row["signature"] == "WORKER_TIMEOUT")
+        self.assertEqual(worker["change"], "NEW")
+        self.assertEqual(worker["example"], {
+            "source": "worker-example.txt", "line": 1, "id": "incident-00",
+        })
+        worker_coverage = report["coverage"]["sources"][1]
+        self.assertEqual(worker_coverage["baseline_scanned"], 0)
+        self.assertEqual(worker_coverage["incident_scanned"], 3)
+        self.assertEqual(worker_coverage["incident_used"], 1)
+        timeline = self.run_cli("timeline", *self.sources, "--value", worker["example"]["id"])
+        self.assertIn("Matched: 9", timeline.stdout)
+        self.assertIn("worker-example.txt:1", timeline.stdout)
+
+    def test_correlate_merges_the_same_id_and_lists_sources(self):
+        result = self.run_cli("correlate", *self.sources, "--sort", "count", "--top", "1")
+        top = result.stdout.splitlines()[1]
+        self.assertEqual(top.split()[0], "9")
+        self.assertTrue(top.endswith('"incident-00"  ["incident.jsonl", "worker-example.txt"]'))
+        self.assertIn("worker-example.txt: scanned 3, used 3, skipped 0", result.stdout)
+
+    def test_source_options_reject_conflicting_mappings_and_repeated_stdin(self):
+        result = self.run_cli("correlate", *self.sources, "--key", "request", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--source replaces", result.stderr)
+        result = self.run_cli(
+            "correlate", "--source", "-", "incident-profile.json",
+            "--source", "-", "worker-profile.json", check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("stdin can only be used as one source", result.stderr)
 
 
 if __name__ == "__main__":

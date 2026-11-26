@@ -184,6 +184,21 @@ Windows include their start and exclude their end. Use `--regex` with named
 captures for text logs. `--service` and `--id` are optional. Observed ID counts
 reflect only records with usable IDs. Rates use the full requested windows.
 
+## Analyze multiple sources
+
+Use the same `--source FILE PROFILE` pairs with `compare`, `correlate`, and
+`timeline`. Each profile maps the fields in its own file.
+
+```powershell
+python log_summary.py compare --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z
+python log_summary.py correlate --source incident.jsonl incident-profile.json --source worker-example.txt worker-profile.json --top 3
+```
+
+Compare shows coverage per source and window, and links examples to the source
+line. Correlate lists the sources that observed each ID. IDs are matched by
+value across files. Each input record counts once per occurrence, so supplying
+overlapping copies can inflate event counts.
+
 ## Limit or export reports
 
 Use `--top N` with `group`, `correlate`, or `compare` to show the first N
