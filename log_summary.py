@@ -1,5 +1,6 @@
 import argparse
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable, TextIO
 
@@ -47,15 +48,16 @@ def main() -> int:
             '  python log_summary.py sample.log --level ERROR --contains "timed out"\n'
             "                                        Count ERROR lines containing timed out\n"
             '  python log_summary.py sample.log --level ERROR --contains "timed out" --show-lines\n'
-            "                                        Print matching lines with line numbers"
+            "                                        Print matching lines with line numbers\n"
+            "  Get-Content sample.log | python log_summary.py - --level ERROR\n"
+            "                                        Read from a PowerShell pipeline"
         ),
     )
     parser.add_argument(
         "log_file",
         nargs="?",
-        type=Path,
-        default=Path(__file__).with_name("sample.log"),
-        help="path to the log file (default: sample.log beside this script)",
+        default=str(Path(__file__).with_name("sample.log")),
+        help="log file path or - for stdin (default: sample.log beside this script)",
     )
     parser.add_argument(
         "--level",
@@ -77,7 +79,11 @@ def main() -> int:
     log_path = args.log_file
 
     try:
-        with log_path.open(encoding="utf-8") as log_file:
+        input_stream = (
+            nullcontext(sys.stdin) if log_path == "-"
+            else Path(log_path).open(encoding="utf-8")
+        )
+        with input_stream as log_file:
             counts = count_levels(
                 log_file,
                 contains=args.contains,
