@@ -23,6 +23,8 @@ LOG_LEVELS = ("INFO", "WARNING", "ERROR")
 LEVEL_ALIASES = {"WARN": "WARNING"}
 LOG_FORMATS = ("text", "jsonl", "logfmt")
 TIME_FORMATS = ("iso", "epoch_s", "epoch_ms")
+MAX_MULTILINE_BYTES = 1_048_576
+MAX_MULTILINE_LINES = 10_000
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 MICROSECOND = timedelta(microseconds=1)
 INSPECT_EPOCH_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
@@ -38,8 +40,17 @@ TIMESTAMP_PREFIX = re.compile(
 )
 
 
+def is_json_object_line(line: str) -> bool:
+    if not line.lstrip().startswith("{"):
+        return False
+    try:
+        return isinstance(json.loads(line), dict)
+    except (ValueError, RecursionError):
+        return False
+
+
 def log_records(
-    lines: Iterable[str], *, multiline: bool = False
+    lines: Iterable[str], *, multiline: bool = False, preserve_jsonl: bool = False
 ) -> Iterator[tuple[int, int, str, str]]:
     """Yield physical start/end lines, the header, and the complete record."""
     if not multiline:
@@ -48,13 +59,27 @@ def log_records(
         return
 
     pending: list[str] = []
-    start = last = 0
+    start = last = size = 0
     for number, line in enumerate(lines, start=1):
-        if pending and not line.startswith((" ", "\t")):
+        continuation = line.startswith((" ", "\t"))
+        if continuation and preserve_jsonl and is_json_object_line(line):
+            continuation = False
+        if pending and not continuation:
             yield start, last, pending[0], "".join(pending)
             pending = []
+            size = 0
         if not pending:
             start = number
+        if len(pending) >= MAX_MULTILINE_LINES:
+            raise OSError(f"multiline record starting at line {start} exceeds {MAX_MULTILINE_LINES:,} lines")
+        # UTF-8 uses at least one byte per character. Avoid encoding an already oversized line.
+        remaining = MAX_MULTILINE_BYTES - size
+        if len(line) <= remaining:
+            size += len(line.encode("utf-8"))
+        else:
+            size = MAX_MULTILINE_BYTES + 1
+        if size > MAX_MULTILINE_BYTES:
+            raise OSError(f"multiline record starting at line {start} exceeds 1 MiB of UTF-8 text")
         pending.append(line)
         last = number
     if pending:
@@ -170,7 +195,7 @@ def open_log(log_path: str) -> Iterator[Iterable[str]]:
 
 
 def report_input_error(path: str, error: OSError | UnicodeError) -> int:
-    message = f"Log file not found: {path}" if isinstance(error, FileNotFoundError) else f"Cannot read log: {error}"
+    message = f"Log file not found: {path}" if isinstance(error, FileNotFoundError) else f"Cannot read log: {path!r}: {error}"
     print(message, file=sys.stderr)
     return 1
 
@@ -752,12 +777,8 @@ def timeline_log(argv: list[str]) -> int:
                         source.matched += 1
                     else:
                         source.outside_window += 1
-        except FileNotFoundError:
-            print(f"Log file not found: {source.path}", file=sys.stderr)
-            return 1
         except (OSError, UnicodeError) as error:
-            print(f"Cannot read log {source.path!r}: {error}", file=sys.stderr)
-            return 1
+            return report_input_error(source.path, error)
 
         times.warn_if_unit_suspect()
 
@@ -830,6 +851,7 @@ def correlate_log(argv: list[str]) -> int:
     parser.add_argument("--sort", choices=("span", "count"), default="span",
                         help="rank IDs by observed span or event count (default: span)")
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     mappings = source_mappings(parser, args, required=("key", "time"))
@@ -840,17 +862,18 @@ def correlate_log(argv: list[str]) -> int:
     include_sources = args.json or len(mappings) > 1
     sources_by_id: dict[str, set[str]] = {}
     coverage: list[dict[str, str | int]] = []
-    scanned = used = skipped = outside = 0
+    scanned = used = skipped = outside = physical_lines = 0
     for (path, mapping), pattern in zip(mappings, patterns):
         name = source_name(path)
         times = RecordTimeReader(name, mapping.time, mapping.time_format)
         parse_time = event_time if times.time_format == "iso" else times.parse
-        source_scanned = source_skipped = source_used = source_outside = 0
+        source_scanned = source_skipped = source_used = source_outside = source_lines = 0
         try:
             with open_log(path) as log_file:
-                for line in log_file:
+                records = log_records(log_file, multiline=args.multiline and mapping.format != "jsonl")
+                for _, source_lines, header, _ in records:
                     source_scanned += 1
-                    fields = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
+                    fields = event_fields(header.rstrip("\r\n"), pattern, mapping.format)
                     key = event_id(log_field(fields, mapping.key))
                     timestamp = parse_time(log_field(fields, mapping.time))
                     if key is None or timestamp is None:
@@ -877,11 +900,13 @@ def correlate_log(argv: list[str]) -> int:
         coverage.append({
             "source": name, "scanned": source_scanned, "used": source_used,
             "skipped": source_skipped, "outside_window": source_outside,
+            **({"physical_lines": source_lines} if args.multiline else {}),
         })
         scanned += source_scanned
         used += source_used
         skipped += source_skipped
         outside += source_outside
+        physical_lines += source_lines
 
     # Sort the IDs first to break ties consistently even when input is reordered.
     ranked = sorted(groups)
@@ -902,6 +927,7 @@ def correlate_log(argv: list[str]) -> int:
                 "skipped": skipped,
                 "outside_window": outside,
                 "sources": coverage,
+                **({"physical_lines": physical_lines} if args.multiline else {}),
             },
             "results": [
                 {
@@ -932,10 +958,12 @@ def correlate_log(argv: list[str]) -> int:
             print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} IDs")
         if len(coverage) > 1:
             for source in coverage:
+                source_suffix = f", physical lines {source['physical_lines']}" if args.multiline else ""
                 print(f"{source['source']}: scanned {source['scanned']}, used {source['used']}, "
-                      f"skipped {source['skipped']}, outside window {source['outside_window']}")
+                      f"skipped {source['skipped']}, outside window {source['outside_window']}{source_suffix}")
+        suffix = f"  Physical lines: {physical_lines}" if args.multiline else ""
         print(f"Scanned: {scanned}  IDs: {len(groups)}  Skipped: {skipped}  "
-              f"Used: {used}  Outside window: {outside}")
+              f"Used: {used}  Outside window: {outside}{suffix}")
     if scanned and scanned == skipped:
         if len(mappings) == 1:
             mapping = mappings[0][1]
@@ -1004,6 +1032,7 @@ def compare_log(argv: list[str]) -> int:
     parser.add_argument("--baseline", nargs=2, metavar=("START", "END"), required=True)
     parser.add_argument("--incident", nargs=2, metavar=("START", "END"), required=True)
     parser.add_argument("--top", type=positive_count, metavar="N", help="show only the first N ranked rows")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     mappings = source_mappings(
@@ -1026,7 +1055,7 @@ def compare_log(argv: list[str]) -> int:
         parser.error("the baseline must end at or before the incident starts")
 
     coverage: list[dict[str, str | int]] = []
-    unknown_time = outside = 0
+    unknown_time = outside = physical_lines = 0
     for (path, mapping), pattern in zip(mappings, patterns):
         name = source_name(path)
         times = RecordTimeReader(name, mapping.time, mapping.time_format)
@@ -1035,11 +1064,13 @@ def compare_log(argv: list[str]) -> int:
             ("scanned", "used", "baseline_scanned", "baseline_used", "incident_scanned",
              "incident_used", "invalid_timestamp", "outside_windows"), 0
         )
+        source_lines = 0
         try:
             with open_log(path) as log_file:
-                for line_number, line in enumerate(log_file, start=1):
+                records = log_records(log_file, multiline=args.multiline and mapping.format != "jsonl")
+                for line_number, source_lines, header, _ in records:
                     source_counts["scanned"] += 1
-                    record = event_fields(line.rstrip("\r\n"), pattern, mapping.format)
+                    record = event_fields(header.rstrip("\r\n"), pattern, mapping.format)
                     timestamp = parse_time(log_field(record, mapping.time))
                     if timestamp is None:
                         source_counts['invalid_timestamp'] += 1
@@ -1071,11 +1102,13 @@ def compare_log(argv: list[str]) -> int:
         except (OSError, UnicodeError) as error:
             return report_input_error(path, error)
         times.warn_if_unit_suspect()
+        physical_lines += source_lines
         unknown_time += source_counts["invalid_timestamp"]
         outside += source_counts["outside_windows"]
         coverage.append({
             "source": name,
             **source_counts,
+            **({"physical_lines": source_lines} if args.multiline else {}),
             "skipped": source_counts["scanned"] - source_counts["used"] - source_counts["outside_windows"],
         })
 
@@ -1142,6 +1175,7 @@ def compare_log(argv: list[str]) -> int:
                 "invalid_timestamp": unknown_time,
                 "outside_windows": outside,
                 "sources": coverage,
+                **({"physical_lines": physical_lines} if args.multiline else {}),
             },
             "results": results,
         }))
@@ -1150,12 +1184,16 @@ def compare_log(argv: list[str]) -> int:
             print(f"Showing {min(len(ranked), args.top)} of {len(ranked)} signatures")
         for name, window in (("Baseline", baseline), ("Incident", incident)):
             print(f"{name}: {window.used}/{window.scanned} records used")
-        if len(coverage) > 1:
+        if len(coverage) > 1 or args.multiline:
             for item in coverage:
+                source_suffix = f", physical lines {item['physical_lines']}" if args.multiline else ""
                 print(f"{item['source']}: scanned {item['scanned']}, used {item['used']}, "
-                      f"skipped {item['skipped']}, outside {item['outside_windows']}")
+                      f"skipped {item['skipped']}, outside {item['outside_windows']}{source_suffix}")
                 print(f"  Baseline: {item['baseline_used']}/{item['baseline_scanned']} used  "
                       f"Incident: {item['incident_used']}/{item['incident_scanned']} used")
+        if args.multiline:
+            scanned = baseline.scanned + incident.scanned + unknown_time + outside
+            print(f"Scanned records: {scanned}  Physical lines: {physical_lines}")
         print(f"Unassigned (invalid or missing timestamp): {unknown_time}  Outside windows: {outside}")
     if not (unknown_time or baseline.scanned or incident.scanned or outside):
         print("The input is empty.", file=sys.stderr)
@@ -1205,6 +1243,7 @@ def bucket_log(argv: list[str]) -> int:
     parser.add_argument("--level-field", help="severity field (JSONL: severity; text or logfmt: level)")
     parser.add_argument("--value", help="exact value to count in the signature field")
     parser.add_argument("--ignore-case", action="store_true", help="match signature values case-insensitively")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     if args.level is not None and (args.signature is not None or args.value is not None):
@@ -1244,15 +1283,16 @@ def bucket_log(argv: list[str]) -> int:
     wanted = args.value.casefold() if args.ignore_case else args.value
 
     first = last = None
-    scanned = invalid = outside = filtered = 0
+    scanned = invalid = outside = filtered = physical_lines = 0
     counts: Counter[int] = Counter()
     times = RecordTimeReader(source_name(args.log_file), args.time, args.time_format)
     parse_time = event_time if times.time_format == "iso" else times.parse
     try:
         with open_log(args.log_file) as log_file:
-            for line in log_file:
+            records = log_records(log_file, multiline=args.multiline and args.format != "jsonl")
+            for _, physical_lines, header, _ in records:
                 scanned += 1
-                fields = event_fields(line.rstrip("\r\n"), pattern, args.format)
+                fields = event_fields(header.rstrip("\r\n"), pattern, args.format)
                 timestamp = parse_time(log_field(fields, args.time))
                 if timestamp is None:
                     invalid += 1
@@ -1313,6 +1353,7 @@ def bucket_log(argv: list[str]) -> int:
         "invalid_timestamp": invalid,
         "outside_window": outside,
         "filtered": filtered,
+        **({"physical_lines": physical_lines} if args.multiline else {}),
     }
     if not scanned:
         print("The input is empty.", file=sys.stderr)
@@ -1349,9 +1390,10 @@ def bucket_log(argv: list[str]) -> int:
             rate = bucket["events_per_minute"]
             rate_text = "partial" if rate is None else f"{rate:.3f}"
             print(f'{bucket["start"]:32}  {bucket["count"]:5}  {rate_text}')
+        suffix = f"  Physical lines: {physical_lines}" if args.multiline else ""
         print(
             f"Scanned: {scanned}  Counted: {coverage['counted']}  "
-            f"Invalid timestamp: {invalid}  Outside window: {outside}  Filtered: {filtered}"
+            f"Invalid timestamp: {invalid}  Outside window: {outside}  Filtered: {filtered}{suffix}"
         )
     return report_status(args, empty=not counts)
 
@@ -1383,20 +1425,22 @@ def inspect_log(argv: list[str]) -> int:
         description="Sample a log and suggest field mappings.",
     )
     parser.add_argument("log_file", help="log file path or - for stdin")
-    parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines (1-1000)")
+    parser.add_argument("--lines", type=int, default=100, help="sample up to this many lines or multiline records (1-1000)")
     parser.add_argument("--profile-out", metavar="FILE", help="write a new profile when a usable mapping is found")
+    add_multiline_option(parser)
     add_report_arguments(parser)
     args = parser.parse_args(argv)
     if not 1 <= args.lines <= 1000:
         parser.error("--lines must be between 1 and 1000")
 
-    sampled = objects = timestamp_prefixes = 0
+    sampled = objects = timestamp_prefixes = physical_lines = 0
     logfmt_lines = 0
     json_fields: dict[str, FieldSample] = {}
     native_fields: dict[str, FieldSample] = {}
     try:
         with open_log(args.log_file) as log_file:
-            for line in islice(log_file, args.lines):
+            records = log_records(log_file, multiline=args.multiline, preserve_jsonl=True)
+            for _, physical_lines, line, _ in islice(records, args.lines):
                 sampled += 1
                 try:
                     record = json.loads(line)
@@ -1496,6 +1540,7 @@ def inspect_log(argv: list[str]) -> int:
             "coverage": {
                 "sampled": sampled, "json_objects": objects, "logfmt_lines": logfmt_lines,
                 "text_timestamp_prefixes": timestamp_prefixes,
+                **({"physical_lines": physical_lines} if args.multiline else {}),
             },
             "format": input_format,
             "fields": {
@@ -1507,7 +1552,8 @@ def inspect_log(argv: list[str]) -> int:
             "profile": profile or None,
         }))
     else:
-        print(f"Sampled: {sampled}  JSON objects: {objects}  Text timestamp prefixes: {timestamp_prefixes}")
+        suffix = f"  Physical lines: {physical_lines}" if args.multiline else ""
+        print(f"Sampled: {sampled}  JSON objects: {objects}  Text timestamp prefixes: {timestamp_prefixes}{suffix}")
         if input_format is not None:
             print(f"Suggested format: {input_format}")
             if logfmt_lines:

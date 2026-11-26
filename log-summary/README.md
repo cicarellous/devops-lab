@@ -89,21 +89,25 @@ is printed once.
 
 ## Read multiline text records
 
-Use `--multiline` with search, severity summary, group, or timeline.
+Use `--multiline` with any command when reading text logs. For `inspect`,
+`--lines` counts sampled records in this mode.
 Lines that start with a space or tab attach to the preceding record.
 Summary and search can match text anywhere in a record. Severity and field
-mappings read its header. JSON Lines stays line-based in structured commands.
+mappings read its header. JSON Lines stays line-based in structured commands and when `inspect` recognizes
+a JSON object. A multiline record exceeding 10,000 lines or 1 MiB of UTF-8
+text stops the command with an input error and the record's starting line.
 
 ```powershell
 python log_summary.py search stacktrace-example.txt --multiline --contains TimeoutError --context 1
 python log_summary.py stacktrace-example.txt --multiline --contains TimeoutError --show-lines
 python log_summary.py timeline stacktrace-example.txt --format logfmt --time timestamp --key request_id --value r1 --multiline
+python log_summary.py bucket stacktrace-example.txt --format logfmt --time timestamp --interval 1m --multiline
 ```
 
 Search context counts records in multiline mode. Search and timeline JSON
 include the inclusive `line` and `end_line` of each displayed record. Coverage
-in search, group, and timeline counts logical records and reports physical
-lines separately.
+in search, group, timed commands, and inspect reports physical lines
+separately from logical records.
 
 ## Group log entries
 

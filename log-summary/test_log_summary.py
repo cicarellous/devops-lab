@@ -1281,5 +1281,75 @@ class MultilineTests(unittest.TestCase):
                                              {"value": "E2", "count": 1}])
 
 
+class MultilineParityTests(unittest.TestCase):
+    def run_cli(self, *args, data=None, check=True):
+        return subprocess.run(
+            [sys.executable, "log_summary.py", *args],
+            cwd=Path(__file__).resolve().parent, input=data,
+            text=True, encoding="utf-8", capture_output=True, check=check,
+        )
+
+    def test_timed_commands_count_headers_and_preserve_original_evidence(self):
+        fixture = "stacktrace-example.txt"
+        common = (fixture, "--format", "logfmt", "--time", "timestamp", "--multiline")
+        bucket = json.loads(self.run_cli("bucket", *common, "--interval", "1m", "--json").stdout)
+        self.assertEqual(bucket["coverage"], {
+            "scanned": 3, "counted": 3, "invalid_timestamp": 0,
+            "outside_window": 0, "filtered": 0, "physical_lines": 6,
+        })
+        self.assertIn("Physical lines: 6", self.run_cli("bucket", *common, "--interval", "1m").stdout)
+        correlate = json.loads(self.run_cli("correlate", *common, "--key", "request_id", "--json").stdout)
+        self.assertEqual(correlate["coverage"], {
+            "scanned": 3, "used": 3, "skipped": 0, "outside_window": 0, "physical_lines": 6,
+            "sources": [{"source": fixture, "scanned": 3, "used": 3, "skipped": 0,
+                         "outside_window": 0, "physical_lines": 6}],
+        })
+        compare = json.loads(self.run_cli(
+            "compare", *common, "--signature", "code", "--id", "request_id",
+            "--baseline", "2026-11-26T14:01:00Z", "2026-11-26T14:01:02Z",
+            "--incident", "2026-11-26T14:01:02Z", "2026-11-26T14:01:05Z", "--json",
+        ).stdout)
+        self.assertEqual(compare["coverage"]["invalid_timestamp"], 0)
+        self.assertEqual(compare["coverage"]["physical_lines"], 6)
+        self.assertEqual(compare["coverage"]["sources"][0]["scanned"], 3)
+        finding = next(row for row in compare["results"] if row["signature"] == "E1042")
+        self.assertEqual(finding["incident"]["events"], 2)
+        self.assertEqual(finding["example"], {"source": fixture, "line": 1, "id": "r1"})
+
+    def test_inspect_samples_records_and_keeps_indented_json_objects_separate(self):
+        result = self.run_cli("inspect", "stacktrace-example.txt", "--multiline", "--lines", "2", "--json")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["coverage"]["sampled"], 2)
+        self.assertEqual(report["coverage"]["physical_lines"], 4)
+        self.assertEqual(report["profile"]["time"], "timestamp")
+        json_data = '{"ts":"2026-11-26T14:01Z"}\n  {"ts":"2026-11-26T14:02Z"}\n'
+        report = json.loads(self.run_cli("inspect", "-", "--multiline", "--json", data=json_data).stdout)
+        self.assertEqual(report["coverage"]["json_objects"], 2)
+        self.assertEqual(report["coverage"]["sampled"], 2)
+
+    def test_oversized_multiline_records_fail_with_source_and_start_line(self):
+        data = "INFO fine\nERROR fail\n" + "    frame\n" * 10_000
+        args = ("search", "-", "--multiline", "--contains", "ERROR", "--json")
+        result = self.run_cli(*args, data=data, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("'-': multiline record starting at line 2 exceeds 10,000 lines", result.stderr)
+
+        with TemporaryDirectory() as directory:
+            fixture = Path(directory) / "oversized.log"
+            fixture.write_text(
+                "2026-11-26T14:01Z ERROR id=r1\n " + "\u00e9" * (1_048_576 // 2),
+                encoding="utf-8",
+            )
+            result = self.run_cli(
+                "timeline", str(fixture), "--format", "logfmt", "--time", "timestamp",
+                "--key", "id", "--value", "r1", "--multiline", "--json", check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("oversized.log", result.stderr)
+            self.assertIn("record starting at line 1 exceeds 1 MiB", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
