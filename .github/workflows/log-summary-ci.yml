@@ -1,0 +1,93 @@
+name: Log Summary CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit tests / ${{ matrix.platform }} / Python 3.12
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Ubuntu
+            runner: ubuntu-latest
+          - platform: Windows
+            runner: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run Log Summary unit tests
+        id: unittest
+        working-directory: log-summary
+        shell: bash
+        run: python -m unittest -v 2>&1 | tee "$RUNNER_TEMP/log-summary-unittest.log"
+
+      - name: Summarize unit tests
+        if: always()
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TEST_OUTCOME: ${{ steps.unittest.outcome }}
+        run: |
+          {
+            printf '### Unit tests on %s (Python 3.12)\n\n' "$PLATFORM"
+            printf 'Outcome: **%s**\n\n' "$TEST_OUTCOME"
+            if [[ -f "$RUNNER_TEMP/log-summary-unittest.log" ]]; then
+              grep -E '^Ran [0-9]+ tests? in ' "$RUNNER_TEMP/log-summary-unittest.log" || true
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  code-quality:
+    name: Code quality / Ruff and mypy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Ruff and mypy
+        id: tools
+        run: python -m pip install ruff==0.11.13 mypy==1.19.1
+
+      - name: Lint with Ruff
+        id: lint
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        working-directory: log-summary
+        run: python -m ruff check log_summary.py test_log_summary.py
+
+      - name: Type check with mypy
+        id: types
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        working-directory: log-summary
+        run: python -m mypy --python-version 3.12 log_summary.py
+
+      - name: Summarize code quality
+        if: always()
+        shell: bash
+        env:
+          TOOLS_OUTCOME: ${{ steps.tools.outcome }}
+          RUFF_OUTCOME: ${{ steps.lint.outcome }}
+          MYPY_OUTCOME: ${{ steps.types.outcome }}
+        run: |
+          {
+            printf '### Code quality (Ubuntu, Python 3.12)\n\n'
+            printf '| Check | Outcome |\n| --- | --- |\n'
+            printf '| Install check tools | %s |\n' "$TOOLS_OUTCOME"
+            printf '| Ruff lint | %s |\n' "$RUFF_OUTCOME"
+            printf '| mypy type check | %s |\n' "$MYPY_OUTCOME"
+          } >> "$GITHUB_STEP_SUMMARY"
