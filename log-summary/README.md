@@ -11,6 +11,7 @@ and observed spans across IDs. It reads files or standard input.
 | Rank values by frequency | `python log_summary.py group -h` |
 | Reconstruct one ID's events | `python log_summary.py timeline -h` |
 | Rank IDs by event count or observed span | `python log_summary.py correlate -h` |
+| Compare event rates before and during an incident | `python log_summary.py compare -h` |
 
 ## Quick start
 
@@ -108,6 +109,21 @@ Correlation spans are calculated from the events within the window.
 ```powershell
 python log_summary.py correlate app.jsonl --format jsonl --key request_id --time timestamp --since "2026-11-26T14:00:00.548Z" --until "2026-11-26T14:00:00.959Z"
 ```
+
+## Compare an incident with a baseline
+
+```powershell
+python log_summary.py compare incident.jsonl --format jsonl --time ts --signature code --service service --id request --baseline 2026-11-26T14:00Z 2026-11-26T14:01Z --incident 2026-11-26T14:01Z 2026-11-26T14:03Z
+```
+
+The synthetic example shows 80 timeout events across 12 observed IDs and a
+warning whose count doubles while its rate stays flat. Rows are ranked by the
+change in events per minute. Each row gives an example line, and the footer
+shows coverage. `NEW` means the signature was unseen in the supplied baseline.
+
+Windows include their start and exclude their end. Use `--regex` with named
+captures for text logs. `--service` and `--id` are optional. Observed ID counts
+reflect only records with usable IDs. Rates use the full requested windows.
 
 ## Tests
 

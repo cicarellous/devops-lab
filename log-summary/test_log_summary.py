@@ -305,5 +305,67 @@ class InputErrorTests(unittest.TestCase):
                     self.assertNotIn("Traceback", result.stderr)
 
 
+class CompareTests(unittest.TestCase):
+    def run_compare(self, source, *mapping, baseline=None, incident=None, input_text=None):
+        return subprocess.run(
+            [
+                sys.executable, "log_summary.py", "compare", source, *mapping,
+                "--baseline", *(baseline or ["2026-11-26T14:00Z", "2026-11-26T14:01Z"]),
+                "--incident", *(incident or ["2026-11-26T14:01Z", "2026-11-26T14:03Z"]),
+            ],
+            cwd=Path(__file__).resolve().parent,
+            input=input_text, capture_output=True, text=True,
+        )
+
+    def test_normalizes_rates_counts_observed_ids_and_reports_coverage(self):
+        result = self.run_compare(
+            "incident.jsonl", "--format", "jsonl", "--time", "ts",
+            "--signature", "code", "--service", "service", "--id", "request",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = result.stdout.splitlines()
+        self.assertTrue(rows[0].startswith(
+            'RISING "TIMEOUT" service="payments" | events 2 -> 80 | '
+            'events/min 2.000 -> 40.000 | observed IDs 2 -> 12'
+        ))
+        self.assertRegex(rows[0], r'example incident\.jsonl:\d+ id="incident-00"$')
+        self.assertTrue(rows[1].startswith('NEW "POOL_EXHAUSTED" service="orders"'))
+        self.assertIn('events 2 -> 4 | events/min 2.000 -> 2.000', rows[2])
+        self.assertEqual(rows[3:], [
+            "Baseline: 4/5 records used",
+            "Incident: 85/86 records used",
+            "Unassigned (invalid or missing timestamp): 1  Outside windows: 1",
+        ])
+
+    def test_text_stdin_uses_half_open_windows(self):
+        result = self.run_compare(
+            "-", "--time", "ts", "--signature", "code",
+            "--regex", r"^(?P<ts>\S+) (?P<code>\S+)",
+            input_text=(
+                "2026-11-26T14:00Z E1\n"
+                "2026-11-26T09:01-05:00 E2\n"
+                "2026-11-26T14:03Z E3\n"
+            ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = result.stdout.splitlines()
+        self.assertIn('NEW "E2" | events 0 -> 1 | events/min 0.000 -> 0.500 | example <stdin>:2', rows)
+        self.assertIn('FALLING "E1" | events 1 -> 0 | events/min 1.000 -> 0.000 | example <stdin>:1', rows)
+        self.assertTrue(rows[-1].endswith("Outside windows: 1"))
+
+    def test_rejects_overlapping_and_invalid_windows(self):
+        for bounds, message in [
+            (["2026-11-26T14:00Z", "2026-11-26T14:02Z"], "baseline must end"),
+            (["invalid", "2026-11-26T14:01Z"], "--baseline requires"),
+        ]:
+            with self.subTest(bounds=bounds):
+                result = self.run_compare(
+                    "-", "--format", "jsonl", "--time", "ts", "--signature", "code",
+                    baseline=bounds, input_text="",
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,8 +4,9 @@ import re
 import sys
 from collections import Counter, deque
 from contextlib import nullcontext
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from itertools import chain
 from pathlib import Path
 from typing import ContextManager, Iterable, TextIO
@@ -189,12 +190,17 @@ def add_event_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def event_pattern(parser: argparse.ArgumentParser, args: argparse.Namespace) -> re.Pattern[str] | None:
+def input_pattern(parser: argparse.ArgumentParser, args: argparse.Namespace) -> re.Pattern[str] | None:
     if args.format == "text" and args.regex is None:
         parser.error("text input requires --regex")
     if args.format == "jsonl" and args.regex is not None:
         parser.error("--regex applies only to text input")
     pattern = compile_pattern(parser, args.regex)
+    return pattern
+
+
+def event_pattern(parser: argparse.ArgumentParser, args: argparse.Namespace) -> re.Pattern[str] | None:
+    pattern = input_pattern(parser, args)
     if pattern is not None and not {args.key, args.time} <= pattern.groupindex.keys():
         parser.error("--regex must define named captures for --key and --time")
     return pattern
@@ -359,6 +365,150 @@ def correlate_log(argv: list[str]) -> int:
     return 0
 
 
+@dataclass
+class SignatureStats:
+    count: int = 0
+    ids: set[str] = field(default_factory=set)
+    example_line: int = 0
+    example_id: str | None = None
+
+    def record(self, line_number: int, event_key: str | None) -> None:
+        self.count += 1
+        if event_key is not None:
+            self.ids.add(event_key)
+        if not self.example_line or (self.example_id is None and event_key is not None):
+            self.example_line = line_number
+            self.example_id = event_key
+
+
+@dataclass
+class ComparisonWindow:
+    start: datetime
+    end: datetime
+    scanned: int = 0
+    used: int = 0
+    groups: dict[tuple[str | None, str], SignatureStats] = field(default_factory=dict)
+
+    def rate(self, count: int) -> Fraction:
+        duration_us = (self.end - self.start) // timedelta(microseconds=1)
+        return Fraction(count * 60_000_000, duration_us)
+
+
+def comparison_window(
+    parser: argparse.ArgumentParser, name: str, bounds: list[str]
+) -> ComparisonWindow:
+    start, end = map(event_time, bounds)
+    if start is None or end is None or start >= end:
+        parser.error(f"--{name} requires two ISO 8601 timestamps in ascending order")
+    return ComparisonWindow(start, end)
+
+
+def compare_log(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="log_summary.py compare",
+        description="Rank signature changes between baseline and incident windows.",
+        epilog="Windows include START and exclude END. Timestamps without offsets use UTC.",
+    )
+    parser.add_argument("log_file", help="log file path or - for stdin")
+    parser.add_argument("--format", choices=("text", "jsonl"), default="text")
+    parser.add_argument("--regex", help="named field captures for text input")
+    parser.add_argument("--time", required=True, help="timestamp field")
+    parser.add_argument("--signature", required=True, help="error code or other stable event field")
+    parser.add_argument("--service", help="optional service field")
+    parser.add_argument("--id", help="optional request or transaction ID field")
+    parser.add_argument("--baseline", nargs=2, metavar=("START", "END"), required=True)
+    parser.add_argument("--incident", nargs=2, metavar=("START", "END"), required=True)
+    args = parser.parse_args(argv)
+
+    pattern = input_pattern(parser, args)
+    if pattern is not None:
+        fields = {args.time, args.signature, args.service, args.id} - {None}
+        missing = fields - pattern.groupindex.keys()
+        if missing:
+            parser.error(f"--regex is missing named captures: {', '.join(sorted(missing))}")
+    baseline = comparison_window(parser, "baseline", args.baseline)
+    incident = comparison_window(parser, "incident", args.incident)
+    if baseline.end > incident.start:
+        parser.error("the baseline must end at or before the incident starts")
+
+    unknown_time = outside = 0
+    try:
+        with open_log(args.log_file) as log_file:
+            for line_number, line in enumerate(log_file, start=1):
+                record = event_fields(line.rstrip("\r\n"), pattern)
+                timestamp = event_time(record.get(args.time))
+                if timestamp is None:
+                    unknown_time += 1
+                    continue
+                if baseline.start <= timestamp < baseline.end:
+                    window = baseline
+                elif incident.start <= timestamp < incident.end:
+                    window = incident
+                else:
+                    outside += 1
+                    continue
+
+                window.scanned += 1
+                signature = event_id(record.get(args.signature))
+                if signature is None:
+                    continue
+                service = event_id(record.get(args.service)) if args.service else None
+                event_key = event_id(record.get(args.id)) if args.id else None
+                window.used += 1
+                group = (service, signature)
+                if group not in window.groups:
+                    window.groups[group] = SignatureStats()
+                window.groups[group].record(line_number, event_key)
+    except FileNotFoundError:
+        print(f"Log file not found: {args.log_file}", file=sys.stderr)
+        return 1
+    except (OSError, UnicodeError) as error:
+        print(f"Cannot read log: {error}", file=sys.stderr)
+        return 1
+
+    empty = SignatureStats()
+    rows = []
+    for service, signature in baseline.groups.keys() | incident.groups.keys():
+        group = (service, signature)
+        before = baseline.groups.get(group, empty)
+        after = incident.groups.get(group, empty)
+        before_rate = baseline.rate(before.count)
+        after_rate = incident.rate(after.count)
+        rows.append((after_rate - before_rate, service, signature, before, after, before_rate, after_rate))
+
+    source = "<stdin>" if args.log_file == "-" else args.log_file
+    for delta, service, signature, before, after, before_rate, after_rate in sorted(
+        rows, key=lambda row: (-row[0], row[1] is not None, row[1] or "", row[2])
+    ):
+        if not before.count:
+            label = "NEW"
+        elif delta > 0:
+            label = "RISING"
+        elif delta < 0:
+            label = "FALLING"
+        else:
+            label = "FLAT"
+        details = f"{label} {json.dumps(signature)}"
+        if args.service:
+            details += f" service={json.dumps(service)}"
+        details += (
+            f" | events {before.count} -> {after.count}"
+            f" | events/min {float(before_rate):.3f} -> {float(after_rate):.3f}"
+        )
+        if args.id:
+            details += f" | observed IDs {len(before.ids)} -> {len(after.ids)}"
+        example = after if after.count else before
+        details += f" | example {source}:{example.example_line}"
+        if example.example_id is not None:
+            details += f" id={json.dumps(example.example_id)}"
+        print(details)
+
+    for name, window in (("Baseline", baseline), ("Incident", incident)):
+        print(f"{name}: {window.used}/{window.scanned} records used")
+    print(f"Unassigned (invalid or missing timestamp): {unknown_time}  Outside windows: {outside}")
+    return 0
+
+
 def main() -> int:
     if sys.argv[1:2] == ["search"]:
         return search_log(sys.argv[2:])
@@ -368,6 +518,8 @@ def main() -> int:
         return timeline_log(sys.argv[2:])
     if sys.argv[1:2] == ["correlate"]:
         return correlate_log(sys.argv[2:])
+    if sys.argv[1:2] == ["compare"]:
+        return compare_log(sys.argv[2:])
 
     parser = argparse.ArgumentParser(
         description="Count INFO, WARNING, and ERROR entries, with optional ISO timestamps.",
@@ -377,7 +529,8 @@ def main() -> int:
             "  search      Find matching lines and surrounding context\n"
             "  group       Rank extracted values by frequency\n"
             "  timeline    Reconstruct events for one ID\n"
-            "  correlate   Rank IDs by event count or observed span\n\n"
+            "  correlate   Rank IDs by event count or observed span\n"
+            "  compare     Compare incident and baseline event rates\n\n"
             "Examples:\n"
             "  python log_summary.py                 Count levels in app.log\n"
             "  python log_summary.py app.log --level ERROR\n"
