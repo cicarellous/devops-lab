@@ -5,7 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fix-printer"
 dynamic = ["version"]
-description = "Inspect FIX 4.2 and 4.4 captures, follow orders, and measure gateway latency."
+description = "Decode and print FIX 4.2 and 4.4 messages, follow orders, and measure gateway latency."
+authors = [{name = "cicarellous"}]
+maintainers = [{name = "cicarellous"}]
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT AND LicenseRef-QuickFIX"
@@ -16,8 +18,12 @@ classifiers = [
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
     "Topic :: System :: Logging",
 ]
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "ruff==0.11.13"]
 
 [project.scripts]
 fix-printer = "fix_printer.cli:run_cli"
@@ -36,3 +42,6 @@ fix_printer = ["dictionaries/FIX42.xml", "dictionaries/FIX44.xml", "dictionaries
 
 [tool.setuptools.dynamic]
 version = {attr = "fix_printer._version.__version__"}
+
+[tool.ruff]
+target-version = "py312"

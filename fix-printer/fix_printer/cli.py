@@ -1349,6 +1349,7 @@ def positive_tag(text: str) -> int:
 
 def main() -> int:
     parser = CliParser(
+        prog="fix-printer",
         description=__doc__,
         epilog=(
             "With one log, order, cancel, and replace response timing is automatic. "

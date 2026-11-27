@@ -3,10 +3,10 @@ name: FIX Printer CI
 on:
   push:
     branches: [main]
-    paths: ['fix-printer/**', '.github/workflows/fix-printer-ci.yml']
+    paths: ['fix-printer/**', '.github/workflows/fix-printer-ci.yml', '.github/workflows/fix-printer-release.yml']
   pull_request:
     branches: [main]
-    paths: ['fix-printer/**', '.github/workflows/fix-printer-ci.yml']
+    paths: ['fix-printer/**', '.github/workflows/fix-printer-ci.yml', '.github/workflows/fix-printer-release.yml']
 
 permissions:
   contents: read
@@ -87,3 +87,31 @@ jobs:
               "$cli" CLIENT-42 /samples/orders.fix --lifecycle | grep -Fx "Time to full fill: 2s"
               "$cli" Outbound_ClOrderId /samples/session-44.fix --lifecycle | grep -F "Cancel ack: 12ms"
             '
+
+  packaging:
+    name: Packaging and lint / Ubuntu / Python 3.12
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fix-printer
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Lint and build distributions
+        run: |
+          python -m pip install '.[dev]'
+          python -m ruff check .
+          python -m build
+          python build_bundle.py
+
+      - name: Run tests from the extracted source archive and bundle
+        run: |
+          version=$(python -c 'from fix_printer import __version__; print(__version__)')
+          tar -xzf "dist/fix_printer-$version.tar.gz" -C "$RUNNER_TEMP"
+          python -m zipfile -e "dist/fix-printer-$version-bundle.zip" "$RUNNER_TEMP/fix-printer-bundle"
+          (cd "$RUNNER_TEMP/fix_printer-$version" && python -m unittest -q)
+          (cd "$RUNNER_TEMP/fix-printer-bundle" && python -m unittest -q)

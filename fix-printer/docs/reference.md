@@ -208,7 +208,7 @@ Client-to-gateway one-way timing would require the client's send timestamp and y
 | `1` | The search or report found no relevant data, or routing could not find a unique order on each leg. |
 | `2` | Input, dictionary, or usage error, including corrupt gzip files, skipped oversized records, and exceeded input budgets. |
 
-Run `python -m unittest -v` from this directory. The fixture tests check required fields and verify BodyLength and CheckSum after restoring SOH delimiters. The CLI uses the dictionaries for display and performs framing checks.
+Run `python -m unittest -v` from `fix-printer/` in a checkout, or from the root of the extracted source archive or bundle. The fixture tests check required fields and verify BodyLength and CheckSum after restoring SOH delimiters. The CLI uses the dictionaries for display and performs framing checks.
 
 ## Troubleshooting
 

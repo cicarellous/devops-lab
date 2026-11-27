@@ -101,8 +101,9 @@ fix-printer --version
 ## Use a source checkout
 
 If you already cloned the repository, run `python -m pip install .` from
-`fix-printer/` with your environment active. You can also run the script
-directly from that directory with `python3.12 fixprinter.py` on Linux or
+`fix-printer/` with your environment active. This needs internet access
+to fetch build dependencies in a fresh environment. You can also run
+the script directly with `python3.12 fixprinter.py` on Linux or
 `python fixprinter.py` on Windows. The download bundle and checkout both
 include the sample files used in the runbook.
 
@@ -123,7 +124,7 @@ Use an approved central export or archived capture. See [Investigate without pro
 
 - [Start with the runbook](docs/runbook.md). It walks through sample commands, expected results, and what to investigate next.
 - [Reference](docs/reference.md) for capture formats, session filters, ID mappings, timing rules, JSON, exit codes, and troubleshooting.
-- `fix-printer -h` lists all options.
+- `fix-printer -h` lists all options. `python -m fix_printer -h` also works.
 
 ## License
 
