@@ -1,0 +1,3 @@
+include build_bundle.py
+include docs/reference.md docs/runbook.md
+include samples/*.fix

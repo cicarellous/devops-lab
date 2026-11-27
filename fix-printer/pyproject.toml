@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fix-printer"
+dynamic = ["version"]
+description = "Inspect FIX 4.2 and 4.4 captures, follow orders, and measure gateway latency."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT AND LicenseRef-QuickFIX"
+license-files = ["LICENSE", "NOTICE", "dictionaries/LICENSE"]
+keywords = ["fix", "trading", "logs", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Logging",
+]
+
+[project.scripts]
+fix-printer = "fixprinter:run_cli"
+
+[project.urls]
+Repository = "https://github.com/cicarellous/devops-lab"
+Documentation = "https://github.com/cicarellous/devops-lab/tree/main/fix-printer"
+Issues = "https://github.com/cicarellous/devops-lab/issues"
+
+[tool.setuptools]
+py-modules = ["fixprinter"]
+packages = ["fixprinter_dictionaries"]
+package-dir = {fixprinter_dictionaries = "dictionaries"}
+
+[tool.setuptools.package-data]
+fixprinter_dictionaries = ["FIX42.xml", "FIX44.xml"]
+
+[tool.setuptools.dynamic]
+version = {attr = "fixprinter.__version__"}

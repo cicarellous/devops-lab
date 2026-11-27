@@ -19,6 +19,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 HEADER_AFTER_BEGIN = re.compile(rb"9=[0-9]{1,9}([\x01|])35=")
+__version__ = "0.1.0"
+
 START = re.compile(rb"(?<![A-Za-z0-9_=])8=(FIX\.4\.[24])([\x01|])")
 FIELD = re.compile(rb"([1-9][0-9]{0,8})=")
 MAX_LINE = 8 * 1024 * 1024
@@ -38,7 +40,10 @@ DATA_TAGS = {
     352: 353, 354: 355, 356: 357, 358: 359, 360: 361,
     362: 363, 364: 365, 445: 446, 618: 619, 621: 622,
 }
-DICTIONARIES = Path(__file__).resolve().with_name("dictionaries")
+MODULE_DIR = Path(__file__).resolve().parent
+DICTIONARIES = MODULE_DIR / "fixprinter_dictionaries"
+if not DICTIONARIES.is_dir():
+    DICTIONARIES = MODULE_DIR / "dictionaries"
 BUILTIN_FILES = {b"FIX.4.2": "FIX42.xml", b"FIX.4.4": "FIX44.xml"}
 
 
@@ -1354,6 +1359,7 @@ def main() -> int:
             "pass the inbound log as LOG and supply the outbound log with --routing-latency."
         ),
     )
+    parser.add_argument("--version", action="version", version=f"FIX Printer {__version__}")
     parser.add_argument("identifier", metavar="ID_OR_LOG",
                         help="identifier to find, or the first capture in a report mode")
     parser.add_argument("log", nargs="?", help="plain or .gz capture, or - for stdin, for order lookup")
