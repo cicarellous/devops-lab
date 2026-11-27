@@ -8,7 +8,7 @@ and routing latency, and export versioned JSON Lines for automation.
 
 ## Download and install
 
-Download the **FIX Printer bundle** from [GitHub Releases](https://github.com/cicarellous/devops-lab/releases/tag/fix-printer-v0.1.0).
+Download the **FIX Printer bundle** from [GitHub Releases](https://github.com/cicarellous/devops-lab/releases/tag/fix-printer-v0.1.1).
 Under **Assets**, choose `fix-printer-<version>-bundle.zip`. Extract it
 and open a terminal in the extracted folder. The bundle includes the
 installable wheel, the analyst guides, sample logs, and the MIT license
@@ -36,7 +36,7 @@ Install the wheel from the extracted folder. If you downloaded a different
 version, use the wheel filename in your bundle.
 
 ```sh
-python -m pip install --no-index --no-deps fix_printer-0.1.0-py3-none-any.whl
+python -m pip install --no-index --no-deps fix_printer-0.1.1-py3-none-any.whl
 fix-printer --version
 ```
 
