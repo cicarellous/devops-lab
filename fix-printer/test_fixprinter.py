@@ -1,4 +1,5 @@
 import gzip
+import json
 import subprocess
 import sys
 import tempfile
@@ -262,6 +263,131 @@ class PrinterTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(b"latency unavailable", result.stdout)
                 self.assertIn(reason, result.stdout)
+
+    def test_session_and_time_filters_include_both_directions(self):
+        sample = CLI.parent / "samples" / "orders.fix"
+        result = self.run_cli(
+            "CLIENT-42", sample, "--session", "NORTHBRK42", "ALPHAOMS42",
+            "--from", "2026-01-12T14:30:01", "--until", "2026-01-12T14:30:03",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        messages = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([message["line"] for message in messages], [3, 4, 5])
+        self.assertTrue(all(message["schema_version"] == 1 for message in messages))
+        timing = messages[1]["timing"]
+        self.assertEqual(timing["microseconds"], 15_000)
+        self.assertEqual((timing["start"]["line"], timing["end"]["line"]), (3, 4))
+        mismatch = self.run_cli("CLIENT-42", sample, "--session", "OTHER", "ALPHAOMS42")
+        self.assertEqual(mismatch.returncode, 1, mismatch.stderr)
+        invalid = self.run_cli(
+            "CLIENT-42", sample, "--from", "2026-01-12T14:30:03Z",
+            "--until", "2026-01-12T14:30:04",
+        )
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn(b"same timezone convention", invalid.stderr)
+
+    def test_routing_json_uses_separate_session_filters(self):
+        samples = CLI.parent / "samples"
+        args = (
+            "Inbound_ClOrderId", samples / "client-ingress.fix",
+            "--routing-latency", samples / "session-44.fix", "--outbound-link-tag", 37,
+            "--session", "ALPHACLIENT", "FIRMINGRESS", "--json",
+        )
+        result = self.run_cli(*args, "--outbound-session", "ALPHAOMS44", "NORTHBRK44")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["type"], "routing")
+        self.assertEqual(report["outbound"]["match_tag"], 37)
+        self.assertEqual([item["microseconds"] for item in report["timings"]], [4_000, 15_000])
+        self.assertEqual(report["timings"][0]["start"]["line"], 1)
+        self.assertEqual(report["timings"][0]["end"]["line"], 3)
+        missing = self.run_cli(*args, "--outbound-session", "MISSING", "NORTHBRK44")
+        self.assertEqual(missing.returncode, 1, missing.stderr)
+        self.assertIn("not found", json.loads(missing.stdout)["outbound"]["reason"])
+
+    def test_lifecycle_reports_fill_times_and_follows_cancel_id(self):
+        for identifier, filename, lines, full in (
+            ("CLIENT-42", "orders.fix", [3, 4, 5, 6], 2_000_000),
+            ("Outbound_ClOrderId", "session-44.fix", [3, 4, 5, 6, 7], None),
+        ):
+            with self.subTest(filename=filename):
+                result = self.run_cli(identifier, CLI.parent / "samples" / filename, "--lifecycle", "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                *messages, summary = [json.loads(line) for line in result.stdout.splitlines()]
+                self.assertEqual([message["line"] for message in messages], lines)
+                self.assertEqual(summary["type"], "lifecycle_summary")
+                first, final = summary["timings"]
+                self.assertEqual(first["microseconds"], 1_000_000)
+                self.assertEqual((first["start"]["line"], first["end"]["line"]), (3, 5))
+                self.assertEqual(final["microseconds"], full)
+                if full is None:
+                    self.assertEqual(final["reason"], "no full fill seen")
+                    self.assertEqual(messages[-1]["timing"]["microseconds"], 12_000)
+
+    def test_lifecycle_follows_replace_and_excludes_another_session(self):
+        def row(millis, body):
+            return f"2026-01-12 14:30:00.{millis:03d} 8=FIX.4.4|9=1|{body}|10=000|\n".encode()
+
+        data = b"".join((
+            row(0, "35=D|49=OMS|56=VENUE|11=ORIGINAL"),
+            row(1, "35=8|49=VENUE|56=OMS|11=ORIGINAL|37=EXCHANGE|150=0"),
+            row(2, "35=G|49=OMS|56=VENUE|11=REPLACED|41=ORIGINAL"),
+            row(3, "35=8|49=VENUE|56=OTHER|11=REPLACED|37=EXCHANGE|150=F|32=1|39=2"),
+            row(4, "35=8|49=VENUE|56=OMS|11=REPLACED|41=ORIGINAL|37=EXCHANGE|150=5"),
+            row(5, "35=8|49=VENUE|56=OMS|37=EXCHANGE|150=F|32=1|39=2"),
+        ))
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = Path(tmp, "capture.log.gz")
+            sample.write_bytes(gzip.compress(data))
+            result = self.run_cli("ORIGINAL", sample, "--lifecycle", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *messages, summary = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([message["line"] for message in messages], [1, 2, 3, 5, 6])
+        self.assertEqual(messages[-2]["timing"]["label"], "Replace ack")
+        self.assertEqual(summary["timings"][1]["microseconds"], 5_000)
+
+    def test_json_preserves_repeated_tags_and_binary_values_without_color(self):
+        data = b"8=FIX.4.4|9=1|35=D|11=ID|40=1|40=2|95=2|96=\xff||10=000|\n"
+        result = self.run_cli("ID", "-", "--json", "--color", "always", data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(b"\x1b", result.stdout)
+        fields = json.loads(result.stdout)["fields"]
+        self.assertEqual([field["value"] for field in fields if field["tag"] == 40], ["1", "2"])
+        self.assertEqual(next(field for field in fields if field["tag"] == 96)["raw_base64"], "/3w=")
+
+    def test_undated_session_boundary_stops_correlation_with_a_time_filter(self):
+        data = (
+            b"2026-01-12 14:30:01 8=FIX.4.4|9=1|35=D|49=A|56=B|11=ID|10=000|\n"
+            b"8=FIX.4.4|9=1|35=A|49=A|56=B|10=000|\n"
+            b"2026-01-12 14:30:02 8=FIX.4.4|9=1|35=8|49=B|56=A|11=ID|150=0|10=000|\n"
+            b"2026-01-12 14:30:03 8=FIX.4.4|9=1|35=8|49=B|56=A|11=ID|150=F|32=1|39=2|10=000|\n"
+        )
+        options = ("--from", "2026-01-12T14:30:00", "--json")
+        search = self.run_cli("ID", "-", *options, data=data)
+        self.assertEqual(search.returncode, 0, search.stderr)
+        messages = [json.loads(line) for line in search.stdout.splitlines()]
+        self.assertEqual([message["line"] for message in messages], [1, 3, 4])
+        self.assertEqual(messages[1]["timing"]["reason"], "request not found in this session")
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp, "capture.fix")
+            capture.write_bytes(data)
+            lifecycle = self.run_cli("ID", capture, "--lifecycle", *options)
+        self.assertEqual(lifecycle.returncode, 0, lifecycle.stderr)
+        message, summary = [json.loads(line) for line in lifecycle.stdout.splitlines()]
+        self.assertEqual(message["line"], 1)
+        self.assertEqual(summary["timings"][0]["reason"], "no fill seen")
+
+    def test_routing_keeps_exchange_timing_when_inbound_order_is_missing(self):
+        samples = CLI.parent / "samples"
+        result = self.run_cli(
+            "missing", samples / "client-ingress.fix", "--routing-latency", samples / "session-44.fix",
+            "--outbound-clordid", "Outbound_ClOrderId", "--json",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        routing, exchange = json.loads(result.stdout)["timings"]
+        self.assertIsNone(routing["microseconds"])
+        self.assertEqual(exchange["microseconds"], 15_000)
 
     def test_wire_data_with_embedded_delimiter_and_fake_field(self):
         payload = b"hi\x0111=FAKE"

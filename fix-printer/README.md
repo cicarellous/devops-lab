@@ -5,6 +5,7 @@ Find an order in a FIX 4.2 or 4.4 log and print each matching message as a reada
 | Task | Command pattern |
 | --- | --- |
 | Print matching messages and same-session response times | `fixprinter.py ID LOG` |
+| Follow an order from submission through fills and cancels | `fixprinter.py ORIGINAL_CLORDID LOG --lifecycle` |
 | Label response times in an exchange-facing capture | `fixprinter.py ID LOG --exchange-facing` |
 | Measure internal routing when the gateway logs are separate | `fixprinter.py INBOUND_ID INBOUND_LOG --routing-latency OUTBOUND_LOG` |
 
@@ -39,9 +40,9 @@ The fixtures include the mandatory fields defined by the bundled dictionaries fo
 
 By default, the printer matches the exact value in `11` (ClOrdID), `37` (OrderID), or `41` (OrigClOrdID). Repeat `--tag` to search several explicit tags. Each match includes the file and line number and any prefix present before the message, such as a log timestamp or direction arrow. Repeated fields stay in the order they appeared. In color mode, MsgType (tag `35`) is cyan and the matching value is yellow. Use `--color never` for plain-text output or `--color always` when piping to an ANSI-aware pager.
 
-## Order and cancel response latency
+## Order, cancel, and replace response latency
 
-The printer automatically shows elapsed capture time on order and cancel acknowledgements or rejects. Latencies below one millisecond use microseconds (for example, `140μs`). From one millisecond up to one second, they use milliseconds (for example, `12.5ms`). From one second onward, they use seconds (for example, `1.25s` or `65s`). Seconds appear in red when color is enabled. Fractional values preserve the precision of the measured interval.
+The printer automatically shows elapsed capture time on order, cancel, and replace acknowledgements or rejects. Latencies below one millisecond use microseconds (for example, `140μs`). From one millisecond up to one second, they use milliseconds (for example, `12.5ms`). From one second onward, they use seconds (for example, `1.25s` or `65s`). Seconds appear in red when color is enabled. Fractional values preserve the precision of the measured interval.
 
 ```sh
 python3.12 fixprinter.py BROKER-44 samples/session-44.fix --tag 37
@@ -52,6 +53,41 @@ The sample prints **Order ack: 15ms** and **Cancel ack: 12ms**. The printer read
 Use a capture with one clock and a single logical session per CompID pair at any given time. Each timestamp must begin the log prefix in `YYYY-MM-DD HH:MM:SS[.ffffff]` or `MM/DD/YYYY HH:MM:SS[.ffffff]` format. A `T` separator, `Z`, and offsets such as `-05:00` are supported. Offset-free timestamps are compared as written. Eligible responses with a missing or ambiguous request, incompatible timestamps, or negative elapsed time show a reason. On very large captures, the oldest entries are evicted once 100,000 requests are pending.
 
 This measurement uses the capture timestamps on both records. It measures elapsed time at the capture point. Pending statuses and fills are outside the acknowledgement metric.
+
+## Filter by session and capture time
+
+`--session COMP_ID PEER_ID` selects one SenderCompID/TargetCompID pair in both directions. In two-log routing mode, it filters the inbound log. Use `--outbound-session COMP_ID PEER_ID` to filter the outbound log separately.
+
+```sh
+python3.12 fixprinter.py CLIENT-42 samples/orders.fix --session ALPHAOMS42 NORTHBRK42 --from 2026-01-12T14:30:01 --until 2026-01-12T14:30:03
+```
+
+This prints the new order, acknowledgement, and partial fill. `--from` includes its timestamp and `--until` excludes its timestamp. Either bound can be omitted. Time filters apply to both inputs in routing mode and only include records with parseable capture timestamps and compatible timezone conventions. Include the original request in the window to calculate its response time. Logon and Logout still end correlation for their session, even if their timestamps are missing or outside the window.
+
+## Follow an order lifecycle
+
+Start with the original ClOrdID on a New Order Single (`35=D`). The printer follows the matching session forward using ClOrdID (`11`), OrigClOrdID (`41`), and session OrderID (`37`) learned from linked execution reports. The timeline includes acknowledgements, fills, cancel and replace requests, their responses, and rejects. Use session and time filters if the original ID appears more than once.
+
+```sh
+python3.12 fixprinter.py CLIENT-42 samples/orders.fix --lifecycle
+python3.12 fixprinter.py Outbound_ClOrderId samples/session-44.fix --lifecycle
+```
+
+The FIX 4.2 example shows **1s to first fill** and **2s to full fill**. The FIX 4.4 example shows **1s to first fill** and a cancellation of the remainder. It reports that no full fill was seen. Both timings start at the original new order and use capture timestamps. A fill must be a trade execution report with a positive LastShares (FIX 4.2) or LastQty (FIX 4.4). A full fill also requires Filled in OrdStatus (tag `39`). The printer skips replay-flagged messages and stops at the selected session's next Logon or Logout. Supply a plain or gzip file in capture order so the printer can first locate the unique new order, then follow it.
+
+## JSON Lines
+
+Add `--json` to any workflow. Stdout contains one JSON object per line with `schema_version: 1`. Diagnostics go to stderr. Output contains no terminal color codes.
+
+```sh
+python3.12 fixprinter.py CLIENT-42 samples/orders.fix --lifecycle --json
+```
+
+- `message` includes the capture file, line, timestamp, prefix, FIX version, framing warnings, and fields in original order. Each field includes its numeric tag, name, raw value, optional enum description, and match status. Fields containing invalid UTF-8 also include `raw_base64` for exact recovery.
+- `lifecycle_summary` follows the messages and contains first-fill and full-fill timings, or a reason the original order could not be resolved.
+- `routing` contains both legs and their measurements in one record. It includes a reason for any leg that could not be resolved. The exchange response time can still be available when the inbound order is missing.
+
+Each timing has a label, start and end capture points when known, an integer `microseconds` value when measurable, and a reason when unavailable.
 
 ## Exchange and cross-gateway timing
 
@@ -96,7 +132,7 @@ Here the printer finds the inbound `35=D` by tag `11` and the outbound `35=D` by
 | Internal routing | Client-facing gateway receives `35=D` | Exchange-facing gateway sends the corresponding `35=D` | 4ms |
 | Exchange order ack round trip | Exchange-facing gateway sends `35=D` | Same gateway receives the exchange acknowledgement | 15ms |
 
-`--routing-latency` labels the exchange round trip automatically. The report lists the file, line, ClOrdID, and timestamp for both new orders. It requires one original matching new order per capture and reports missing or ambiguous links. An ambiguous outbound acknowledgement leaves the routing interval available when the two new orders can still be identified. Narrow the exports to the relevant session and time window if an ID is reused. Use synchronized gateway clocks and log timestamps recorded at receive and send. This mode accepts plain and gzip files.
+`--routing-latency` labels the exchange round trip automatically. The report lists the file, line, ClOrdID, and timestamp for both new orders. It requires one original matching new order per capture and reports missing or ambiguous links. An ambiguous outbound acknowledgement leaves the routing interval available when the two new orders can still be identified. If the inbound order is missing, the exchange round trip can still be reported from the outbound capture. The command exits with code `1` because the two-leg route is incomplete. Narrow the exports to the relevant session and time window if an ID is reused. Use synchronized gateway clocks and log timestamps recorded at receive and send. This mode accepts plain and gzip files.
 
 Client-to-gateway one-way timing would require the client's send timestamp and your gateway's receive timestamp on aligned clocks. Gateway-to-exchange one-way timing would require your gateway's send timestamp and the exchange's order receipt timestamp. Tag `52` on an exchange acknowledgement supplies the exchange's reply send time, which is a later event. The printer reports the measurements in the table from the available capture events.
 
