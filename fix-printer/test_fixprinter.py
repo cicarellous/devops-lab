@@ -389,6 +389,78 @@ class PrinterTests(unittest.TestCase):
         self.assertIsNone(routing["microseconds"])
         self.assertEqual(exchange["microseconds"], 15_000)
 
+    def test_rotation_keeps_search_lifecycle_and_outbound_timing(self):
+        samples = CLI.parent / "samples"
+        rows = (samples / "session-44.fix").read_bytes().splitlines(keepends=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp, "exchange.log.1.gz")
+            first.write_bytes(gzip.compress(b"".join(rows[:3])))
+            last = Path(tmp, "exchange.log")
+            last.write_bytes(b"".join(rows[3:]))
+            for mode in ((), ("--lifecycle",)):
+                result = self.run_cli(
+                    "Outbound_ClOrderId", first, "--next-log", last, "--json", *mode,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                messages = [json.loads(line) for line in result.stdout.splitlines()]
+                ack = messages[1]["timing"]
+                self.assertEqual(ack["microseconds"], 15_000)
+                self.assertEqual(ack["start"]["source"], str(first))
+                self.assertEqual(ack["end"]["source"], str(last))
+                self.assertEqual(ack["end"]["line"], 1)
+            route = self.run_cli(
+                "Inbound_ClOrderId", samples / "client-ingress.fix",
+                "--routing-latency", first, "--next-outbound-log", last,
+                "--outbound-link-tag", 37, "--json",
+            )
+        self.assertEqual(route.returncode, 0, route.stderr)
+        timing = json.loads(route.stdout)["timings"][1]
+        self.assertEqual(timing["microseconds"], 15_000)
+        self.assertEqual(timing["end"]["source"], str(last))
+
+    def test_session_diagnostics_tracks_each_direction_and_gap_fill(self):
+        rows = (
+            b"35=0|49=A|56=B|34=4|",
+            b"35=0|49=B|56=A|34=20|",
+            b"35=0|49=A|56=B|34=6|",
+            b"35=4|49=A|56=B|34=7|36=9|123=Y|43=Y|",
+            b"35=0|49=A|56=B|34=9|",
+            b"35=A|49=A|56=B|34=1|141=Y|",
+            b"35=0|49=A|56=B|34=2|",
+        )
+        data = b"".join(b"8=FIX.4.4|9=1|" + row + b"10=000|\n" for row in rows)
+        result = self.run_cli("-", "--session-diagnostics", "--json", data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *events, summary = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([event["event"] for event in events],
+                         ["sequence_gap", "replay", "gap_fill", "logon_reset"])
+        self.assertEqual((events[0]["expected"], events[0]["observed"]), (5, 6))
+        self.assertEqual(summary["messages"], 7)
+
+    def test_latency_summary_reports_percentiles_unavailable_and_evidence(self):
+        def row(millis, body):
+            return f"2026-01-12 14:30:00.{millis:03d} 8=FIX.4.4|9=1|{body}|10=000|\n".encode()
+
+        rows = []
+        for index, elapsed in enumerate((1, 2, 3, 50), start=1):
+            start = index * 100
+            rows.append(row(start, f"35=D|49=A|56=B|11=ID{index}"))
+            rows.append(row(start + elapsed, f"35=8|49=B|56=A|11=ID{index}|150=0"))
+        rows.append(row(500, "35=8|49=B|56=A|11=MISSING|150=0"))
+        rows.append(row(501, "35=8|49=B|56=A|11=ID1|150=F|32=1|39=2"))
+        result = self.run_cli("-", "--latency-summary", "--json", data=b"".join(rows))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *metrics, summary = [json.loads(line) for line in result.stdout.splitlines()]
+        indexed = {metric["label"]: metric for metric in metrics}
+        ack = indexed["Order ack"]
+        self.assertEqual(ack["session"], ["A", "B"])
+        self.assertEqual(ack["measured"], 4)
+        self.assertEqual(ack["percentiles_microseconds"], {"p50": 2000, "p95": 50000, "p99": 50000})
+        self.assertEqual(ack["unavailable"], {"request not found in this session": 1})
+        self.assertEqual(ack["slowest"][0]["end"]["line"], 8)
+        self.assertEqual(indexed["Time to full fill"]["percentiles_microseconds"]["p50"], 401_000)
+        self.assertEqual(summary["messages"], 10)
+
     def test_wire_data_with_embedded_delimiter_and_fake_field(self):
         payload = b"hi\x0111=FAKE"
         data = wire(b"4.2", b"35=8\x01150=1\x01354=10\x01355=" + payload + b"\x0111=REAL\x01")

@@ -7,6 +7,8 @@ Find an order in a FIX 4.2 or 4.4 log and print each matching message as a reada
 | Print matching messages and same-session response times | `fixprinter.py ID LOG` |
 | Follow an order from submission through fills and cancels | `fixprinter.py ORIGINAL_CLORDID LOG --lifecycle` |
 | Label response times in an exchange-facing capture | `fixprinter.py ID LOG --exchange-facing` |
+| Check sequence gaps, resets, and replay flags | `fixprinter.py LOG --session-diagnostics` |
+| Summarize response and fill latency by session | `fixprinter.py LOG --latency-summary` |
 | Measure internal routing when the gateway logs are separate | `fixprinter.py INBOUND_ID INBOUND_LOG --routing-latency OUTBOUND_LOG` |
 
 Run these examples from the `fix-printer` directory:
@@ -75,6 +77,34 @@ python3.12 fixprinter.py Outbound_ClOrderId samples/session-44.fix --lifecycle
 
 The FIX 4.2 example shows **1s to first fill** and **2s to full fill**. The FIX 4.4 example shows **1s to first fill** and a cancellation of the remainder. It reports that no full fill was seen. Both timings start at the original new order and use capture timestamps. A fill must be a trade execution report with a positive LastShares (FIX 4.2) or LastQty (FIX 4.4). A full fill also requires Filled in OrdStatus (tag `39`). The printer skips replay-flagged messages and stops at the selected session's next Logon or Logout. Supply a plain or gzip file in capture order so the printer can first locate the unique new order, then follow it.
 
+## Read rotated captures
+
+Pass the oldest file first and repeat `--next-log` for each later file. The printer reads files in the supplied order and retains correlation state between them. Every match and timing endpoint keeps its original filename and line number.
+
+```sh
+python3.12 fixprinter.py ORDER-123 gateway.log.2.gz --next-log gateway.log.1.gz --next-log gateway.log --lifecycle
+```
+
+For two-log routing, `--next-log` extends the inbound capture and `--next-outbound-log` extends the outbound capture. Use nonoverlapping files from each stream in oldest-to-newest order. The same session and time filters apply across a stream's files.
+
+## Inspect session sequence numbers
+
+```sh
+python3.12 fixprinter.py samples/session-44.fix --session-diagnostics
+```
+
+The sample reports **13 messages and no sequence events**. Use this report before investigating an incomplete order. It tracks sequence numbers independently by FIX version and sender/target direction, starting with the first visible message. It reports forward gaps, messages behind the expected sequence, replay flags, gap fills, and resets, with source lines. A gap is a discontinuity in the capture. Missing exports, capture filters, or a replay can affect what you see. Malformed messages and oversized records are counted separately.
+
+## Summarize latency for a session
+
+```sh
+python3.12 fixprinter.py samples/orders.fix --latency-summary --session ALPHAOMS42 NORTHBRK42
+```
+
+The sample reports an order acknowledgement at **15ms**, a first fill at **1s**, and a full fill at **2s**. For each FIX version, request direction, and timing type, the report shows measured counts, unavailable observations by reason, exact nearest-rank p50/p95/p99, and the three slowest intervals with start and end file and line references. Add `--exchange-facing` for exchange round-trip labels.
+
+Percentiles use measured observations. Requests with no visible reply and orders with no visible fill are outside those distributions. A visible reply or fill with missing correlation evidence is counted as unavailable. Capture times, session filters, and replay handling follow the same rules as the order views. Fill tracking retains up to 100,000 recent identifier links, and percentile memory grows with the number of distinct measured durations. Supply a time window for large investigations.
+
 ## JSON Lines
 
 Add `--json` to any workflow. Stdout contains one JSON object per line with `schema_version: 1`. Diagnostics go to stderr. Output contains no terminal color codes.
@@ -86,6 +116,9 @@ python3.12 fixprinter.py CLIENT-42 samples/orders.fix --lifecycle --json
 - `message` includes the capture file, line, timestamp, prefix, FIX version, framing warnings, and fields in original order. Each field includes its numeric tag, name, raw value, optional enum description, and match status. Fields containing invalid UTF-8 also include `raw_base64` for exact recovery.
 - `lifecycle_summary` follows the messages and contains first-fill and full-fill timings, or a reason the original order could not be resolved.
 - `routing` contains both legs and their measurements in one record. It includes a reason for any leg that could not be resolved. The exchange response time can still be available when the inbound order is missing.
+
+- `session_event` and `session_summary` report sequence evidence and counts.
+- `latency_metric` reports one metric and session direction, with percentiles and slowest intervals. `latency_summary` reports capture counts.
 
 Each timing has a label, start and end capture points when known, an integer `microseconds` value when measurable, and a reason when unavailable.
 
@@ -144,8 +177,8 @@ Client-to-gateway one-way timing would require the client's send timestamp and y
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | The search found matching messages, or routing found one matching order on each leg. Individual timings can still be unavailable. |
-| `1` | The search found no matches, or routing could not find a unique order on each leg. |
+| `0` | The search or report found relevant data, or routing found one matching order on each leg. Individual timings can still be unavailable. |
+| `1` | The search or report found no relevant data, or routing could not find a unique order on each leg. |
 | `2` | Input, dictionary, or usage error, including corrupt gzip files and skipped oversized records. |
 
 Run `python -m unittest -v` from this directory. The fixture tests check required fields and verify BodyLength and CheckSum after restoring SOH delimiters. The CLI uses the dictionaries for display and performs framing checks.
