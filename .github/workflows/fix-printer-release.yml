@@ -1,0 +1,56 @@
+name: Publish FIX Printer release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: fix-printer
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Test and build the bundle
+        run: |
+          python -m unittest -q
+          python -m pip install build
+          python -m build
+          python build_bundle.py
+
+      - name: Verify the wheel offline
+        run: |
+          python -m venv "$RUNNER_TEMP/fix-printer-release"
+          "$RUNNER_TEMP/fix-printer-release/bin/python" -m pip install --no-index --no-deps dist/*.whl
+          samples="$PWD/samples"
+          cd "$RUNNER_TEMP"
+          cli="$RUNNER_TEMP/fix-printer-release/bin/fix-printer"
+          "$cli" --version
+          "$cli" CLIENT-42 "$samples/orders.fix" --lifecycle | grep -Fx 'Time to full fill: 2s'
+          "$cli" Outbound_ClOrderId "$samples/session-44.fix" --lifecycle | grep -F 'Cancel ack: 12ms'
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python -c 'from fix_printer._version import __version__; print(__version__)')
+          gh release create "fix-printer-v$version" \
+            "dist/fix-printer-$version-bundle.zip" \
+            "dist/fix_printer-$version-py3-none-any.whl" \
+            --target "$GITHUB_SHA" \
+            --latest=false \
+            --title "FIX Printer $version" \
+            --notes "Download the bundle ZIP for the offline wheel, analyst guides, sample logs, and license notices. Extract it and start with README.md. Python 3.12 or later required."

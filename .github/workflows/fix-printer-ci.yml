@@ -29,6 +29,26 @@ jobs:
           python-version: '3.12'
       - run: python -m unittest -v
 
+      - name: Verify the wheel installs offline on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m pip install build
+          $dist = Join-Path $env:RUNNER_TEMP 'fix-printer-dist'
+          python -m build --wheel --outdir $dist
+          $wheel = Get-ChildItem -LiteralPath $dist -Filter '*.whl'
+          $venv = Join-Path $env:RUNNER_TEMP 'fix-printer-venv'
+          python -m venv $venv
+          & "$venv/Scripts/python.exe" -m pip install --no-index --no-deps $wheel.FullName
+          $samples = (Resolve-Path -LiteralPath 'samples').Path
+          Set-Location -LiteralPath $env:RUNNER_TEMP
+          $cli = "$venv/Scripts/fix-printer.exe"
+          & $cli --version
+          $fix42 = & $cli CLIENT-42 "$samples/orders.fix" --lifecycle
+          if ($LASTEXITCODE -ne 0 -or $fix42 -notcontains 'Time to full fill: 2s') { throw 'FIX 4.2 wheel smoke test failed' }
+          $fix44 = & $cli Outbound_ClOrderId "$samples/session-44.fix" --lifecycle
+          if ($LASTEXITCODE -ne 0 -or -not ($fix44 -match 'Cancel ack: 12ms')) { throw 'FIX 4.4 wheel smoke test failed' }
+
   ubi:
     name: Unit tests / Red Hat UBI 8 / Python 3.12
     runs-on: ubuntu-latest
@@ -38,3 +58,32 @@ jobs:
           docker run --rm -e PYTHONUTF8=1 -v "${{ github.workspace }}:/workspace:ro"
           -w /workspace/fix-printer --entrypoint /usr/bin/python3.12
           registry.access.redhat.com/ubi8/python-312 -B -m unittest -v
+
+      - name: Set up Python for the wheel build
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Build a wheel for the RHEL install check
+        working-directory: fix-printer
+        run: |
+          python -m pip install build
+          python -m build --wheel --outdir "$RUNNER_TEMP/fix-printer-dist"
+
+      - name: Install and smoke-test the wheel in Red Hat UBI 8
+        shell: bash
+        run: |
+          docker run --rm --network none \
+            --volume "$RUNNER_TEMP/fix-printer-dist:/dist:ro" \
+            --volume "$GITHUB_WORKSPACE/fix-printer/samples:/samples:ro" \
+            --entrypoint /bin/bash \
+            registry.access.redhat.com/ubi8/python-312 \
+            -e -u -o pipefail -c '
+              /usr/bin/python3.12 -m venv /tmp/fix-printer-venv
+              /tmp/fix-printer-venv/bin/python -m pip install --no-index --no-deps /dist/*.whl
+              cd /tmp
+              cli=/tmp/fix-printer-venv/bin/fix-printer
+              "$cli" --version
+              "$cli" CLIENT-42 /samples/orders.fix --lifecycle | grep -Fx "Time to full fill: 2s"
+              "$cli" Outbound_ClOrderId /samples/session-44.fix --lifecycle | grep -F "Cancel ack: 12ms"
+            '
