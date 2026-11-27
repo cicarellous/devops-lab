@@ -1,0 +1,40 @@
+name: FIX Printer CI
+
+on:
+  push:
+    branches: [main]
+    paths: ['fix-printer/**', '.github/workflows/fix-printer-ci.yml']
+  pull_request:
+    branches: [main]
+    paths: ['fix-printer/**', '.github/workflows/fix-printer-ci.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit tests / ${{ matrix.os }} / Python 3.12
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: fix-printer
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m unittest -v
+
+  ubi:
+    name: Unit tests / Red Hat UBI 8 / Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: >-
+          docker run --rm -e PYTHONUTF8=1 -v "${{ github.workspace }}:/workspace:ro"
+          -w /workspace/fix-printer --entrypoint /usr/bin/python3.12
+          registry.access.redhat.com/ubi8/python-312 -B -m unittest -v
