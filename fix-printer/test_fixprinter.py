@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
-from fixprinter import START, LatencyStats, Timing, format_duration, parse_message, run_cli, same_capture
+from fix_printer.cli import START, LatencyStats, Timing, format_duration, parse_message, run_cli, same_capture
 
 CLI = Path(__file__).with_name("fixprinter.py")
 
@@ -82,7 +82,7 @@ class PrinterTests(unittest.TestCase):
     def test_sample_sessions_contain_required_dictionary_fields(self):
         for version, sample in (("42", "orders.fix"), ("44", "session-44.fix")):
             with self.subTest(version=version):
-                root = ET.parse(CLI.parent / "dictionaries" / f"FIX{version}.xml")
+                root = ET.parse(CLI.parent / "fix_printer" / "dictionaries" / f"FIX{version}.xml")
                 tags = {field.attrib["name"]: int(field.attrib["number"])
                         for field in root.findall("fields/field")}
                 components = {node.attrib["name"]: node
@@ -537,7 +537,7 @@ class PrinterTests(unittest.TestCase):
                 result = self.run_cli("CLIENT-42", first, "--next-log", second)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(reason, result.stderr)
-        with patch("fixprinter.os.path.samefile", side_effect=OSError):
+        with patch("fix_printer.cli.os.path.samefile", side_effect=OSError):
             self.assertTrue(same_capture(str(sample), str(sample)))
             self.assertFalse(same_capture(str(sample), str(sample.with_name("other.fix"))))
 
@@ -590,7 +590,7 @@ class PrinterTests(unittest.TestCase):
             self.assertNotIn(b"\x1b", plain.stdout)
 
     def test_percentiles_bound_storage_and_preserve_slowest_evidence(self):
-        with patch("fixprinter.MAX_EXACT_LATENCY_VALUES", 8):
+        with patch("fix_printer.cli.MAX_EXACT_LATENCY_VALUES", 8):
             stats = LatencyStats()
             for value in range(1, 10_001):
                 stats.add(Timing("test", microseconds=value))
@@ -652,7 +652,7 @@ class PrinterTests(unittest.TestCase):
         self.assertIn("timezone conventions", json.loads(mixed.stdout.splitlines()[1])["timing"]["reason"])
 
     def test_closed_stderr_and_missing_startup_stdout_exit_quietly(self):
-        with patch("fixprinter.sys.stdout", None), patch("fixprinter.print_error"):
+        with patch("fix_printer.cli.sys.stdout", None), patch("fix_printer.cli.print_error"):
             self.assertEqual(run_cli(), 2)
         command = [sys.executable, str(CLI), "ID", "-", "--session", "X", "Y"]
         with subprocess.Popen(

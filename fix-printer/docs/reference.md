@@ -224,7 +224,7 @@ Run `python -m unittest -v` from this directory. The fixture tests check require
 
 ## FIX dictionaries
 
-The printer uses tag `8` (BeginString) to select version-specific names and enum descriptions from the bundled dictionaries, covering all 405 field definitions in the FIX 4.2 dictionary and all 912 in FIX 4.4. Keep the `dictionaries/` folder alongside the script. Supply a trusted QuickFIX XML dictionary with `--dictionary path/to/venue.xml` to add fields or override labels and enum values for that version. You can pass one override per version. Bundled and custom enum labels use the same display formatting, including common FIX acronyms. Unrecognized tags and values remain visible. Fields inside repeating groups are printed in capture order.
+The printer uses tag `8` (BeginString) to select version-specific names and enum descriptions from the bundled dictionaries, covering all 405 field definitions in the FIX 4.2 dictionary and all 912 in FIX 4.4. The installed wheel includes both dictionaries in `fix_printer/dictionaries/`. Supply a trusted QuickFIX XML dictionary with `--dictionary path/to/venue.xml` to add fields or override labels and enum values for that version. You can pass one override per version. Bundled and custom enum labels use the same display formatting, including common FIX acronyms. Unrecognized tags and values remain visible. Fields inside repeating groups are printed in capture order.
 
 ### Dictionary source
 
@@ -233,4 +233,4 @@ quickfixengine.org (http://www.quickfixengine.org/).
 
 The bundled [FIX 4.2](https://github.com/quickfix/quickfix/blob/386ce46e917ae494ab6e90b1be90fd421cdbe3f9/spec/FIX42.xml)
 and [FIX 4.4](https://github.com/quickfix/quickfix/blob/386ce46e917ae494ab6e90b1be90fd421cdbe3f9/spec/FIX44.xml)
-dictionaries are distributed under the [QuickFIX Software License](../dictionaries/LICENSE).
+dictionaries are distributed under the [QuickFIX Software License](../fix_printer/dictionaries/LICENSE).

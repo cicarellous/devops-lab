@@ -3,7 +3,7 @@
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fixprinter import __version__
+from fix_printer._version import __version__
 
 
 def main() -> None:
@@ -20,9 +20,12 @@ def main() -> None:
         "docs/reference.md",
         "docs/runbook.md",
         "fixprinter.py",
-        "dictionaries/FIX42.xml",
-        "dictionaries/FIX44.xml",
-        "dictionaries/LICENSE",
+        "fix_printer/__init__.py",
+        "fix_printer/_version.py",
+        "fix_printer/cli.py",
+        "fix_printer/dictionaries/FIX42.xml",
+        "fix_printer/dictionaries/FIX44.xml",
+        "fix_printer/dictionaries/LICENSE",
         "samples/client-ingress.fix",
         "samples/orders.fix",
         "samples/session-44.fix",

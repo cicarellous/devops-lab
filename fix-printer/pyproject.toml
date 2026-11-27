@@ -9,7 +9,7 @@ description = "Inspect FIX 4.2 and 4.4 captures, follow orders, and measure gate
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT AND LicenseRef-QuickFIX"
-license-files = ["LICENSE", "NOTICE", "dictionaries/LICENSE"]
+license-files = ["LICENSE", "NOTICE", "fix_printer/dictionaries/LICENSE"]
 keywords = ["fix", "trading", "logs", "cli"]
 classifiers = [
     "Environment :: Console",
@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 [project.scripts]
-fix-printer = "fixprinter:run_cli"
+fix-printer = "fix_printer.cli:run_cli"
 
 [project.urls]
 Repository = "https://github.com/cicarellous/devops-lab"
@@ -28,12 +28,11 @@ Documentation = "https://github.com/cicarellous/devops-lab/tree/main/fix-printer
 Issues = "https://github.com/cicarellous/devops-lab/issues"
 
 [tool.setuptools]
-py-modules = ["fixprinter"]
-packages = ["fixprinter_dictionaries"]
-package-dir = {fixprinter_dictionaries = "dictionaries"}
+packages = ["fix_printer"]
+include-package-data = false
 
 [tool.setuptools.package-data]
-fixprinter_dictionaries = ["FIX42.xml", "FIX44.xml"]
+fix_printer = ["dictionaries/FIX42.xml", "dictionaries/FIX44.xml", "dictionaries/LICENSE"]
 
 [tool.setuptools.dynamic]
-version = {attr = "fixprinter.__version__"}
+version = {attr = "fix_printer._version.__version__"}
