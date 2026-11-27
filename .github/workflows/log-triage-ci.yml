@@ -3,8 +3,10 @@ name: Log Triage CI
 on:
   push:
     branches: [main]
+    paths: ['log-triage/**', '.github/workflows/log-triage-ci.yml']
   pull_request:
     branches: [main]
+    paths: ['log-triage/**', '.github/workflows/log-triage-ci.yml']
 
 jobs:
   unit-tests:
