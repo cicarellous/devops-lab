@@ -7,7 +7,7 @@ and versioned JSON and exit codes in automation.
 
 ## Download and install
 
-Download the **Log Triage bundle** from [GitHub Releases](https://github.com/cicarellous/devops-lab/releases).
+Download the **Log Triage bundle** from [GitHub Releases](https://github.com/cicarellous/devops-lab/releases/tag/log-triage-v0.1.0).
 Under **Assets**, choose `log-triage-<version>-bundle.zip`. Extract it
 and open a terminal in the extracted folder. The bundle includes the
 installable wheel, the analyst guides, sample logs, and the MIT license.
