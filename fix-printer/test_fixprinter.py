@@ -652,8 +652,8 @@ class PrinterTests(unittest.TestCase):
         self.assertIn("timezone conventions", json.loads(mixed.stdout.splitlines()[1])["timing"]["reason"])
 
     def test_closed_stderr_and_missing_startup_stdout_exit_quietly(self):
-        with patch("fixprinter.sys.stdout", None):
-            self.assertEqual(run_cli(), 0)
+        with patch("fixprinter.sys.stdout", None), patch("fixprinter.print_error"):
+            self.assertEqual(run_cli(), 2)
         command = [sys.executable, str(CLI), "ID", "-", "--session", "X", "Y"]
         with subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -662,7 +662,15 @@ class PrinterTests(unittest.TestCase):
             process.stdin.write(b"8=FIX.4.4|9=1|35=D|49=A|56=B|11=ID|10=000|\n")
             process.stdin.close()
             self.assertEqual(process.stdout.read(), b"")
-            self.assertEqual(process.wait(timeout=10), 0)
+            self.assertEqual(process.wait(timeout=10), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp, "missing.log"))
+            with subprocess.Popen(
+                [sys.executable, str(CLI), "ID", missing], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ) as process:
+                process.stderr.close()
+                self.assertEqual(process.stdout.read(), b"")
+                self.assertEqual(process.wait(timeout=10), 2)
 
     def test_structural_link_tags_and_exact_record_limit(self):
         sample = CLI.parent / "samples" / "orders.fix"
@@ -735,6 +743,76 @@ class PrinterTests(unittest.TestCase):
         self.assertEqual(report["messages"], 3)
         self.assertEqual({item["label"]: item["percentiles_microseconds"]["p50"] for item in metrics},
                          {"Order ack": 2_000_000, "Time to first fill": 3_000_000})
+
+    def test_matching_partial_boundary_resets_only_compatible_scope(self):
+        def row(index, body):
+            return f"2026-01-12 14:30:0{index} 8=FIX.4.4|9=1|{body}|10=000|\n".encode()
+
+        for sender, expected in (("OTHER", 2_000_000), ("S1", None)):
+            with self.subTest(sender=sender):
+                data = b"".join((
+                    row(0, "35=D|49=A|56=B|50=S1|57=S2|11=ID"),
+                    row(1, f"35=A|49=A|56=B|50={sender}"),
+                    row(2, "35=8|49=B|56=A|50=S2|57=S1|11=ID|150=0"),
+                ))
+                result = self.run_cli(
+                    "ID", "-", "--session", "A", "B", "--session-subids", "S1", "S2", "--json", data=data,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                ack = json.loads(result.stdout.splitlines()[-1])["timing"]
+                self.assertEqual(ack["microseconds"], expected)
+                if expected is None:
+                    self.assertEqual(ack["reason"], "request not found in this session")
+        empty = self.run_cli(
+            "ID", "-", "--session", "A", "B", "--session-subids", "WRONG", "S2",
+            "--session-locations", "NY", "LDN", data=data,
+        )
+        self.assertEqual(empty.returncode, 1)
+        self.assertIn(b"SubIDs (50/57) WRONG / S2", empty.stderr)
+        self.assertIn(b"LocationIDs (142/143) NY / LDN", empty.stderr)
+
+    def test_fix42_lifecycle_applies_correction_and_later_bust_by_corrected_id(self):
+        rows = (
+            "35=D|49=A|56=B|11=ID",
+            "35=8|49=B|56=A|11=ID|17=ORIGINAL|20=0|150=2|39=2|32=10",
+            "35=8|49=B|56=A|17=CORRECTED|19=ORIGINAL|20=2|150=1|39=1|32=5",
+        )
+        data = [
+            f"2026-01-12 14:30:0{index} 8=FIX.4.2|9=1|{row}|10=000|\n".encode()
+            for index, row in enumerate(rows)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp, "corrections.log")
+            capture.write_bytes(b"".join(data))
+            corrected = self.run_cli("ID", capture, "--lifecycle", "--json")
+            self.assertEqual(corrected.returncode, 0, corrected.stderr)
+            *events, summary = [json.loads(line) for line in corrected.stdout.splitlines()]
+            self.assertEqual(len(events), 3)
+            self.assertEqual(summary["timings"][0]["microseconds"], 1_000_000)
+            self.assertEqual(summary["timings"][0]["end"]["line"], 2)
+            self.assertIsNone(summary["timings"][1]["microseconds"])
+            capture.write_bytes(b"".join(data) + (
+                b"2026-01-12 14:30:03 8=FIX.4.2|9=1|35=8|49=B|56=A|"
+                b"17=BUST|19=CORRECTED|20=1|150=1|39=0|32=5|10=000|\n"
+            ))
+            busted = self.run_cli("ID", capture, "--lifecycle", "--json")
+        self.assertEqual(busted.returncode, 0, busted.stderr)
+        summary = json.loads(busted.stdout.splitlines()[-1])
+        self.assertIsNone(summary["timings"][0]["microseconds"])
+        self.assertIn("referenced execution was busted", summary["timings"][0]["reason"])
+
+    def test_lifecycle_input_budget_counts_both_passes(self):
+        sample = CLI.parent / "samples" / "orders.fix"
+        rows = sample.read_bytes().splitlines(keepends=True)
+        data = b"".join(rows[:3]) + b"x" * (600 * 1024) + b"\n" + b"".join(rows[3:])
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp, "input.log")
+            capture.write_bytes(data)
+            lookup = self.run_cli("CLIENT-42", capture, "--max-input-mib", 1)
+            lifecycle = self.run_cli("CLIENT-42", capture, "--lifecycle", "--max-input-mib", 1)
+        self.assertEqual(lookup.returncode, 0, lookup.stderr)
+        self.assertEqual(lifecycle.returncode, 2, lifecycle.stderr)
+        self.assertIn(b"decompressed input exceeds --max-input-mib", lifecycle.stderr)
 
     def test_wire_data_with_embedded_delimiter_and_fake_field(self):
         payload = b"hi\x0111=FAKE"

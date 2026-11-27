@@ -137,11 +137,11 @@ def load_dictionary(path: str | Path) -> tuple[bytes, dict[int, str], dict[int, 
         raise ValueError("expected a QuickFIX XML dictionary for FIX 4.2 or 4.4")
     names = {}
     enums = {}
-    for field in fields.findall("field"):
-        tag = int(field.attrib["number"])
-        names[tag] = field.attrib["name"]
+    for entry in fields.findall("field"):
+        tag = int(entry.attrib["number"])
+        names[tag] = entry.attrib["name"]
         enums[tag] = {value.attrib["enum"]: enum_label(value.attrib["description"])
-                      for value in field.findall("value")}
+                      for value in entry.findall("value")}
     return version, names, enums
 
 
@@ -242,9 +242,11 @@ class CaptureFilter:
                 if pair is None:
                     continue
                 observed = tuple(fields.get(tag) for tag in tags)
-                if boundary and observed == (None, None):
-                    continue
-                if observed != (pair[::-1] if reverse else pair):
+                expected = pair[::-1] if reverse else pair
+                if boundary:
+                    if any(actual is not None and actual != value for actual, value in zip(observed, expected)):
+                        break
+                elif observed != expected:
                     break
             else:
                 return True
@@ -280,10 +282,15 @@ class CaptureFilter:
             return
         if self.session and not self.saw_session:
             pair = " / ".join(safe_text(comp) for comp in self.session)
-            print(f"fixprinter: {stream}: no messages for session {pair}", file=sys.stderr)
+            scope = []
+            for label, values in (("SubIDs (50/57)", self.subids), ("LocationIDs (142/143)", self.locations)):
+                if values:
+                    scope.append(f"{label} {' / '.join(safe_text(value) for value in values)}")
+            detail = f" with {', '.join(scope)}" if scope else ""
+            print_error(f"fixprinter: {stream}: no messages for session {pair}{detail}")
         elif self.rejected_times:
             details = "; ".join(f"{count} {reason}" for reason, count in sorted(self.rejected_times.items()))
-            print(f"fixprinter: {stream}: time filter excluded all matching records ({details})", file=sys.stderr)
+            print_error(f"fixprinter: {stream}: time filter excluded all matching records ({details})")
 
 
 @dataclass(frozen=True)
@@ -496,7 +503,7 @@ def records(
             while record and not record.endswith(b"\n"):
                 record = read_record()
             if warn_skipped:
-                print(f"{source}:{line_number}: skipped record over 8 MiB", file=sys.stderr)
+                print_error(f"{source}:{line_number}: skipped record over 8 MiB")
             yield line_number, b"", None
             continue
         first = None
@@ -529,9 +536,10 @@ def same_capture(first: str, second: str) -> bool:
 
 def capture_records(
     paths, *, containing=None, start_index=0, from_line=1, session=None, warn_skipped=True,
-    max_input_bytes=0,
+    max_input_bytes=0, budget=None,
 ):
-    budget = InputBudget(max_input_bytes) if max_input_bytes else None
+    if budget is None and max_input_bytes:
+        budget = InputBudget(max_input_bytes)
     rotated = len(paths) > 1
     if rotated:
         seen = set()
@@ -577,19 +585,38 @@ def capture_records(
 
 def is_closed_pipe(exc: OSError) -> bool:
     return isinstance(exc, BrokenPipeError) or (
-        os.name == "nt" and exc.errno in (errno.EINVAL, errno.EBADF)
+        os.name == "nt" and exc.errno == errno.EINVAL
     )
 
 
+def silence(stream) -> None:
+    with suppress(OSError, ValueError), open(os.devnull, "wb") as sink:
+        os.dup2(sink.fileno(), stream.fileno())
+
+
 def print(*values, **options):
-    if "file" in options and options["file"] is None:
-        return
     try:
         builtins.print(*values, **options)
     except OSError as exc:
-        if is_closed_pipe(exc):
+        output = options.get("file")
+        if output is not None and output is sys.stderr and (is_closed_pipe(exc) or exc.errno == errno.EBADF):
+            silence(output)
+        elif is_closed_pipe(exc):
             raise BrokenPipeError from exc
-        raise
+        else:
+            raise
+
+
+def print_error(message: str) -> None:
+    if sys.stderr is not None:
+        print(message, file=sys.stderr)
+
+
+class CliParser(argparse.ArgumentParser):
+    def _print_message(self, message, file=None):
+        stream = sys.stderr if file is None else file
+        if message and stream is not None:
+            print(message, end="", file=stream)
 
 
 def emit_json(kind: str, **values) -> None:
@@ -675,13 +702,15 @@ class RouteOrder:
 
 def locate_route_order(
     paths: list[str], identifier: bytes, link_tag: int, exchange: bool, capture_filter: CaptureFilter,
+    *, budget: InputBudget | None = None,
 ) -> RouteOrder | str:
     order = None
     tracker = LatencyTracker(exchange_facing=True)
     # Exchange timing also needs session boundaries and requests that may share an outbound ID.
     containing = None if exchange else identifier
     for index, source, line, prefix, message in capture_records(
-        paths, containing=containing, session=capture_filter.session, max_input_bytes=capture_filter.max_input_bytes,
+        paths, containing=containing, session=capture_filter.session,
+        max_input_bytes=capture_filter.max_input_bytes, budget=budget,
     ):
         if message is None:
             capture_filter.skipped = True
@@ -796,6 +825,14 @@ def legacy_fills_for(args, fields: dict[int, bytes]) -> bool:
     return args.legacy_fills or any(pair in (scope, scope[::-1]) for scope in args.legacy_fill_sessions)
 
 
+def last_fill_quantity(fields: dict[int, bytes]) -> Decimal | None:
+    try:
+        quantity = Decimal(fields.get(32, b"").decode("ascii"))
+    except (InvalidOperation, UnicodeDecodeError):
+        return None
+    return quantity if quantity.is_finite() else None
+
+
 def classify_fill(version: bytes, fields: dict[int, bytes], legacy_fills: bool) -> tuple[bool, str | None]:
     execution = fields.get(150)
     legacy = execution in (b"1", b"2")
@@ -806,11 +843,8 @@ def classify_fill(version: bytes, fields: dict[int, bytes], legacy_fills: bool) 
     standard_fill = legacy if version == b"FIX.4.2" else execution == b"F" or legacy
     if not standard_fill and (execution in NON_FILL_EXEC_TYPES or fields.get(39) not in (b"1", b"2")):
         return False, None
-    try:
-        quantity = Decimal(fields.get(32, b"0").decode("ascii"))
-        positive = quantity.is_finite() and quantity > 0
-    except (InvalidOperation, UnicodeDecodeError):
-        positive = False
+    quantity = last_fill_quantity(fields)
+    positive = quantity is not None and quantity > 0
     if standard_fill:
         return (True, None) if positive else (False, "missing or invalid last fill quantity")
     if positive:
@@ -820,7 +854,8 @@ def classify_fill(version: bytes, fields: dict[int, bytes], legacy_fills: bool) 
 
 def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
     paths = [args.log, *args.next_log]
-    root = locate_route_order(paths, identifier, 11, False, capture_filter)
+    budget = InputBudget(capture_filter.max_input_bytes) if capture_filter.max_input_bytes else None
+    root = locate_route_order(paths, identifier, 11, False, capture_filter, budget=budget)
     if isinstance(root, str):
         if args.json:
             emit_json("lifecycle_summary", clordid=safe_text(identifier), reason=root, timings=[])
@@ -833,13 +868,14 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
     tracker = LatencyTracker(args.exchange_facing)
     started = False
     fills = {}
-    busted = set()
+    execution_slots = {}
+    retired_executions = set()
     request_refs = {}
     fill_issues = Counter()
-    for _, source, line, prefix, message in capture_records(
+    for ordinal, (_, source, line, prefix, message) in enumerate(capture_records(
         paths, start_index=root.capture_index, from_line=root.point.line,
-        session=capture_filter.session, warn_skipped=False, max_input_bytes=capture_filter.max_input_bytes,
-    ):
+        session=capture_filter.session, warn_skipped=False, budget=budget,
+    )):
         if message is None:
             capture_filter.skipped = True
             if started:
@@ -867,6 +903,8 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
         execution_id, execution_ref = fields.get(17), fields.get(19)
         bust = (kind == b"8" and not forward
                 and (fields.get(150) == b"H" or message.version == b"FIX.4.2" and fields.get(20) == b"1"))
+        correction = (kind == b"8" and not forward and message.version == b"FIX.4.2"
+                      and fields.get(20) == b"2")
         reference = None
         if not started:
             if kind != b"D" or clordid != identifier or not forward:
@@ -889,7 +927,8 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
                 continue
         elif not forward and kind in (b"8", b"9"):
             if (clordid not in ids and orig not in ids and orderid not in order_ids
-                    and not (bust and (execution_ref in fills or execution_ref in busted))):
+                    and not ((bust or correction)
+                             and (execution_ref in execution_slots or execution_ref in retired_executions))):
                 continue
             if kind == b"8" and clordid in ids and fields.get(150) != b"8":
                 if orderid and orderid.upper() not in (b"0", b"NONE", b"UNKNOWN", b"N/A"):
@@ -908,14 +947,31 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
             label = "Session reject" if kind == b"3" else "Business reject"
             timing = elapsed_time(label, reference[1], point)
         fill, fill_issue = (classify_fill(message.version, fields, legacy_fills_for(args, fields))
-                            if not forward and kind == b"8" and not bust else (False, None))
-        if bust:
-            if execution_ref in fills:
-                del fills[execution_ref]
-                busted.add(execution_ref)
-                fill_issue = "referenced execution was busted"
-            elif execution_ref not in busted:
-                fill_issue = "trade bust could not be linked to an observed execution"
+                            if not forward and kind == b"8" and not (bust or correction) else (False, None))
+        if bust or correction:
+            if execution_ref in execution_slots:
+                slot = execution_slots.pop(execution_ref)
+                retired_executions.add(execution_ref)
+                original_point, original_full = fills[slot]
+                if bust:
+                    del fills[slot]
+                    fill_issue = "referenced execution was busted"
+                else:
+                    quantity = last_fill_quantity(fields)
+                    if quantity is None or quantity < 0 or (quantity > 0 and fields.get(39) not in (b"1", b"2")):
+                        del fills[slot]
+                        fill_issue = "trade correction has missing or invalid fill evidence"
+                    elif quantity == 0:
+                        del fills[slot]
+                        fill_issue = "trade correction removed the fill"
+                    else:
+                        filled = fields[39] == b"2"
+                        fills[slot] = original_point, (original_full or (ordinal, point)) if filled else None
+                        if execution_id:
+                            execution_slots[execution_id] = slot
+            elif execution_ref not in retired_executions:
+                action = "trade bust" if bust else "trade correction"
+                fill_issue = f"{action} could not be linked to an observed execution"
         if fill_issue:
             fill_issues[fill_issue] += 1
         if fill_issue and timing is None:
@@ -923,14 +979,21 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
         emit_message(
             message, source, line, prefix, timing, ID_TAGS, identifier, dictionaries, color, args.json, point
         )
-        if fill and execution_id not in busted:
-            fills.setdefault(execution_id or point, (point, fields.get(39) == b"2"))
+        if fill and execution_id not in retired_executions and execution_id not in execution_slots:
+            slot = execution_id or point
+            fills.setdefault(slot, (point, (ordinal, point) if fields.get(39) == b"2" else None))
+            if execution_id:
+                execution_slots[execution_id] = slot
 
     first = next(iter(fills.values()), None)
-    full = next((point for point, filled in fills.values() if filled), None)
+    _, full = min((event for _, event in fills.values() if event is not None), default=(0, None))
     first_fill = elapsed_time("Time to first fill", root.point, first[0]) if first else None
     full_fill = elapsed_time("Time to full fill", root.point, full) if full else None
-    if "trade bust could not be linked to an observed execution" in fill_issues:
+    if any(reason in fill_issues for reason in (
+        "trade bust could not be linked to an observed execution",
+        "trade correction could not be linked to an observed execution",
+        "trade correction has missing or invalid fill evidence",
+    )):
         first_fill = full_fill = None
     fill_reason = f"fill candidates excluded: {', '.join(fill_issues)}" if fill_issues else None
     if capture_filter.skipped and fill_reason is None:
@@ -1256,7 +1319,8 @@ def capture_report(args, capture_filter, color: bool) -> int:
         else:
             print(f"Latency summary: {total} messages, {malformed} malformed, {skipped} skipped records")
             if orphan_count:
-                print(f"{orphan_count} replies had no observed requests in their session direction.")
+                subject = "reply had" if orphan_count == 1 else "replies had"
+                print(f"{orphan_count} {subject} no observed requests in the corresponding session direction.")
             if not stats:
                 print("No eligible latency observations.")
     return 2 if skipped else 0 if (total if args.session_diagnostics else stats) else 1
@@ -1282,7 +1346,7 @@ def positive_tag(text: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
+    parser = CliParser(
         description=__doc__,
         epilog=(
             "With one log, order, cancel, and replace response timing is automatic. "
@@ -1340,7 +1404,7 @@ def main() -> int:
                         metavar=("COMP_ID", "PEER_ID"),
                         help="enable legacy FIX 4.4 fill codes only for this pair; repeatable")
     parser.add_argument("--max-input-mib", type=int, default=0, metavar="MIB",
-                        help="limit decompressed input per capture stream (0 means unlimited)")
+                        help="limit decompressed bytes read per capture stream, including lifecycle rereads; JSON output is uncapped (0 means unlimited)")
     parser.add_argument("--json", action="store_true", help="write versioned JSON Lines to stdout")
     args = parser.parse_args()
     report = args.session_diagnostics or args.latency_summary
@@ -1438,29 +1502,36 @@ def main() -> int:
     except BrokenPipeError:
         raise
     except (OSError, EOFError, ET.ParseError, ValueError, KeyError, zlib.error) as exc:
-        print(f"fixprinter: {printable_label(str(exc))}", file=sys.stderr)
+        print_error(f"fixprinter: {printable_label(str(exc))}")
         return 2
 
 
 def run_cli() -> int:
     if sys.stdout is None:
-        return 0
+        print_error("fixprinter: stdout is unavailable")
+        return 2
     try:
         sys.stdout.reconfigure(encoding="utf-8")
+    except (OSError, ValueError):
+        silence(sys.stdout)
+        print_error("fixprinter: unable to configure stdout")
+        return 2
+    try:
         status = main()
         sys.stdout.flush()
-        if sys.stderr is not None:
-            sys.stderr.flush()
-        return status
     except OSError as exc:
-        if not is_closed_pipe(exc):
+        if not is_closed_pipe(exc) and exc.errno != errno.EBADF:
             raise
-        with open(os.devnull, "wb") as sink:
-            for stream in (sys.stdout, sys.stderr):
-                if stream is not None:
-                    with suppress(OSError):
-                        os.dup2(sink.fileno(), stream.fileno())
-        return 0
+        silence(sys.stdout)
+        status = 0 if is_closed_pipe(exc) else 2
+    if sys.stderr is not None:
+        try:
+            sys.stderr.flush()
+        except OSError as exc:
+            if not is_closed_pipe(exc) and exc.errno != errno.EBADF:
+                raise
+            silence(sys.stderr)
+    return status
 
 
 if __name__ == "__main__":
