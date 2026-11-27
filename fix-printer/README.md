@@ -7,6 +7,7 @@ Find an order in a FIX 4.2 or 4.4 log and print each matching message as a reada
 | Print matching messages and same-session response times | `fixprinter.py ID LOG` |
 | Follow an order from submission through fills and cancels | `fixprinter.py ORIGINAL_CLORDID LOG --lifecycle` |
 | Label response times in an exchange-facing capture | `fixprinter.py ID LOG --exchange-facing` |
+| Interpret legacy FIX 4.4 fills for a known venue | `fixprinter.py LOG --latency-summary --legacy-fill-session COMP_ID PEER_ID` |
 | Check sequence gaps, resets, and replay flags | `fixprinter.py LOG --session-diagnostics` |
 | Summarize response and fill latency by session | `fixprinter.py LOG --latency-summary` |
 | Measure internal routing when the gateway logs are separate | `fixprinter.py INBOUND_ID INBOUND_LOG --routing-latency OUTBOUND_LOG` |
@@ -52,13 +53,15 @@ python3.12 fixprinter.py BROKER-44 samples/session-44.fix --tag 37
 
 The sample prints **Order ack: 15ms** and **Cancel ack: 12ms**. The printer reads requests even when the search filter hides them. It pairs by ClOrdID (`11`), FIX version, and reversed sender/target CompIDs. A cancel uses its own ClOrdID and checks OrigClOrdID (`41`) when both records carry it. Logon and Logout clear pending requests for that CompID pair. Messages marked as possible duplicates are skipped for timing.
 
-Use a capture with one clock and a single logical session per CompID pair at any given time. Each timestamp must begin the log prefix in `YYYY-MM-DD HH:MM:SS[.ffffff]` or `MM/DD/YYYY HH:MM:SS[.ffffff]` format. The fractional part can have up to nine digits. Filters compare the full timestamp, and elapsed values are reported in whole microseconds. A `T` separator, `Z`, and offsets such as `-05:00` are supported. Offset-free timestamps are compared as written. Eligible responses with a missing or ambiguous request, incompatible timestamps, or negative elapsed time show a reason. A repeated reply to a recently completed request is reported as a duplicate response. On very large captures, the oldest entries are evicted once 100,000 requests are pending.
+Use a capture with one clock and scope multiplexed sessions using the filters below. Begin each log prefix with `YYYY-MM-DD HH:MM:SS[.fraction]` or `MM/DD/YYYY HH:MM:SS[.fraction]`. Fractional seconds are accepted at any printed precision. The printer compares the first nine digits and reports elapsed values in whole microseconds. A `T` separator, `Z`, and offsets such as `-05:00` are supported. Offset-free timestamps are compared as written. Eligible responses with a missing or ambiguous request, incompatible timestamps, or negative elapsed time show a reason. A repeated reply to a recently completed request is reported as a duplicate response. An acknowledgement followed by a rejection is a conflicting reply. On very large captures, the oldest entries are evicted once 100,000 requests are pending.
 
 This measurement uses the capture timestamps on both records. It measures elapsed time at the capture point. Pending statuses and fills are outside the acknowledgement metric.
 
 ## Filter by session and capture time
 
 `--session COMP_ID PEER_ID` selects one SenderCompID/TargetCompID pair in both directions. In two-log routing mode, it filters the inbound log. Use `--outbound-session COMP_ID PEER_ID` to filter the outbound log separately.
+
+When several logical sessions share a CompID pair, add `--session-subids COMP_SUB PEER_SUB` for tags 50/57 and `--session-locations COMP_LOC PEER_LOC` for tags 142/143. The two values follow the same endpoint order as `--session`, and are reversed for replies. Use `--outbound-subids` and `--outbound-locations` with `--outbound-session`. Scope each run to one logical session when these fields distinguish traffic. Unscoped Logons and Logouts on the selected CompID pair still end correlation.
 
 ```sh
 python3.12 fixprinter.py CLIENT-42 samples/orders.fix --session ALPHAOMS42 NORTHBRK42 --from 2026-01-12T14:30:01 --until 2026-01-12T14:30:03
@@ -68,14 +71,14 @@ This prints the new order, acknowledgement, and partial fill. `--from` includes 
 
 ## Follow an order lifecycle
 
-Start with the original ClOrdID on a New Order Single (`35=D`). The printer follows the matching session forward using ClOrdID (`11`), OrigClOrdID (`41`), and session OrderID (`37`) learned from linked execution reports. The timeline includes acknowledgements, fills, cancel and replace requests, their responses, and rejects. Use session and time filters if the original ID appears more than once.
+Start with the original ClOrdID on a New Order Single (`35=D`). The printer follows the matching session forward using ClOrdID (`11`), OrigClOrdID (`41`), and session OrderID (`37`) learned from linked execution reports. The timeline includes acknowledgements, fills, cancel and replace requests, their responses, and session or business rejects with a reference to a tracked request. Use session and time filters if the original ID appears more than once.
 
 ```sh
 python3.12 fixprinter.py CLIENT-42 samples/orders.fix --lifecycle
 python3.12 fixprinter.py Outbound_ClOrderId samples/session-44.fix --lifecycle
 ```
 
-The FIX 4.2 example shows **1s to first fill** and **2s to full fill**. The FIX 4.4 example shows **1s to first fill** and a cancellation of the remainder. It reports that no full fill was seen. Both timings start at the original new order and use capture timestamps. A fill must be a trade execution report with a positive LastShares (FIX 4.2) or LastQty (FIX 4.4). A full fill also requires Filled in OrdStatus (tag `39`). FIX 4.4 uses `ExecType=F` for a trade. If a venue sends legacy `1` or `2` on FIX 4.4, use `--legacy-fills` with lifecycle or latency summary. Without that opt-in, legacy fills are reported as unavailable. Unrecognized execution types with a positive last quantity and a partial or filled status are also flagged. The printer skips replay-flagged messages and stops at the selected session's next Logon or Logout. Supply a plain or gzip file in capture order so the printer can first locate the unique new order, then follow it.
+The FIX 4.2 example shows **1s to first fill** and **2s to full fill**. The FIX 4.4 example shows **1s to first fill** and a cancellation of the remainder. It reports that no full fill was seen. Both timings start at the original new order and use capture timestamps. A fill must be a trade execution report with a positive LastShares (FIX 4.2) or LastQty (FIX 4.4). A full fill also requires Filled in OrdStatus (tag `39`). FIX 4.4 uses `ExecType=F` for a trade. If a venue sends legacy `1` or `2` on FIX 4.4, use repeatable `--legacy-fill-session COMP_ID PEER_ID` with lifecycle or latency summary. Use `--legacy-fills` for an entire capture that follows that convention. Without that opt-in, legacy fills are reported as unavailable. Unrecognized execution types with a positive last quantity and a partial or filled status are also flagged. The lifecycle removes a busted fill when its ExecRefID links to an observed execution. A bust with no matching execution in the selected lifecycle makes its fill timings unavailable. The printer skips replay-flagged messages and stops at the selected session's next Logon or Logout. Supply a plain or gzip file in capture order so the printer can first locate the unique new order, then follow it.
 
 ## Read rotated captures
 
@@ -93,7 +96,7 @@ For two-log routing, `--next-log` extends the inbound capture and `--next-outbou
 python3.12 fixprinter.py samples/session-44.fix --session-diagnostics
 ```
 
-The sample reports **13 messages and no sequence events**. Use this report before investigating an incomplete order. It tracks sequence numbers independently by FIX version and sender/target direction, starting with the first visible message. It reports forward gaps, messages behind the expected sequence, replay flags, gap fills, and resets, with source lines and the final expected sequence for each direction. A gap is a discontinuity in the capture. Missing exports, capture filters, or a replay can affect what you see. Malformed messages and oversized records are counted separately.
+The sample reports **13 messages and no sequence events**. Use this report before investigating an incomplete order. It tracks sequence numbers independently by FIX version and sender/target direction, starting with the first visible message. A reset Logon clears the previous expectation in both directions. A paired reset reply establishes the peer's new expectation. It reports forward gaps, messages behind the expected sequence, replay flags, gap fills, and resets, with source lines and the final expected sequence for each direction. A gap is a discontinuity in the capture. Missing exports, capture filters, or a replay can affect what you see. Malformed messages and oversized records are counted separately.
 
 ## Summarize latency for a session
 
@@ -103,7 +106,7 @@ python3.12 fixprinter.py samples/orders.fix --latency-summary --session ALPHAOMS
 
 The sample reports an order acknowledgement at **15ms**, a first fill at **1s**, and a full fill at **2s**. For each FIX version, request direction, and timing type, the report shows measured counts, unavailable observations by reason, nearest-rank p50/p95/p99, and the three slowest intervals with start and end file and line references. Add `--exchange-facing` for exchange round-trip labels.
 
-Percentiles use measured observations. Requests that are still unanswered at capture end, lost at a session boundary, or evicted from tracking are counted separately. Visible replies and fills with missing evidence are counted as unavailable. Orders with no visible fill are outside fill distributions.
+Percentiles use measured observations. Requests that are still unanswered at capture end, lost at a session boundary, or evicted from tracking are counted separately. Visible replies and fills with missing evidence are counted as unavailable. Orders with no visible fill are outside fill distributions. Replies with no observed requests in that session direction are counted separately. With a time filter, unanswered means no matching reply inside the selected window. Fill percentiles describe observed fill events. Use the order lifecycle to reconcile linked trade busts.
 
 The report marks p95 as sparse below 20 measured values and p99 below 100. After 2,048 distinct durations for a metric, it switches from exact ranks to bounded buckets and labels percentile estimates as approximate. The three slowest intervals retain exact microsecond values. Fill tracking retains up to 100,000 recent identifier links.
 
@@ -119,10 +122,10 @@ python3.12 fixprinter.py CLIENT-42 samples/orders.fix --lifecycle --json
 - `lifecycle_summary` follows the messages and contains first-fill and full-fill timings, or a reason the original order could not be resolved.
 - `routing` contains both legs and their measurements in one record. It includes a reason for any leg that could not be resolved. The exchange response time can still be available when the inbound order is missing.
 
-- `session_event` and `session_summary` report sequence evidence and counts.
-- `latency_metric` reports one metric and session direction, with percentiles and slowest intervals. `latency_summary` reports capture counts.
+- `session_event` and `session_summary` report sequence evidence and counts. The summary includes `expected_next` per direction.
+- `latency_metric` reports one metric and session direction, with percentiles, `percentile_method`, `sparse_percentiles`, and slowest intervals. `latency_summary` reports capture counts. Lifecycle and routing summaries carry an `incomplete` flag if a record was skipped.
 
-Each timing has a label, start and end capture points when known, an integer `microseconds` value when measurable, and a reason when unavailable. Capture points include `nanosecond_remainder`, the 0?999 nanoseconds beyond the timestamp's microsecond precision.
+Each timing has a label, start and end capture points when known, an integer `microseconds` value when measurable, and a reason when unavailable. Capture points include `nanosecond_remainder`, the 0 to 999 nanoseconds beyond the timestamp's microsecond precision.
 
 ## Exchange and cross-gateway timing
 
@@ -174,14 +177,15 @@ Client-to-gateway one-way timing would require the client's send timestamp and y
 ## Input
 
 - Read a plain log, a `.gz` file, or stdin using `-`. For example, a logging tool that exports FIX records can feed them into `python3.12 fixprinter.py CLIENT-42 -`.
-- Each message must be on one physical line, with SOH bytes or pipe separators. A single line can hold multiple messages. Lines over 8 MiB are skipped with a diagnostic. Lifecycle and routing emit recoverable evidence, mark affected timings unavailable, and exit with code `2`. Capture formats that wrap messages or contain line breaks inside binary fields need preprocessing.
+- Each message must be on one physical line, with SOH bytes or pipe separators. A single line can hold multiple messages. Lines over 8 MiB are skipped with a diagnostic. Lifecycle and routing keep timings backed by captured endpoints, flag the result as incomplete, and exit with code `2`. Session response pairing resets at a skipped record. Capture formats that wrap messages or contain line breaks inside binary fields need preprocessing.
+- Use `--max-input-mib MIB` to cap decompressed input per capture stream, including rotations. The default is unlimited. Terminal field values are shortened after 512 bytes, and JSON Lines retains the full values.
 - For SOH captures, the printer checks BodyLength and CheckSum where available. If an export omits only the separator after CheckSum, otherwise valid records are accepted. Pipe exports receive structural checks. Matching partial messages are printed with warnings when the identifier is recoverable. Single-log searches match the requested tag values directly. Use the two-log workflow for a mapped inbound and outbound pair.
 
 | Exit code | Meaning |
 | --- | --- |
-| `0` | The search or report found relevant data, or routing found one matching order on each leg. Individual timings can still be unavailable. |
+| `0` | The search or report found relevant data, or routing found one matching order on each leg. A latency report with only unanswered requests is a successful report. Closing the output pipe early also exits with code `0`. |
 | `1` | The search or report found no relevant data, or routing could not find a unique order on each leg. |
-| `2` | Input, dictionary, or usage error, including corrupt gzip files and skipped oversized records. |
+| `2` | Input, dictionary, or usage error, including corrupt gzip files, skipped oversized records, and exceeded input budgets. |
 
 Run `python -m unittest -v` from this directory. The fixture tests check required fields and verify BodyLength and CheckSum after restoring SOH delimiters. The CLI uses the dictionaries for display and performs framing checks.
 

@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
-from fixprinter import START, LatencyStats, Timing, format_duration, parse_message, same_capture
+from fixprinter import START, LatencyStats, Timing, format_duration, parse_message, run_cli, same_capture
 
 CLI = Path(__file__).with_name("fixprinter.py")
 
@@ -439,7 +439,7 @@ class PrinterTests(unittest.TestCase):
         self.assertEqual((events[0]["expected"], events[0]["observed"]), (5, 6))
         self.assertEqual(summary["messages"], 7)
         expected = {(row["sender"], row["target"]): row["next_sequence"] for row in summary["expected_next"]}
-        self.assertEqual(expected, {("A", "B"): 3, ("B", "A"): 21})
+        self.assertEqual(expected, {("A", "B"): 3})
 
     def test_latency_summary_reports_percentiles_unavailable_and_evidence(self):
         def row(millis, body):
@@ -545,19 +545,21 @@ class PrinterTests(unittest.TestCase):
         samples = CLI.parent / "samples"
         with tempfile.TemporaryDirectory() as tmp:
             partial = Path(tmp, "partial.log")
-            partial.write_bytes((samples / "session-44.fix").read_bytes() + b"x" * (8 * 1024 * 1024) + b"\n")
+            partial.write_bytes((samples / "session-44.fix").read_bytes() + b"x" * (8 * 1024 * 1024 + 1) + b"\n")
             lifecycle = self.run_cli("Outbound_ClOrderId", partial, "--lifecycle", "--json")
             self.assertEqual(lifecycle.returncode, 2, lifecycle.stderr)
             *messages, summary = [json.loads(line) for line in lifecycle.stdout.splitlines()]
             self.assertEqual(len(messages), 5)
-            self.assertEqual(summary["timings"][0]["reason"], "capture has a skipped record")
+            self.assertTrue(summary["incomplete"])
+            self.assertEqual(summary["timings"][0]["microseconds"], 1_000_000)
             route = self.run_cli(
                 "Inbound_ClOrderId", samples / "client-ingress.fix", "--routing-latency", partial,
                 "--outbound-link-tag", 37, "--json",
             )
             self.assertEqual(route.returncode, 2, route.stderr)
             self.assertIsNotNone(json.loads(route.stdout)["outbound"]["line"])
-            self.assertIsNone(json.loads(route.stdout)["timings"][0]["microseconds"])
+            self.assertTrue(json.loads(route.stdout)["incomplete"])
+            self.assertEqual(json.loads(route.stdout)["timings"][0]["microseconds"], 4_000)
 
     def test_closed_stdout_pipe_exits_quietly(self):
         sample = CLI.parent / "samples" / "orders.fix"
@@ -597,6 +599,142 @@ class PrinterTests(unittest.TestCase):
         self.assertEqual(sum(stats.values.values()), 10_000)
         self.assertEqual(stats.slowest[0].microseconds, 10_000)
         self.assertGreaterEqual(stats.percentiles(10_000)["p99"], 9_700)
+
+    def test_execution_report_rejects_use_pending_kind_and_conflicts_are_not_unanswered(self):
+        rows = (
+            "35=F|49=A|56=B|11=C|41=ORIGINAL",
+            "35=8|49=B|56=A|11=C|41=ORIGINAL|150=8",
+            "35=G|49=A|56=B|11=R|41=ORIGINAL",
+            "35=8|49=B|56=A|11=R|41=ORIGINAL|150=8",
+            "35=F|49=A|56=B|11=M|41=ORIGINAL",
+            "35=9|49=B|56=A|11=M|41=DIFFERENT|434=1",
+            "35=D|49=A|56=B|11=ORDER",
+            "35=8|49=B|56=A|11=ORDER|150=0",
+            "35=8|49=B|56=A|11=ORDER|150=8",
+        )
+        data = b"".join(
+            f"2026-01-12 14:30:00.{index:03d} 8=FIX.4.4|9=1|{row}|10=000|\n".encode()
+            for index, row in enumerate(rows)
+        )
+        result = self.run_cli("-", "--latency-summary", "--json", data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *metrics, _ = [json.loads(line) for line in result.stdout.splitlines()]
+        labels = {item["label"]: item for item in metrics}
+        self.assertEqual(labels["Cancel reject"]["measured"], 1)
+        self.assertEqual(labels["Replace reject"]["measured"], 1)
+        self.assertEqual(labels["Cancel reject"]["unavailable"], {"request and response do not match": 1})
+        self.assertEqual(labels["Order reject"]["unavailable"], {"conflicting reply": 1})
+        self.assertFalse(any("unanswered" in label for label in labels))
+
+    def test_windowed_unanswered_and_orphan_replies_are_reported_separately(self):
+        request = b"2026-01-12 14:30:00 8=FIX.4.4|9=1|35=D|49=A|56=B|11=ID|10=000|\n"
+        reply = b"2026-01-12 14:30:02 8=FIX.4.4|9=1|35=8|49=B|56=A|11=ID|150=0|10=000|\n"
+        limited = self.run_cli("-", "--latency-summary", "--until", "2026-01-12T14:30:02",
+                               "--exchange-facing", "--json", data=request + reply)
+        self.assertEqual(limited.returncode, 0, limited.stderr)
+        metric = json.loads(limited.stdout.splitlines()[0])
+        self.assertEqual(metric["label"], "Exchange order unanswered")
+        self.assertEqual(metric["unavailable"], {"no matching reply in the selected time window": 1})
+        orphan = self.run_cli("-", "--latency-summary", "--json", data=reply)
+        self.assertEqual(orphan.returncode, 1, orphan.stderr)
+        summary = json.loads(orphan.stdout)
+        self.assertEqual(summary["metrics"], 0)
+        self.assertEqual(summary["replies_without_observed_request_direction"], 1)
+
+    def test_long_fraction_and_mixed_timezone_records(self):
+        request = b"2026-01-12 14:30:00.000000900012 8=FIX.4.4|9=1|35=D|49=A|56=B|11=ID|10=000|\n"
+        reply = b"2026-01-12 14:30:00.000140100999 8=FIX.4.4|9=1|35=8|49=B|56=A|11=ID|150=0|10=000|\n"
+        result = self.run_cli("ID", "-", "--json", data=request + reply)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[1])["timing"]["microseconds"], 139)
+        mixed = self.run_cli("ID", "-", "--json", data=request + reply.replace(b"999 ", b"999Z ", 1))
+        self.assertEqual(mixed.returncode, 0, mixed.stderr)
+        self.assertIn("timezone conventions", json.loads(mixed.stdout.splitlines()[1])["timing"]["reason"])
+
+    def test_closed_stderr_and_missing_startup_stdout_exit_quietly(self):
+        with patch("fixprinter.sys.stdout", None):
+            self.assertEqual(run_cli(), 0)
+        command = [sys.executable, str(CLI), "ID", "-", "--session", "X", "Y"]
+        with subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ) as process:
+            process.stderr.close()
+            process.stdin.write(b"8=FIX.4.4|9=1|35=D|49=A|56=B|11=ID|10=000|\n")
+            process.stdin.close()
+            self.assertEqual(process.stdout.read(), b"")
+            self.assertEqual(process.wait(timeout=10), 0)
+
+    def test_structural_link_tags_and_exact_record_limit(self):
+        sample = CLI.parent / "samples" / "orders.fix"
+        for tag in (8, 9, 10, 35):
+            result = self.run_cli("ID", sample, "--routing-latency", sample, "--outbound-link-tag", tag)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b"structural tag", result.stderr)
+        record = b"8=FIX.4.4|9=1|35=D|11=ID|58="
+        trailer = b"|10=000|"
+        pad = 8 * 1024 * 1024 - len(record) - len(trailer)
+        exact = self.run_cli("ID", "-", data=record + b"x" * pad + trailer + b"\r\n")
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        self.assertIn(b"[truncated", exact.stdout)
+        self.assertLess(len(exact.stdout), 2_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "large.log.gz")
+            path.write_bytes(gzip.compress(record + b"x" * (1024 * 1024) + trailer + b"\n"))
+            capped = self.run_cli("ID", path, "--max-input-mib", 1)
+        self.assertEqual(capped.returncode, 2)
+        self.assertIn(b"decompressed input exceeds", capped.stderr)
+
+    def test_embedded_beginstring_fragment_keeps_fields_after_it(self):
+        data = b"8=FIX.4.4|9=1|35=D|58=description|8=FIX.4.2|11=ID|10=000|\n"
+        result = self.run_cli("ID", "-", "--json", data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        message = json.loads(result.stdout)
+        self.assertIn("Embedded BeginString-like field without a FIX header", message["warnings"])
+        self.assertIn("ID", [field["value"] for field in message["fields"] if field["tag"] == 11])
+
+    def test_lifecycle_correlates_generic_rejects_and_excludes_busted_fills(self):
+        rows = (
+            "35=D|49=A|56=B|34=7|11=ID",
+            "35=8|49=B|56=A|11=ID|37=O|17=OLD|150=F|39=2|32=5",
+            "35=8|49=B|56=A|11=ID|37=O|17=BUST|19=OLD|150=H|39=0",
+            "35=3|49=B|56=A|45=7|372=D",
+            "35=j|49=B|56=A|379=ID|372=D",
+            "35=8|49=B|56=A|11=ID|37=O|17=NEW|150=F|39=2|32=5",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "trades.log")
+            path.write_bytes(b"".join(
+                f"2026-01-12 14:30:0{index} 8=FIX.4.4|9=1|{row}|10=000|\n".encode()
+                for index, row in enumerate(rows)
+            ))
+            result = self.run_cli("ID", path, "--lifecycle", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *messages, summary = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row["line"] for row in messages], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([row["timing"]["label"] for row in messages[3:5]], ["Session reject", "Business reject"])
+        self.assertEqual([item["microseconds"] for item in summary["timings"]], [5_000_000, 5_000_000])
+
+    def test_optional_subidentifiers_and_legacy_venue_scope(self):
+        rows = (
+            "35=D|49=A|56=B|50=X|57=Y|142=NY|143=LDN|11=ID",
+            "35=8|49=B|56=A|50=Y|57=OTHER|142=LDN|143=NY|11=ID|150=0",
+            "35=8|49=B|56=A|50=Y|57=X|142=LDN|143=NY|11=ID|150=0",
+            "35=8|49=B|56=A|50=Y|57=X|142=LDN|143=NY|11=ID|150=1|39=1|32=1",
+        )
+        data = b"".join(
+            f"2026-01-12 14:30:0{index} 8=FIX.4.4|9=1|{row}|10=000|\n".encode()
+            for index, row in enumerate(rows)
+        )
+        result = self.run_cli(
+            "-", "--latency-summary", "--json", "--session", "A", "B",
+            "--session-subids", "X", "Y", "--session-locations", "NY", "LDN",
+            "--legacy-fill-session", "A", "B", data=data,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *metrics, report = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(report["messages"], 3)
+        self.assertEqual({item["label"]: item["percentiles_microseconds"]["p50"] for item in metrics},
+                         {"Order ack": 2_000_000, "Time to first fill": 3_000_000})
 
     def test_wire_data_with_embedded_delimiter_and_fake_field(self):
         payload = b"hi\x0111=FAKE"
