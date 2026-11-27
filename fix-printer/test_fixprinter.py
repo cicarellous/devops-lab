@@ -9,7 +9,16 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
-from fix_printer.cli import START, LatencyStats, Timing, format_duration, parse_message, run_cli, same_capture
+from fix_printer import __version__
+from fix_printer.cli import (
+    START,
+    LatencyStats,
+    Timing,
+    format_duration,
+    parse_message,
+    run_cli,
+    same_capture,
+)
 
 CLI = Path(__file__).with_name("fixprinter.py")
 
@@ -20,6 +29,15 @@ def wire(version, body):
 
 
 class PrinterTests(unittest.TestCase):
+    def test_python_module_entry_point(self):
+        module = [sys.executable, "-m", "fix_printer"]
+        version = subprocess.run([*module, "--version"], cwd=CLI.parent, capture_output=True, check=False)
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertEqual(version.stdout.strip(), f"FIX Printer {__version__}".encode())
+        missing = subprocess.run(module, cwd=CLI.parent, capture_output=True, check=False)
+        self.assertEqual(missing.returncode, 2, missing.stderr)
+        self.assertTrue(missing.stderr.startswith(b"usage: fix-printer "), missing.stderr)
+
     def run_cli(self, *args, data=None):
         return subprocess.run(
             [sys.executable, str(CLI), *map(str, args)], input=data,
@@ -90,13 +108,13 @@ class PrinterTests(unittest.TestCase):
                 messages = {node.attrib["msgtype"].encode(): node
                             for node in root.findall("messages/message")}
 
-                def required(section):
+                def required(section, components, tags):
                     for entry in section:
                         if entry.attrib["required"] != "Y":
                             continue
                         name = entry.attrib["name"]
                         if entry.tag == "component":
-                            yield from required(components[name])
+                            yield from required(components[name], components, tags)
                         else:
                             yield tags[name]
 
@@ -111,7 +129,7 @@ class PrinterTests(unittest.TestCase):
                     kind = fields[35]
                     kinds.append(kind)
                     for section in (root.find("header"), messages[kind], root.find("trailer")):
-                        self.assertFalse(set(required(section)) - fields.keys())
+                        self.assertFalse(set(required(section, components, tags)) - fields.keys())
                 expected = b"AAD888001055" if version == "42" else b"AAD88F8001055"
                 self.assertEqual(b"".join(kinds), expected)
 

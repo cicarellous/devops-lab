@@ -248,7 +248,10 @@ class CaptureFilter:
                 observed = tuple(fields.get(tag) for tag in tags)
                 expected = pair[::-1] if reverse else pair
                 if boundary:
-                    if any(actual is not None and actual != value for actual, value in zip(observed, expected)):
+                    if any(
+                        actual is not None and actual != value
+                        for actual, value in zip(observed, expected, strict=True)
+                    ):
                         break
                 elif observed != expected:
                     break
@@ -562,7 +565,7 @@ def capture_records(
         first_timestamp = True
         latest = None
 
-        def on_timestamp(timestamp):
+        def on_timestamp(timestamp, previous=previous, previous_source=previous_source, source=source):
             nonlocal first_timestamp, latest
             if first_timestamp and previous is not None:
                 if (timestamp[0].tzinfo is None) != (previous[0].tzinfo is None):
