@@ -40,7 +40,7 @@ The fixtures include the mandatory fields defined by the bundled dictionaries fo
 
 ## Matching messages
 
-By default, the printer matches the exact value in `11` (ClOrdID), `37` (OrderID), or `41` (OrigClOrdID). Repeat `--tag` to search several explicit tags. Each match includes the file and line number and any prefix present before the message, such as a log timestamp or direction arrow. Repeated fields stay in the order they appeared. In color mode, MsgType (tag `35`) is cyan and the matching value is yellow. Use `--color never` for plain-text output or `--color always` when piping to an ANSI-aware pager.
+By default, the printer matches the exact value in `11` (ClOrdID), `37` (OrderID), or `41` (OrigClOrdID). Repeat `--tag` to search several explicit tags. Each match includes the file and line number and any prefix present before the message, such as a log timestamp or direction arrow. Repeated fields stay in the order they appeared. In color mode, MsgType (tag `35`) is cyan and the matching value is yellow. Use `--color never` for plain-text output or `--color always` when piping to an ANSI-aware pager. In auto mode, `CLICOLOR_FORCE` and `FORCE_COLOR` enable color unless `NO_COLOR` is set. JSON Lines always stays plain.
 
 ## Order, cancel, and replace response latency
 
@@ -52,7 +52,7 @@ python3.12 fixprinter.py BROKER-44 samples/session-44.fix --tag 37
 
 The sample prints **Order ack: 15ms** and **Cancel ack: 12ms**. The printer reads requests even when the search filter hides them. It pairs by ClOrdID (`11`), FIX version, and reversed sender/target CompIDs. A cancel uses its own ClOrdID and checks OrigClOrdID (`41`) when both records carry it. Logon and Logout clear pending requests for that CompID pair. Messages marked as possible duplicates are skipped for timing.
 
-Use a capture with one clock and a single logical session per CompID pair at any given time. Each timestamp must begin the log prefix in `YYYY-MM-DD HH:MM:SS[.ffffff]` or `MM/DD/YYYY HH:MM:SS[.ffffff]` format. A `T` separator, `Z`, and offsets such as `-05:00` are supported. Offset-free timestamps are compared as written. Eligible responses with a missing or ambiguous request, incompatible timestamps, or negative elapsed time show a reason. On very large captures, the oldest entries are evicted once 100,000 requests are pending.
+Use a capture with one clock and a single logical session per CompID pair at any given time. Each timestamp must begin the log prefix in `YYYY-MM-DD HH:MM:SS[.ffffff]` or `MM/DD/YYYY HH:MM:SS[.ffffff]` format. The fractional part can have up to nine digits. Filters compare the full timestamp, and elapsed values are reported in whole microseconds. A `T` separator, `Z`, and offsets such as `-05:00` are supported. Offset-free timestamps are compared as written. Eligible responses with a missing or ambiguous request, incompatible timestamps, or negative elapsed time show a reason. A repeated reply to a recently completed request is reported as a duplicate response. On very large captures, the oldest entries are evicted once 100,000 requests are pending.
 
 This measurement uses the capture timestamps on both records. It measures elapsed time at the capture point. Pending statuses and fills are outside the acknowledgement metric.
 
@@ -64,7 +64,7 @@ This measurement uses the capture timestamps on both records. It measures elapse
 python3.12 fixprinter.py CLIENT-42 samples/orders.fix --session ALPHAOMS42 NORTHBRK42 --from 2026-01-12T14:30:01 --until 2026-01-12T14:30:03
 ```
 
-This prints the new order, acknowledgement, and partial fill. `--from` includes its timestamp and `--until` excludes its timestamp. Either bound can be omitted. Time filters apply to both inputs in routing mode and only include records with parseable capture timestamps and compatible timezone conventions. Include the original request in the window to calculate its response time. Logon and Logout still end correlation for their session, even if their timestamps are missing or outside the window.
+This prints the new order, acknowledgement, and partial fill. `--from` includes its timestamp and `--until` excludes its timestamp. Either bound can be omitted. Time filters apply to both inputs in routing mode and only include records with parseable capture timestamps and compatible timezone conventions. If the session matches no records or the time window excludes every candidate, the printer explains why on stderr. Include the original request in the window to calculate its response time. Logon and Logout still end correlation for their session, even if their timestamps are missing or outside the window.
 
 ## Follow an order lifecycle
 
@@ -75,7 +75,7 @@ python3.12 fixprinter.py CLIENT-42 samples/orders.fix --lifecycle
 python3.12 fixprinter.py Outbound_ClOrderId samples/session-44.fix --lifecycle
 ```
 
-The FIX 4.2 example shows **1s to first fill** and **2s to full fill**. The FIX 4.4 example shows **1s to first fill** and a cancellation of the remainder. It reports that no full fill was seen. Both timings start at the original new order and use capture timestamps. A fill must be a trade execution report with a positive LastShares (FIX 4.2) or LastQty (FIX 4.4). A full fill also requires Filled in OrdStatus (tag `39`). The printer skips replay-flagged messages and stops at the selected session's next Logon or Logout. Supply a plain or gzip file in capture order so the printer can first locate the unique new order, then follow it.
+The FIX 4.2 example shows **1s to first fill** and **2s to full fill**. The FIX 4.4 example shows **1s to first fill** and a cancellation of the remainder. It reports that no full fill was seen. Both timings start at the original new order and use capture timestamps. A fill must be a trade execution report with a positive LastShares (FIX 4.2) or LastQty (FIX 4.4). A full fill also requires Filled in OrdStatus (tag `39`). FIX 4.4 uses `ExecType=F` for a trade. If a venue sends legacy `1` or `2` on FIX 4.4, use `--legacy-fills` with lifecycle or latency summary. Without that opt-in, legacy fills are reported as unavailable. Unrecognized execution types with a positive last quantity and a partial or filled status are also flagged. The printer skips replay-flagged messages and stops at the selected session's next Logon or Logout. Supply a plain or gzip file in capture order so the printer can first locate the unique new order, then follow it.
 
 ## Read rotated captures
 
@@ -85,7 +85,7 @@ Pass the oldest file first and repeat `--next-log` for each later file. The prin
 python3.12 fixprinter.py ORDER-123 gateway.log.2.gz --next-log gateway.log.1.gz --next-log gateway.log --lifecycle
 ```
 
-For two-log routing, `--next-log` extends the inbound capture and `--next-outbound-log` extends the outbound capture. Use nonoverlapping files from each stream in oldest-to-newest order. The same session and time filters apply across a stream's files.
+For two-log routing, `--next-log` extends the inbound capture and `--next-outbound-log` extends the outbound capture. Use nonoverlapping files from each stream in oldest-to-newest order. Duplicate files and reversed or overlapping timestamp ranges at rotation boundaries are rejected when those boundaries have comparable timestamps. The same session and time filters apply across a stream's files.
 
 ## Inspect session sequence numbers
 
@@ -93,7 +93,7 @@ For two-log routing, `--next-log` extends the inbound capture and `--next-outbou
 python3.12 fixprinter.py samples/session-44.fix --session-diagnostics
 ```
 
-The sample reports **13 messages and no sequence events**. Use this report before investigating an incomplete order. It tracks sequence numbers independently by FIX version and sender/target direction, starting with the first visible message. It reports forward gaps, messages behind the expected sequence, replay flags, gap fills, and resets, with source lines. A gap is a discontinuity in the capture. Missing exports, capture filters, or a replay can affect what you see. Malformed messages and oversized records are counted separately.
+The sample reports **13 messages and no sequence events**. Use this report before investigating an incomplete order. It tracks sequence numbers independently by FIX version and sender/target direction, starting with the first visible message. It reports forward gaps, messages behind the expected sequence, replay flags, gap fills, and resets, with source lines and the final expected sequence for each direction. A gap is a discontinuity in the capture. Missing exports, capture filters, or a replay can affect what you see. Malformed messages and oversized records are counted separately.
 
 ## Summarize latency for a session
 
@@ -101,9 +101,11 @@ The sample reports **13 messages and no sequence events**. Use this report befor
 python3.12 fixprinter.py samples/orders.fix --latency-summary --session ALPHAOMS42 NORTHBRK42
 ```
 
-The sample reports an order acknowledgement at **15ms**, a first fill at **1s**, and a full fill at **2s**. For each FIX version, request direction, and timing type, the report shows measured counts, unavailable observations by reason, exact nearest-rank p50/p95/p99, and the three slowest intervals with start and end file and line references. Add `--exchange-facing` for exchange round-trip labels.
+The sample reports an order acknowledgement at **15ms**, a first fill at **1s**, and a full fill at **2s**. For each FIX version, request direction, and timing type, the report shows measured counts, unavailable observations by reason, nearest-rank p50/p95/p99, and the three slowest intervals with start and end file and line references. Add `--exchange-facing` for exchange round-trip labels.
 
-Percentiles use measured observations. Requests with no visible reply and orders with no visible fill are outside those distributions. A visible reply or fill with missing correlation evidence is counted as unavailable. Capture times, session filters, and replay handling follow the same rules as the order views. Fill tracking retains up to 100,000 recent identifier links, and percentile memory grows with the number of distinct measured durations. Supply a time window for large investigations.
+Percentiles use measured observations. Requests that are still unanswered at capture end, lost at a session boundary, or evicted from tracking are counted separately. Visible replies and fills with missing evidence are counted as unavailable. Orders with no visible fill are outside fill distributions.
+
+The report marks p95 as sparse below 20 measured values and p99 below 100. After 2,048 distinct durations for a metric, it switches from exact ranks to bounded buckets and labels percentile estimates as approximate. The three slowest intervals retain exact microsecond values. Fill tracking retains up to 100,000 recent identifier links.
 
 ## JSON Lines
 
@@ -120,7 +122,7 @@ python3.12 fixprinter.py CLIENT-42 samples/orders.fix --lifecycle --json
 - `session_event` and `session_summary` report sequence evidence and counts.
 - `latency_metric` reports one metric and session direction, with percentiles and slowest intervals. `latency_summary` reports capture counts.
 
-Each timing has a label, start and end capture points when known, an integer `microseconds` value when measurable, and a reason when unavailable.
+Each timing has a label, start and end capture points when known, an integer `microseconds` value when measurable, and a reason when unavailable. Capture points include `nanosecond_remainder`, the 0?999 nanoseconds beyond the timestamp's microsecond precision.
 
 ## Exchange and cross-gateway timing
 
@@ -172,8 +174,8 @@ Client-to-gateway one-way timing would require the client's send timestamp and y
 ## Input
 
 - Read a plain log, a `.gz` file, or stdin using `-`. For example, a logging tool that exports FIX records can feed them into `python3.12 fixprinter.py CLIENT-42 -`.
-- Each message must be on one physical line, with SOH bytes or pipe separators. A single line can hold multiple messages. Lines over 8 MiB are skipped with a diagnostic. Capture formats that wrap messages or contain line breaks inside binary fields need preprocessing.
-- For SOH captures, the printer checks BodyLength and CheckSum where available. Pipe exports receive structural checks. Matching partial messages are printed with warnings when the identifier is recoverable. Single-log searches match the requested tag values directly. Use the two-log workflow for a mapped inbound and outbound pair.
+- Each message must be on one physical line, with SOH bytes or pipe separators. A single line can hold multiple messages. Lines over 8 MiB are skipped with a diagnostic. Lifecycle and routing emit recoverable evidence, mark affected timings unavailable, and exit with code `2`. Capture formats that wrap messages or contain line breaks inside binary fields need preprocessing.
+- For SOH captures, the printer checks BodyLength and CheckSum where available. If an export omits only the separator after CheckSum, otherwise valid records are accepted. Pipe exports receive structural checks. Matching partial messages are printed with warnings when the identifier is recoverable. Single-log searches match the requested tag values directly. Use the two-log workflow for a mapped inbound and outbound pair.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -185,7 +187,7 @@ Run `python -m unittest -v` from this directory. The fixture tests check require
 
 ## FIX dictionaries
 
-The printer uses tag `8` (BeginString) to select version-specific names and enum descriptions from the bundled dictionaries, covering all 405 field definitions in the FIX 4.2 dictionary and all 912 in FIX 4.4. Keep the `dictionaries/` folder alongside the script. Supply a trusted QuickFIX XML dictionary with `--dictionary path/to/venue.xml` to add fields or override labels and enum values for that version. You can pass one override per version. Unrecognized tags and values remain visible. Fields inside repeating groups are printed in capture order.
+The printer uses tag `8` (BeginString) to select version-specific names and enum descriptions from the bundled dictionaries, covering all 405 field definitions in the FIX 4.2 dictionary and all 912 in FIX 4.4. Keep the `dictionaries/` folder alongside the script. Supply a trusted QuickFIX XML dictionary with `--dictionary path/to/venue.xml` to add fields or override labels and enum values for that version. You can pass one override per version. Bundled and custom enum labels use the same display formatting, including common FIX acronyms. Unrecognized tags and values remain visible. Fields inside repeating groups are printed in capture order.
 
 ### Dictionary source
 

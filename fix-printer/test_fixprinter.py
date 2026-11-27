@@ -1,13 +1,15 @@
 import gzip
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest.mock import patch
 
-from fixprinter import START, format_duration, parse_message
+from fixprinter import START, LatencyStats, Timing, format_duration, parse_message, same_capture
 
 CLI = Path(__file__).with_name("fixprinter.py")
 
@@ -46,13 +48,13 @@ class PrinterTests(unittest.TestCase):
             xml = Path(tmp, "venue.xml")
             xml.write_text(
                 '<fix major="4" minor="4"><fields>'
-                '<field number="9001" name="VenueID"><value enum="S" description="Sim"/>'
+                '<field number="9001" name="VenueID"><value enum="S" description="RIC_CODE"/>'
                 '</field></fields></fix>', encoding="utf-8",
             )
             result = self.run_cli("S", log, "--tag", 9001, "--dictionary", xml)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(b"VenueID", result.stdout)
-            self.assertIn(b"Sim [S]", result.stdout)
+            self.assertIn(b"RIC Code [S]", result.stdout)
             self.assertIn(b"Buy [1]", result.stdout)
             self.assertEqual(self.run_cli("S", log).returncode, 1)
 
@@ -436,6 +438,8 @@ class PrinterTests(unittest.TestCase):
                          ["sequence_gap", "replay", "gap_fill", "logon_reset"])
         self.assertEqual((events[0]["expected"], events[0]["observed"]), (5, 6))
         self.assertEqual(summary["messages"], 7)
+        expected = {(row["sender"], row["target"]): row["next_sequence"] for row in summary["expected_next"]}
+        self.assertEqual(expected, {("A", "B"): 3, ("B", "A"): 21})
 
     def test_latency_summary_reports_percentiles_unavailable_and_evidence(self):
         def row(millis, body):
@@ -460,6 +464,139 @@ class PrinterTests(unittest.TestCase):
         self.assertEqual(ack["slowest"][0]["end"]["line"], 8)
         self.assertEqual(indexed["Time to full fill"]["percentiles_microseconds"]["p50"], 401_000)
         self.assertEqual(summary["messages"], 10)
+
+    def test_nanosecond_capture_duplicate_response_and_unanswered_request(self):
+        data = (
+            b"2026-01-12 14:30:00.000000900 8=FIX.4.4|9=1|35=D|49=A|56=B|11=ID|10=000|\n"
+            b"2026-01-12 14:30:00.000140100 8=FIX.4.4|9=1|35=8|49=B|56=A|11=ID|150=0|10=000|\n"
+            b"2026-01-12 14:30:00.000141999 8=FIX.4.4|9=1|35=8|49=B|56=A|11=ID|150=0|10=000|\n"
+            b"2026-01-12 14:30:00.000142999 8=FIX.4.4|9=1|35=D|49=A|56=B|11=OTHER|10=000|\n"
+        )
+        result = self.run_cli("-", "--latency-summary", "--json", data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        *metrics, _ = [json.loads(line) for line in result.stdout.splitlines()]
+        by_label = {metric["label"]: metric for metric in metrics}
+        self.assertEqual(by_label["Order ack"]["percentiles_microseconds"]["p50"], 139)
+        self.assertEqual(by_label["Order ack"]["unavailable"], {"duplicate response": 1})
+        self.assertEqual(by_label["Order ack"]["slowest"][0]["start"]["nanosecond_remainder"], 900)
+        filtered = self.run_cli("ID", "-", "--until", "2026-01-12T14:30:00.000140101", "--json", data=data)
+        self.assertEqual(filtered.returncode, 0, filtered.stderr)
+        self.assertEqual(len(filtered.stdout.splitlines()), 2)
+        self.assertEqual(by_label["Order unanswered"]["unavailable"],
+                         {"capture ended before a matching reply": 1})
+        pending = self.run_cli("-", "--latency-summary", "--json", data=data.splitlines(keepends=True)[-1])
+        self.assertEqual(pending.returncode, 0, pending.stderr)
+        self.assertEqual(json.loads(pending.stdout.splitlines()[0])["label"], "Order unanswered")
+
+    def test_legacy_fills_are_explicit_and_fill_like_reports_explain_exclusion(self):
+        def row(index, body):
+            return f"2026-01-12 14:30:0{index} 8=FIX.4.4|9=1|{body}|10=000|\n".encode()
+
+        data = b"".join((
+            row(0, "35=D|49=A|56=B|11=ID"),
+            row(1, "35=8|49=B|56=A|11=ID|150=Z|39=1|32=10"),
+            row(2, "35=8|49=B|56=A|11=ID|150=1|39=1|32=10"),
+            row(3, "35=8|49=B|56=A|11=ID|150=2|39=2|32=10"),
+        ))
+        strict = self.run_cli("-", "--latency-summary", "--json", data=data)
+        self.assertEqual(strict.returncode, 0, strict.stderr)
+        metrics = {item.get("label"): item for item in map(json.loads, strict.stdout.splitlines())}
+        self.assertEqual(sum(metrics["Fill timing"]["unavailable"].values()), 3)
+        compat = self.run_cli("-", "--latency-summary", "--legacy-fills", "--json", data=data)
+        self.assertEqual(compat.returncode, 0, compat.stderr)
+        metrics = {item.get("label"): item for item in map(json.loads, compat.stdout.splitlines())}
+        self.assertEqual(metrics["Time to first fill"]["percentiles_microseconds"]["p50"], 2_000_000)
+        self.assertEqual(metrics["Time to full fill"]["percentiles_microseconds"]["p50"], 3_000_000)
+
+    def test_filter_diagnostics_and_incompatible_options(self):
+        data = b"2026-01-12 14:30:00 8=FIX.4.4|9=1|35=D|49=A|56=B|11=ID|10=000|\n"
+        for options, expected in (
+            (("--session", "X", "Y"), b"no messages for session X / Y"),
+            (("--from", "2026-01-12T14:29:59Z"), b"timezone convention differs"),
+        ):
+            result = self.run_cli("ID", "-", *options, data=data)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout, b"")
+            self.assertIn(expected, result.stderr)
+        incompatible = self.run_cli("-", "--session-diagnostics", "--exchange-facing")
+        self.assertEqual(incompatible.returncode, 2)
+        self.assertIn(b"does not apply", incompatible.stderr)
+
+    def test_rotated_inputs_reject_duplicate_and_reversed_captures(self):
+        sample = CLI.parent / "samples" / "orders.fix"
+        rows = sample.read_bytes().splitlines(keepends=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            older = Path(tmp, "older.log")
+            newer = Path(tmp, "newer.log.gz")
+            older.write_bytes(b"".join(rows[:3]))
+            newer.write_bytes(gzip.compress(b"".join(rows[3:])))
+            for first, second, reason in (
+                (older, older, b"duplicate rotated capture"),
+                (newer, older, b"out of order or overlap"),
+            ):
+                result = self.run_cli("CLIENT-42", first, "--next-log", second)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(reason, result.stderr)
+        with patch("fixprinter.os.path.samefile", side_effect=OSError):
+            self.assertTrue(same_capture(str(sample), str(sample)))
+            self.assertFalse(same_capture(str(sample), str(sample.with_name("other.fix"))))
+
+    def test_oversized_record_keeps_partial_lifecycle_and_route_output(self):
+        samples = CLI.parent / "samples"
+        with tempfile.TemporaryDirectory() as tmp:
+            partial = Path(tmp, "partial.log")
+            partial.write_bytes((samples / "session-44.fix").read_bytes() + b"x" * (8 * 1024 * 1024) + b"\n")
+            lifecycle = self.run_cli("Outbound_ClOrderId", partial, "--lifecycle", "--json")
+            self.assertEqual(lifecycle.returncode, 2, lifecycle.stderr)
+            *messages, summary = [json.loads(line) for line in lifecycle.stdout.splitlines()]
+            self.assertEqual(len(messages), 5)
+            self.assertEqual(summary["timings"][0]["reason"], "capture has a skipped record")
+            route = self.run_cli(
+                "Inbound_ClOrderId", samples / "client-ingress.fix", "--routing-latency", partial,
+                "--outbound-link-tag", 37, "--json",
+            )
+            self.assertEqual(route.returncode, 2, route.stderr)
+            self.assertIsNotNone(json.loads(route.stdout)["outbound"]["line"])
+            self.assertIsNone(json.loads(route.stdout)["timings"][0]["microseconds"])
+
+    def test_closed_stdout_pipe_exits_quietly(self):
+        sample = CLI.parent / "samples" / "orders.fix"
+        with tempfile.TemporaryDirectory() as tmp:
+            capture = Path(tmp, "many.log")
+            capture.write_bytes(sample.read_bytes() * 200)
+            with subprocess.Popen(
+                [sys.executable, str(CLI), "CLIENT-42", str(capture)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ) as process:
+                self.assertTrue(process.stdout.read(1))
+                process.stdout.close()
+                self.assertEqual(process.stderr.read(), b"")
+                self.assertEqual(process.wait(timeout=10), 0)
+
+    def test_dictionary_acronyms_color_environments_and_omitted_checksum_separator(self):
+        data = wire(b"4.4", b"35=D\x0111=ID\x0122=5\x01")[:-1] + b"\n"
+        result = self.run_cli("ID", "-", "--json", data=data)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        message = json.loads(result.stdout)
+        self.assertEqual(message["warnings"], [])
+        self.assertIn("RIC Code", [item["description"] for item in message["fields"]])
+        for name in ("CLICOLOR_FORCE", "FORCE_COLOR"):
+            with patch.dict(os.environ, {name: "1"}, clear=True):
+                forced = self.run_cli("ID", "-", data=data)
+                plain = self.run_cli("ID", "-", "--color", "never", data=data)
+            self.assertIn(b"\x1b[36m", forced.stdout)
+            self.assertNotIn(b"\x1b", plain.stdout)
+
+    def test_percentiles_bound_storage_and_preserve_slowest_evidence(self):
+        with patch("fixprinter.MAX_EXACT_LATENCY_VALUES", 8):
+            stats = LatencyStats()
+            for value in range(1, 10_001):
+                stats.add(Timing("test", microseconds=value))
+        self.assertTrue(stats.approximate)
+        self.assertLess(len(stats.values), 1_000)
+        self.assertEqual(sum(stats.values.values()), 10_000)
+        self.assertEqual(stats.slowest[0].microseconds, 10_000)
+        self.assertGreaterEqual(stats.percentiles(10_000)["p99"], 9_700)
 
     def test_wire_data_with_embedded_delimiter_and_fake_field(self):
         payload = b"hi\x0111=FAKE"

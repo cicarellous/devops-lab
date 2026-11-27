@@ -2,6 +2,8 @@
 
 import argparse
 import base64
+import builtins
+import errno
 import gzip
 import json
 import os
@@ -19,9 +21,12 @@ START = re.compile(rb"(?<![A-Za-z0-9_=])8=(FIX\.4\.[24])([\x01|])")
 FIELD = re.compile(rb"([1-9][0-9]{0,8})=")
 MAX_LINE = 8 * 1024 * 1024
 MAX_PENDING = 100_000
+MAX_EXACT_LATENCY_VALUES = 2_048
+ENUM_ACRONYMS = frozenset("ASCII ATS BIC CFI CUSIP ETF FIX FX IBAN ID IOI ISIN ISO MIC NAV OTC RFQ RIC SEDOL SWIFT UTC VWAP XML".split())
+NON_FILL_EXEC_TYPES = frozenset(bytes([code]) for code in b"03456789ABCDEGHI")
 CAPTURE_TIME = re.compile(
     rb"^(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})[ T]+"
-    rb"(\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)"
+    rb"(\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?)"
     rb"(Z|[+-]\d{2}:\d{2})?(?=\s|$)"
 )
 ID_TAGS = {11, 37, 41}
@@ -75,7 +80,6 @@ def parse_message(line: bytes, start: re.Match[bytes]) -> Message:
                 issues.append(f"Incomplete field {tag}")
                 break
             end = len(line)
-            issues.append("Missing trailing delimiter")
         value = line[match.end():end]
         fields.append((tag, value))
         if len(fields) == 2 and tag == 9 and value.isdigit() and len(value) <= 9:
@@ -111,6 +115,12 @@ def safe_text(value: bytes) -> str:
     return "".join(char if char.isprintable() else ascii(char)[1:-1] for char in decoded)
 
 
+def enum_label(label: str) -> str:
+    words = label.replace("_", " ").split()
+    return " ".join(word if word in ENUM_ACRONYMS or not word.isupper() else word.capitalize()
+                    for word in words)
+
+
 def load_dictionary(path: str | Path) -> tuple[bytes, dict[int, str], dict[int, dict[str, str]]]:
     root = ET.parse(path).getroot()
     version = f"FIX.{root.get('major')}.{root.get('minor')}".encode()
@@ -122,7 +132,7 @@ def load_dictionary(path: str | Path) -> tuple[bytes, dict[int, str], dict[int, 
     for field in fields.findall("field"):
         tag = int(field.attrib["number"])
         names[tag] = field.attrib["name"]
-        enums[tag] = {value.attrib["enum"]: value.attrib["description"]
+        enums[tag] = {value.attrib["enum"]: enum_label(value.attrib["description"])
                       for value in field.findall("value")}
     return version, names, enums
 
@@ -157,7 +167,10 @@ def print_message(
     print()
 
 
-def capture_time(prefix: bytes) -> datetime | None:
+CaptureClock = tuple[datetime, int]
+
+
+def capture_time(prefix: bytes) -> CaptureClock | None:
     match = CAPTURE_TIME.match(prefix)
     if match is None:
         return None
@@ -166,18 +179,27 @@ def capture_time(prefix: bytes) -> datetime | None:
         month, day, year = date.split(b"/")
         date = b"-".join((year, month, day))
     try:
-        return datetime.fromisoformat((date + b"T" + time + zone).decode("ascii"))
+        timestamp = datetime.fromisoformat((date + b"T" + time + zone).decode("ascii"))
+        fraction = time.partition(b".")[2]
+        remainder = int(fraction[6:9].ljust(3, b"0")) if len(fraction) > 6 else 0
+        return timestamp, remainder
     except ValueError:
         return None
 
 
-@dataclass(frozen=True)
+@dataclass
 class CaptureFilter:
     session: tuple[bytes, bytes] | None = None
-    start: datetime | None = None
-    stop: datetime | None = None
+    start: CaptureClock | None = None
+    stop: CaptureClock | None = None
+    saw_session: bool = False
+    accepted: int = 0
+    rejected_times: Counter = field(default_factory=Counter)
+    skipped: bool = False
 
     def accepts(self, message: Message, prefix: bytes) -> bool:
+        if self.session is None and self.start is None and self.stop is None:
+            return True
         if self.session:
             sender = target = None
             for tag, value in message.fields:
@@ -187,15 +209,34 @@ class CaptureFilter:
                     target = value
             if (sender, target) not in (self.session, self.session[::-1]):
                 return False
+        self.saw_session = True
         if self.start is None and self.stop is None:
+            self.accepted += 1
             return True
         timestamp = capture_time(prefix)
         bound = self.start if self.start is not None else self.stop
-        if timestamp is None or (timestamp.tzinfo is None) != (bound.tzinfo is None):
-            return False
-        return (self.start is None or timestamp >= self.start) and (
+        if timestamp is None:
+            self.rejected_times["missing or unsupported capture timestamps"] += 1
+        elif (timestamp[0].tzinfo is None) != (bound[0].tzinfo is None):
+            self.rejected_times["timezone convention differs from the filter"] += 1
+        elif (self.start is None or timestamp >= self.start) and (
             self.stop is None or timestamp < self.stop
-        )
+        ):
+            self.accepted += 1
+            return True
+        else:
+            self.rejected_times["outside the requested time window"] += 1
+        return False
+
+    def explain_empty(self, stream: str) -> None:
+        if self.accepted:
+            return
+        if self.session and not self.saw_session:
+            pair = " / ".join(safe_text(comp) for comp in self.session)
+            print(f"fixprinter: {stream}: no messages for session {pair}", file=sys.stderr)
+        elif self.rejected_times:
+            details = "; ".join(f"{count} {reason}" for reason, count in sorted(self.rejected_times.items()))
+            print(f"fixprinter: {stream}: time filter excluded all matching records ({details})", file=sys.stderr)
 
 
 @dataclass(frozen=True)
@@ -203,10 +244,12 @@ class CapturePoint:
     source: str
     line: int
     timestamp: datetime | None
+    nanosecond_remainder: int = 0
 
     @classmethod
     def from_prefix(cls, source: str, line: int, prefix: bytes):
-        return cls(source, line, capture_time(prefix))
+        clock = capture_time(prefix)
+        return cls(source, line, *clock) if clock is not None else cls(source, line, None)
 
 
 @dataclass(frozen=True)
@@ -235,11 +278,30 @@ TIMED_TYPES = SESSION_BOUNDARIES | {b"D", b"F", b"G", b"8", b"9"}
 
 
 class LatencyTracker:
-    def __init__(self, exchange_facing: bool = False) -> None:
+    def __init__(self, exchange_facing: bool = False, count_unanswered: bool = False) -> None:
         self.exchange_facing = exchange_facing
         self.pending: OrderedDict[
             tuple[bytes, bytes, bytes, bytes], PendingRequest | None
         ] = OrderedDict()
+        self.completed = OrderedDict()
+        self.unanswered = Counter() if count_unanswered else None
+
+    def abandon(self, reason: str, session=None) -> None:
+        for key in list(self.pending):
+            if session is None or (key[0] == session[0] and key[1:3] in (
+                session[1:], session[1:][::-1],
+            )):
+                self.record_unanswered(key, self.pending.pop(key), reason)
+        for key in list(self.completed):
+            if session is None or (key[0] == session[0] and key[1:3] in (
+                session[1:], session[1:][::-1],
+            )):
+                del self.completed[key]
+
+    def record_unanswered(self, key, request: PendingRequest | None, reason: str) -> None:
+        if self.unanswered is not None:
+            kind = request.kind if request else b"?"
+            self.unanswered[(*key[:3], kind, reason)] += 1
 
     def observe(
         self, message: Message, prefix: bytes, source: str, line: int,
@@ -255,24 +317,21 @@ class LatencyTracker:
                 fields.get(43) == b"Y" or fields.get(97) == b"Y"):
             return None
         if kind in SESSION_BOUNDARIES:
-            for key in list(self.pending):
-                version, origin, destination, _ = key
-                if version == message.version and (origin, destination) in (
-                    (sender, target), (target, sender)
-                ):
-                    del self.pending[key]
+            self.abandon("session ended or restarted", (message.version, sender, target))
             return None
 
         identifier = fields.get(11)
         if kind in (b"D", b"F", b"G"):
             if identifier:
                 key = (message.version, sender, target, identifier)
+                self.completed.pop(key, None)
                 self.pending[key] = None if key in self.pending else PendingRequest(
                     kind, fields.get(41), CapturePoint.from_prefix(source, line, prefix)
                 )
                 self.pending.move_to_end(key)
                 if len(self.pending) > MAX_PENDING:
-                    self.pending.popitem(last=False)
+                    evicted, request = self.pending.popitem(last=False)
+                    self.record_unanswered(evicted, request, "request tracking limit reached")
             return None
 
         execution = fields.get(150)
@@ -298,6 +357,9 @@ class LatencyTracker:
             return Timing(label, end=point, reason="missing ClOrdID")
         key = (message.version, target, sender, identifier)
         if key not in self.pending:
+            previous = self.completed.get(key)
+            if previous is not None and previous[0] == expected_kind:
+                return Timing(label, previous[1], point, reason="duplicate response")
             return Timing(label, end=point, reason="request not found in this session")
         request = self.pending[key]
         if request is None:
@@ -310,6 +372,9 @@ class LatencyTracker:
             return Timing(label, request.point, point, reason="request and response do not match")
         del self.pending[key]
 
+        self.completed[key] = (expected_kind, request.point)
+        if len(self.completed) > MAX_PENDING:
+            self.completed.popitem(last=False)
         return elapsed_time(label, request.point, point)
 
 
@@ -335,8 +400,9 @@ def elapsed_time(label: str, start_point: CapturePoint, end_point: CapturePoint)
         reason = "capture timestamps use different timezone conventions"
     else:
         elapsed = end - start
-        if elapsed.days >= 0:
-            micros = (elapsed.days * 86_400 + elapsed.seconds) * 1_000_000 + elapsed.microseconds
+        micros = (elapsed.days * 86_400 + elapsed.seconds) * 1_000_000 + elapsed.microseconds
+        micros += (end_point.nanosecond_remainder - start_point.nanosecond_remainder) // 1_000
+        if micros >= 0:
             return Timing(label, start_point, end_point, microseconds=micros)
         reason = "response timestamp precedes request" if label != "Internal routing" else (
             "outbound timestamp precedes inbound timestamp"
@@ -344,17 +410,26 @@ def elapsed_time(label: str, start_point: CapturePoint, end_point: CapturePoint)
     return Timing(label, start_point, end_point, reason=reason)
 
 
-def records(stream, source, *, containing: bytes | None = None, from_line: int = 1):
+def records(stream, source, *, containing=None, from_line=1, session=None, on_timestamp=None, warn_skipped=True):
     line_number = 0
     while record := stream.readline(MAX_LINE + 1):
         line_number += 1
         if len(record) > MAX_LINE:
             while record and not record.endswith(b"\n"):
                 record = stream.readline(MAX_LINE + 1)
-            print(f"{source}:{line_number}: skipped record over 8 MiB", file=sys.stderr)
+            if warn_skipped:
+                print(f"{source}:{line_number}: skipped record over 8 MiB", file=sys.stderr)
             yield line_number, b"", None
             continue
+        if on_timestamp is not None:
+            first = START.search(record)
+            if first is not None:
+                timestamp = capture_time(record[:first.start()].strip())
+                if timestamp is not None:
+                    on_timestamp(timestamp)
         if line_number < from_line or (containing is not None and containing not in record):
+            continue
+        if session and (session[0] not in record or session[1] not in record):
             continue
         line = record.rstrip(b"\r\n")
         offset = 0
@@ -364,18 +439,66 @@ def records(stream, source, *, containing: bytes | None = None, from_line: int =
             offset = max(start.end(), message.end)
 
 
-def capture_records(paths, *, containing=None, start_index=0, from_line=1):
+def same_capture(first: str, second: str) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second))
+
+
+def capture_records(paths, *, containing=None, start_index=0, from_line=1, session=None, warn_skipped=True):
+    rotated = len(paths) > 1
+    if rotated:
+        seen = set()
+        for path in paths:
+            stat = os.stat(path)
+            identity = (stat.st_dev, stat.st_ino) if stat.st_ino else os.path.normcase(os.path.realpath(path))
+            if identity in seen:
+                raise ValueError(f"duplicate rotated capture: {path}")
+            seen.add(identity)
+    previous = None
+    previous_source = None
     for index in range(start_index, len(paths)):
         path = paths[index]
         source = "stdin" if path == "-" else printable_label(path)
         minimum_line = from_line if index == start_index else 1
+        first_timestamp = True
+        latest = None
+
+        def on_timestamp(timestamp):
+            nonlocal first_timestamp, latest
+            if first_timestamp and previous is not None:
+                if (timestamp[0].tzinfo is None) != (previous[0].tzinfo is None):
+                    raise ValueError(f"rotated captures use different timezone conventions: {previous_source}, {source}")
+                if timestamp < previous:
+                    raise ValueError(f"rotated captures are out of order or overlap: {previous_source}, {source}")
+            first_timestamp = False
+            latest = timestamp
+
+        options = {
+            "containing": containing, "from_line": minimum_line, "session": session,
+            "on_timestamp": on_timestamp if rotated else None, "warn_skipped": warn_skipped,
+        }
         if path == "-":
-            for row in records(sys.stdin.buffer, source, containing=containing, from_line=minimum_line):
+            for row in records(sys.stdin.buffer, source, **options):
                 yield index, source, *row
         else:
             with open_capture(path) as stream:
-                for row in records(stream, source, containing=containing, from_line=minimum_line):
+                for row in records(stream, source, **options):
                     yield index, source, *row
+        if latest is not None:
+            previous, previous_source = latest, source
+
+
+def print(*values, **options):
+    try:
+        builtins.print(*values, **options)
+    except OSError as exc:
+        if options.get("file") is not None:
+            raise
+        if isinstance(exc, BrokenPipeError) or (os.name == "nt" and exc.errno == errno.EINVAL):
+            raise BrokenPipeError from exc
+        raise
 
 
 def emit_json(kind: str, **values) -> None:
@@ -423,10 +546,10 @@ def scan(paths, tags, identifier, dictionaries, color, args, capture_filter):
     tracker = LatencyTracker(args.exchange_facing)
     matched = False
     skipped = False
-    for _, source, line, prefix, message in capture_records(paths):
+    for _, source, line, prefix, message in capture_records(paths, session=capture_filter.session):
         if message is None:
             skipped = True
-            tracker.pending.clear()
+            tracker.abandon("capture has a skipped record")
             continue
         if not capture_filter.accepts(message, prefix):
             if not message.issues and message.fields[2][1] in SESSION_BOUNDARIES:
@@ -462,9 +585,11 @@ def locate_route_order(
     tracker = LatencyTracker(exchange_facing=True)
     # Exchange timing also needs session boundaries and requests that may share an outbound ID.
     containing = None if exchange else identifier
-    for index, source, line, prefix, message in capture_records(paths, containing=containing):
+    for index, source, line, prefix, message in capture_records(paths, containing=containing, session=capture_filter.session):
         if message is None:
-            raise ValueError("order correlation requires captures without skipped records")
+            capture_filter.skipped = True
+            tracker.abandon("capture has a skipped record")
+            continue
         if message.issues:
             continue
         kind = message.fields[2][1]
@@ -520,7 +645,7 @@ def print_route(
     outbound = locate_route_order(outbound_paths, outbound_key, link_tag, True, outbound_filter)
     found = isinstance(inbound, RouteOrder) and isinstance(outbound, RouteOrder)
     if found:
-        if inbound.point.line == outbound.point.line and os.path.samefile(
+        if inbound.point.line == outbound.point.line and same_capture(
             inbound_paths[inbound.capture_index], outbound_paths[outbound.capture_index],
         ):
             raise ValueError("inbound and outbound must identify different captured events")
@@ -528,10 +653,17 @@ def print_route(
     else:
         routing = Timing("Internal routing", reason="requires one matching order on each leg")
     exchange = None
+    incomplete = inbound_filter.skipped or outbound_filter.skipped
+    if incomplete:
+        routing = Timing("Internal routing", routing.start, routing.end, reason="capture has a skipped record")
     if isinstance(outbound, RouteOrder):
         exchange = outbound.response or Timing(
             "Exchange order response round trip", outbound.point, reason="response not found"
         )
+        if outbound_filter.skipped:
+            exchange = Timing(exchange.label, exchange.start, exchange.end, reason="outbound capture has a skipped record")
+    inbound_filter.explain_empty("inbound log")
+    outbound_filter.explain_empty("outbound log")
 
     legs = {}
     for leg, path, tag, key, match in (
@@ -560,20 +692,29 @@ def print_route(
     else:
         for timing in timings:
             print(timing.render(color))
-    return 0 if found else 1
+    return 2 if incomplete else 0 if found else 1
 
 
-def is_fill(version: bytes, fields: dict[int, bytes]) -> bool:
+def classify_fill(version: bytes, fields: dict[int, bytes], legacy_fills: bool) -> tuple[bool, str | None]:
     execution = fields.get(150)
-    if execution not in ({b"1", b"2"} if version == b"FIX.4.2" else {b"F"}):
-        return False
-    if version == b"FIX.4.2" and fields.get(20, b"0") != b"0":
-        return False
+    legacy = execution in (b"1", b"2")
+    if fields.get(20, b"0") != b"0" and (version == b"FIX.4.2" or legacy):
+        return False, None
+    if version == b"FIX.4.4" and legacy and not legacy_fills:
+        return False, "legacy FIX 4.4 ExecType; enable --legacy-fills for this venue"
+    standard_fill = legacy if version == b"FIX.4.2" else execution == b"F" or legacy
+    if not standard_fill and (execution in NON_FILL_EXEC_TYPES or fields.get(39) not in (b"1", b"2")):
+        return False, None
     try:
         quantity = Decimal(fields.get(32, b"0").decode("ascii"))
-        return quantity.is_finite() and quantity > 0
+        positive = quantity.is_finite() and quantity > 0
     except (InvalidOperation, UnicodeDecodeError):
-        return False
+        positive = False
+    if standard_fill:
+        return (True, None) if positive else (False, "missing or invalid last fill quantity")
+    if positive:
+        return False, "unrecognized ExecType on a fill-like report"
+    return False, None
 
 
 def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
@@ -584,7 +725,7 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
             emit_json("lifecycle_summary", clordid=safe_text(identifier), reason=root, timings=[])
         else:
             print(f"Lifecycle unavailable: {root}")
-        return 1
+        return 2 if capture_filter.skipped else 1
 
     ids = {identifier}
     order_ids = set()
@@ -593,9 +734,13 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
     first_fill = full_fill = None
     for _, source, line, prefix, message in capture_records(
         paths, start_index=root.capture_index, from_line=root.point.line,
+        session=capture_filter.session, warn_skipped=False,
     ):
         if message is None:
-            raise ValueError("order correlation requires captures without skipped records")
+            capture_filter.skipped = True
+            if started:
+                break
+            continue
         if message.issues or message.version != root.version:
             continue
         kind = message.fields[2][1]
@@ -633,10 +778,15 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
             continue
 
         timing = tracker.observe(message, prefix, source, line, fields)
+        fill, fill_issue = (classify_fill(message.version, fields, args.legacy_fills)
+                            if not forward and kind == b"8" else (False, None))
+        if fill_issue and timing is None:
+            timing = Timing("Fill timing", root.point, CapturePoint.from_prefix(source, line, prefix),
+                            reason=fill_issue)
         emit_message(
             message, source, line, prefix, timing, ID_TAGS, identifier, dictionaries, color, args.json
         )
-        if not forward and kind == b"8" and is_fill(message.version, fields):
+        if fill:
             point = CapturePoint.from_prefix(source, line, prefix)
             if first_fill is None:
                 first_fill = elapsed_time("Time to first fill", root.point, point)
@@ -647,13 +797,16 @@ def print_lifecycle(args, identifier, dictionaries, color, capture_filter):
         first_fill or Timing("Time to first fill", root.point, reason="no fill seen"),
         full_fill or Timing("Time to full fill", root.point, reason="no full fill seen"),
     ]
+    if capture_filter.skipped:
+        timings = [Timing(timing.label, timing.start, timing.end, reason="capture has a skipped record")
+                   for timing in timings]
     if args.json:
         emit_json("lifecycle_summary", clordid=safe_text(identifier),
                   timings=[asdict(timing) for timing in timings])
     else:
         for timing in timings:
             print(timing.render(color))
-    return 0
+    return 2 if capture_filter.skipped else 0
 
 
 def sequence_number(raw: bytes | None) -> int | None:
@@ -717,12 +870,25 @@ class LatencyStats:
     values: Counter = field(default_factory=Counter)
     unavailable: Counter = field(default_factory=Counter)
     slowest: list[Timing] = field(default_factory=list)
+    approximate: bool = False
+
+    @staticmethod
+    def bucket(value: int) -> int:
+        shift = max(0, value.bit_length() - 6)
+        return (value >> shift) << shift
 
     def add(self, timing: Timing) -> None:
         if timing.microseconds is None:
             self.unavailable[timing.reason] += 1
             return
-        self.values[timing.microseconds] += 1
+        value = timing.microseconds
+        if not self.approximate and value not in self.values and len(self.values) >= MAX_EXACT_LATENCY_VALUES:
+            buckets = Counter()
+            for old_value, count in self.values.items():
+                buckets[self.bucket(old_value)] += count
+            self.values = buckets
+            self.approximate = True
+        self.values[self.bucket(value) if self.approximate else value] += 1
         if len(self.slowest) < 3 or timing.microseconds > self.slowest[-1].microseconds:
             self.slowest.append(timing)
             self.slowest.sort(key=lambda item: item.microseconds, reverse=True)
@@ -755,8 +921,9 @@ class FillProgress:
 
 
 class FillTracker:
-    def __init__(self):
+    def __init__(self, legacy_fills: bool):
         self.orders = OrderedDict()
+        self.legacy_fills = legacy_fills
 
     def remember(self, key, progress: FillProgress) -> None:
         existing = self.orders.get(key)
@@ -793,7 +960,10 @@ class FillTracker:
                     progress = self.orders.get((*session, 37, order_id))
                 elif fields.get(150) != b"8":
                     self.remember((*session, 37, order_id), progress)
-            if not is_fill(message.version, fields):
+            fill, reason = classify_fill(message.version, fields, self.legacy_fills)
+            if reason:
+                yield Timing("Fill timing", end=point, reason=reason)
+            if not fill:
                 return
             if progress is None:
                 yield Timing("Fill timing", end=point, reason="original order not found")
@@ -811,15 +981,15 @@ class FillTracker:
 
 def capture_report(args, capture_filter, color: bool) -> int:
     diagnostics = SequenceDiagnostics()
-    tracker = LatencyTracker(args.exchange_facing)
-    fills = FillTracker()
+    tracker = LatencyTracker(args.exchange_facing, count_unanswered=True)
+    fills = FillTracker(args.legacy_fills)
     stats = defaultdict(LatencyStats)
     total = skipped = malformed = 0
-    for _, source, line, prefix, message in capture_records([args.log, *args.next_log]):
+    for _, source, line, prefix, message in capture_records([args.log, *args.next_log], session=capture_filter.session):
         if message is None:
             skipped += 1
             diagnostics.expected.clear()
-            tracker.pending.clear()
+            tracker.abandon("capture has a skipped record")
             fills.orders.clear()
             continue
         if message.issues:
@@ -862,20 +1032,35 @@ def capture_report(args, capture_filter, color: bool) -> int:
                 stats[key].add(observation)
 
     if args.session_diagnostics:
+        expected = [
+            {"version": safe_text(version), "sender": safe_text(sender), "target": safe_text(target),
+             "next_sequence": sequence}
+            for (version, sender, target), sequence in sorted(diagnostics.expected.items())
+        ]
         if args.json:
-            emit_json("session_summary", messages=total, skipped=skipped, malformed=malformed, counts=diagnostics.counts)
+            emit_json("session_summary", messages=total, skipped=skipped, malformed=malformed,
+                      counts=diagnostics.counts, expected_next=expected)
         else:
             counts = ", ".join(f"{kind}={count}" for kind, count in sorted(diagnostics.counts.items()))
             print(f"Session diagnostics: {total} messages, {malformed} malformed, {skipped} skipped records | {counts or 'no events'}")
+            for item in expected:
+                print(f"  {item['version']} {item['sender']} -> {item['target']} | next expected: {item['next_sequence']}")
     else:
+        tracker.abandon("capture ended before a matching reply")
+        for (version, sender, target, kind, reason), count in tracker.unanswered.items():
+            request = {b"D": "Order", b"F": "Cancel", b"G": "Replace"}.get(kind, "Ambiguous")
+            group = stats[safe_text(version), (safe_text(sender), safe_text(target)), f"{request} unanswered"]
+            group.unavailable[reason] += count
         for (version, session, label), group in sorted(stats.items()):
             count = sum(group.values.values())
             percentiles = group.percentiles(count)
+            method = "bucketed_nearest_rank" if group.approximate else "exact_nearest_rank"
+            sparse = [name for name, minimum in (("p95", 20), ("p99", 100)) if 0 < count < minimum]
             if args.json:
                 emit_json(
                     "latency_metric", version=version, session=session, label=label, measured=count,
                     unavailable=dict(group.unavailable), percentiles_microseconds=percentiles,
-                    slowest=[asdict(item) for item in group.slowest],
+                    percentile_method=method, sparse_percentiles=sparse, slowest=[asdict(item) for item in group.slowest],
                 )
             else:
                 rendered = " ".join(
@@ -884,6 +1069,10 @@ def capture_report(args, capture_filter, color: bool) -> int:
                 )
                 print(f"{version} {' -> '.join(session)} | {label} | "
                       f"{count} measured, {sum(group.unavailable.values())} unavailable {rendered}".rstrip())
+                if group.approximate:
+                    print("  Percentiles are approximate (bounded buckets).")
+                if sparse:
+                    print(f"  Small sample for {', '.join(sparse)}.")
                 for reason, count in sorted(group.unavailable.items()):
                     print(f"  {count} unavailable: {reason}")
                 for item in group.slowest:
@@ -898,7 +1087,7 @@ def capture_report(args, capture_filter, color: bool) -> int:
     return 2 if skipped else 0 if (total if args.session_diagnostics else stats) else 1
 
 
-def time_bound(text: str) -> datetime:
+def time_bound(text: str) -> CaptureClock:
     try:
         value = text.encode("ascii")
     except UnicodeEncodeError:
@@ -963,9 +1152,15 @@ def main() -> int:
                          help="summarize acknowledgement and fill timings in LOG without an order ID")
     parser.add_argument("--lifecycle", action="store_true",
                         help="follow an order from its original ClOrdID in one file and report fill times")
+    parser.add_argument("--legacy-fills", action="store_true",
+                        help="accept venue-specific FIX 4.4 ExecType 1/2 in lifecycle and latency reports")
     parser.add_argument("--json", action="store_true", help="write versioned JSON Lines to stdout")
     args = parser.parse_args()
     report = args.session_diagnostics or args.latency_summary
+    if args.legacy_fills and not (args.lifecycle or args.latency_summary):
+        parser.error("--legacy-fills requires --lifecycle or --latency-summary")
+    if args.session_diagnostics and args.exchange_facing:
+        parser.error("--exchange-facing does not apply to --session-diagnostics")
     if report:
         if args.log is not None or args.lifecycle or args.routing_latency or args.tag or args.dictionary:
             parser.error("report modes take one initial capture and no order ID, tag, or dictionary")
@@ -982,7 +1177,7 @@ def main() -> int:
     if args.lifecycle and (args.routing_latency or args.log == "-" or args.tag):
         parser.error("--lifecycle requires a log file and original ClOrdID, without --routing-latency or --tag")
     if args.start and args.until and (
-        (args.start.tzinfo is None) != (args.until.tzinfo is None) or args.start >= args.until
+        (args.start[0].tzinfo is None) != (args.until[0].tzinfo is None) or args.start >= args.until
     ):
         parser.error("--from must precede --until and use the same timezone convention")
     if not args.routing_latency and (args.outbound_clordid is not None or args.outbound_link_tag):
@@ -992,8 +1187,9 @@ def main() -> int:
     if args.routing_latency:
         if args.tag or args.dictionary or args.log == "-" or args.routing_latency == "-":
             parser.error("--routing-latency uses two log files and an inbound ClOrdID, without --tag or --dictionary")
+    forced = any(os.environ.get(name, "0") not in ("", "0") for name in ("CLICOLOR_FORCE", "FORCE_COLOR"))
     color = args.color == "always" or (
-        args.color == "auto" and sys.stdout.isatty() and "NO_COLOR" not in os.environ
+        args.color == "auto" and "NO_COLOR" not in os.environ and (sys.stdout.isatty() or forced)
     )
     inbound_session = tuple(comp.encode("utf-8") for comp in args.session) if args.session else None
     outbound_session = tuple(comp.encode("utf-8") for comp in args.outbound_session) if args.outbound_session else None
@@ -1004,7 +1200,9 @@ def main() -> int:
     custom_versions = set()
     try:
         if report:
-            return capture_report(args, capture_filter, color)
+            status = capture_report(args, capture_filter, color)
+            capture_filter.explain_empty("capture")
+            return status
         if args.routing_latency:
             outbound_key = args.outbound_clordid.encode("utf-8") if args.outbound_clordid else identifier
             return print_route(
@@ -1015,12 +1213,7 @@ def main() -> int:
             actual_version, names, enums = load_dictionary(DICTIONARIES / filename)
             if version != actual_version:
                 raise ValueError(f"unexpected FIX version in {filename}")
-            dictionaries[version] = (
-                names,
-                {tag: {code: label.replace("_", " ").title()
-                       for code, label in values.items()}
-                 for tag, values in enums.items()},
-            )
+            dictionaries[version] = (names, enums)
         for path in args.dictionary:
             version, names, enums = load_dictionary(path)
             if version in custom_versions:
@@ -1031,13 +1224,34 @@ def main() -> int:
             for tag, values in enums.items():
                 standard_enums.setdefault(tag, {}).update(values)
         if args.lifecycle:
-            return print_lifecycle(args, identifier, dictionaries, color, capture_filter)
-        return scan([args.log, *args.next_log], tags, identifier, dictionaries, color, args, capture_filter)
+            status = print_lifecycle(args, identifier, dictionaries, color, capture_filter)
+        else:
+            status = scan([args.log, *args.next_log], tags, identifier, dictionaries, color, args, capture_filter)
+        capture_filter.explain_empty("capture")
+        return status
+    except BrokenPipeError:
+        raise
     except (OSError, EOFError, ET.ParseError, ValueError, KeyError, zlib.error) as exc:
         print(f"fixprinter: {printable_label(str(exc))}", file=sys.stderr)
         return 2
 
 
-if __name__ == "__main__":
+def run_cli() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
-    sys.exit(main())
+    try:
+        status = main()
+        try:
+            sys.stdout.flush()
+        except OSError as exc:
+            if isinstance(exc, BrokenPipeError) or (os.name == "nt" and exc.errno == errno.EINVAL):
+                raise BrokenPipeError from exc
+            raise
+        return status
+    except BrokenPipeError:
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), sys.stdout.fileno())
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_cli())
