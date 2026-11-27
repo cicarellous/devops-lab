@@ -11,7 +11,7 @@ def main() -> None:
     dist = root / "dist"
     wheel = dist / f"fix_printer-{__version__}-py3-none-any.whl"
     if not wheel.is_file():
-        raise SystemExit(f"Build the wheel first: {wheel.name}")
+        raise SystemExit(f"Missing {wheel.name}. Run python -m build --wheel from fix-printer/ first.")
 
     files = (
         "README.md",

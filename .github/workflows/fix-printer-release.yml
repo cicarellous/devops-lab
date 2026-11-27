@@ -61,7 +61,8 @@ jobs:
           gh release create "fix-printer-v$version" \
             "dist/fix-printer-$version-bundle.zip" \
             "dist/fix_printer-$version-py3-none-any.whl" \
+            "dist/fix_printer-$version.tar.gz" \
             --target "$GITHUB_SHA" \
             --latest=false \
             --title "FIX Printer $version" \
-            --notes "Download the bundle ZIP for the offline wheel, analyst guides, sample logs, and license notices. Extract it and start with README.md. Python 3.12 or later required."
+            --notes "Download the bundle ZIP for the offline wheel, analyst guides, sample logs, and license notices. Extract it and start with README.md. The wheel and pip-installable source distribution are also available separately. Python 3.12 or later required."

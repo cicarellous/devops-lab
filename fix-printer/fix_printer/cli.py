@@ -20,6 +20,8 @@ from pathlib import Path
 
 from ._version import __version__
 
+PROGRAM_NAME = "fix-printer"
+
 HEADER_AFTER_BEGIN = re.compile(rb"9=[0-9]{1,9}([\x01|])35=")
 START = re.compile(rb"(?<![A-Za-z0-9_=])8=(FIX\.4\.[24])([\x01|])")
 FIELD = re.compile(rb"([1-9][0-9]{0,8})=")
@@ -289,10 +291,10 @@ class CaptureFilter:
                 if values:
                     scope.append(f"{label} {' / '.join(safe_text(value) for value in values)}")
             detail = f" with {', '.join(scope)}" if scope else ""
-            print_error(f"fixprinter: {stream}: no messages for session {pair}{detail}")
+            print_error(f"{stream}: no messages for session {pair}{detail}")
         elif self.rejected_times:
             details = "; ".join(f"{count} {reason}" for reason, count in sorted(self.rejected_times.items()))
-            print_error(f"fixprinter: {stream}: time filter excluded all matching records ({details})")
+            print_error(f"{stream}: time filter excluded all matching records ({details})")
 
 
 @dataclass(frozen=True)
@@ -611,7 +613,7 @@ def print(*values, **options):
 
 def print_error(message: str) -> None:
     if sys.stderr is not None:
-        print(message, file=sys.stderr)
+        print(f"{PROGRAM_NAME}: {message}", file=sys.stderr)
 
 
 class CliParser(argparse.ArgumentParser):
@@ -1349,7 +1351,7 @@ def positive_tag(text: str) -> int:
 
 def main() -> int:
     parser = CliParser(
-        prog="fix-printer",
+        prog=PROGRAM_NAME,
         description=__doc__,
         epilog=(
             "With one log, order, cancel, and replace response timing is automatic. "
@@ -1506,19 +1508,19 @@ def main() -> int:
     except BrokenPipeError:
         raise
     except (OSError, EOFError, ET.ParseError, ValueError, KeyError, zlib.error) as exc:
-        print_error(f"fixprinter: {printable_label(str(exc))}")
+        print_error(printable_label(str(exc)))
         return 2
 
 
 def run_cli() -> int:
     if sys.stdout is None:
-        print_error("fixprinter: stdout is unavailable")
+        print_error("stdout is unavailable")
         return 2
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except (OSError, ValueError):
         silence(sys.stdout)
-        print_error("fixprinter: unable to configure stdout")
+        print_error("unable to configure stdout")
         return 2
     try:
         status = main()

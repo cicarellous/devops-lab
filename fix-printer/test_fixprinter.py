@@ -65,7 +65,7 @@ class PrinterTests(unittest.TestCase):
             log.write_bytes(header + b"\x07" + bytes(8))
             result = self.run_cli("ID", log)
             self.assertEqual(result.returncode, 2)
-            self.assertIn(b"fixprinter:", result.stderr)
+            self.assertTrue(result.stderr.startswith(b"fix-printer:"), result.stderr)
             self.assertNotIn(b"Traceback", result.stderr)
 
     def test_bundled_dictionary_resolves_version_specific_fields(self):
@@ -863,7 +863,7 @@ class PrinterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             result = self.run_cli("A", Path(tmp, "missing.log"))
         self.assertEqual(result.returncode, 2)
-        self.assertIn(b"fixprinter:", result.stderr)
+        self.assertTrue(result.stderr.startswith(b"fix-printer:"), result.stderr)
 
 
 if __name__ == "__main__":
