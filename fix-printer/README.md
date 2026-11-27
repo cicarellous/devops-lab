@@ -1,9 +1,10 @@
 # FIX Printer
 
-A command-line tool for investigating orders in FIX 4.2 and 4.4 logs.
-Decode messages, follow an order through fills and cancels, and measure
-response and routing latency. Use text reports during an investigation
-and versioned JSON Lines and exit codes in automation.
+A command-line tool that decodes and prints FIX 4.2 and 4.4 messages
+from logs in a readable tag table. Find messages by order ID or another
+FIX tag and see field names and decoded values alongside the raw values.
+You can also follow orders through fills and cancels, measure response
+and routing latency, and export versioned JSON Lines for automation.
 
 ## Download and install
 
